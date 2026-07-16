@@ -1,0 +1,65 @@
+# Order Intelligence Layer — infrastructure
+# Usage: docker compose up -d
+# Python services and the dashboard run natively in dev (see CLAUDE.md).
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: oil-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP -> amqp://guest:guest@localhost:5672/ (image default)
+      - "15672:15672"   # management UI -> http://localhost:15672 (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  redis:
+    image: redis:7-alpine
+    container_name: oil-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: oil-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: oil
+      POSTGRES_PASSWORD: oil
+      POSTGRES_DB: oil
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oil -d oil"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # --- Uncomment for prod-like/demo runs once the app is containerized ---
+  # dashboard:
+  #   build:
+  #     context: ./dashboard
+  #     args:
+  #       NPM_TOKEN: ${NPM_TOKEN}
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
+  #     NEXT_PUBLIC_BACKEND_WS_URL: ws://localhost:8000/ws
+
+volumes:
+  rabbitmq_data:
+  redis_data:
+  postgres_data:

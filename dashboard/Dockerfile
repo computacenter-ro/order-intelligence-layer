@@ -8,7 +8,7 @@ RUN echo "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}" >> .npmrc \
 
 FROM node:20-alpine AS builder
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/node_modules ./node_modules   
 COPY . .
 RUN npm run build
 

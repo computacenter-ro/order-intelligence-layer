@@ -4,11 +4,11 @@ See docs/superpowers/specs/2026-07-16-shared-models-design.md for the design
 rationale, and CLAUDE.md for the authoritative log schema / correlation model.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer
 
 Level = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 BridgeIds = Literal["both", "order", "cart", "random"]
@@ -20,7 +20,7 @@ class LogLine(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     log_id: str
-    timestamp: datetime
+    timestamp: AwareDatetime
     app_name: str
     level: Level
     logger: str
@@ -35,7 +35,8 @@ class LogLine(BaseModel):
 
     @field_serializer("timestamp")
     def _serialize_timestamp(self, value: datetime) -> str:
-        return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
+        utc_value = value.astimezone(timezone.utc)
+        return utc_value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_value.microsecond // 1000:03d}Z"
 
 
 class OrderLine(BaseModel):
@@ -89,7 +90,7 @@ class ProcessedAlert(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     alert_id: str
-    emitted_at: datetime
+    emitted_at: AwareDatetime
     log: LogLine
     explanation: str | None
     department: Department | None

@@ -527,3 +527,6 @@ Slack webhooks above.
 - The system must remain useful with the LLM completely down (breaker +
   pass-through alerts + template journey summaries). Test this path.
 - All LLM/provider wiring stays in one module (Azure AI Foundry today).
+- All datetimes ae UTC and timezone aware (timestamptz in Postgres,
+  datetime.now(timezone.utc) in Python - never utcnow(), never naive
+  datetimes). The 90s stalled journey arithmetic depends on this.

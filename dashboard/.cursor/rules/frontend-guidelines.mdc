@@ -1,0 +1,159 @@
+---
+description: Computacenter brand and design system rules for CC internal application frontends. Auto-applied when editing React components, pages, CSS, or Tailwind config. Covers colour tokens, Albert Sans typography, 4px spacing grid, and all shared component specs (button, badge, card, input, table, navbar).
+globs:
+  - "**/*.tsx"
+  - "**/*.ts"
+  - "**/*.css"
+  - "**/*.scss"
+  - "tailwind.config.*"
+alwaysApply: false
+---
+
+# Computacenter Frontend Guidelines
+
+Read `docs/frontend-guidelines.md` at the project root before making any UI change. It is the binding specification — these notes are a quick-reference summary only.
+
+## Absolute rules
+
+**Colours** — only tokens from the palette below. No raw hex values inline; always CSS custom properties or Tailwind config extensions.
+
+| Token | Hex | Use |
+|---|---|---|
+| Heritage Blue | `#0D21A0` | Primary actions, headings, interactive text |
+| Foundation Blue | `#011749` | Navbar, dark backgrounds |
+| Horizon Blue | `#49ABEB` | Headings only — never body text or labels |
+| Cloud White | `#FAFAFF` | Page background — never pure `#FFFFFF` |
+| United Red | `#F12938` | Error, delete, destructive |
+| Neural Purple | `#8459E2` | Pending states |
+| Circuit Green | `#54C664` | Success, live, completed |
+| Fibre Orange | `#FF7900` | In progress, warning |
+| Voltage Yellow | `#EABE42` | Caution only |
+| Grey One–Six | `#2A2A2B` → `#EDF2F8` | Functional use only |
+
+**Colour rules:**
+- Never use `#ffffff` or `#fff` — all white surfaces use `var(--cc-cloud-white)` (#FAFAFF)
+- Never use Heritage Blue as a background on Foundation Blue — contrast is ~1.3:1 (invisible)
+- Notification badges on the Foundation Blue nav bar use United Red (`#F12938`), not Heritage Blue
+- TopNav `<nav>` aria-label = `"Primary navigation"` · SideNav `<nav>` aria-label = `"Sidebar navigation"` — these must differ so landmark labels are unique on pages with both
+
+**Typography** — Albert Sans, self-hosted from `src/fonts/`. Weights available: 300/400/500/600/700. No other font. Sentence case for body text, headings, captions, and badges. Title Case for button labels and CTAs — every significant word capitalised — and for form field labels and table column headers ("Connection Name", "Device Name"; never ALL CAPS by default so deliberate acronyms like "ID"/"SKU" stay distinguishable). ALL CAPS only for KPI stat card labels and acronyms.
+
+**Global type scale:**
+
+| Level | Size | Weight | Line Height | Letter Spacing | Colour |
+|---|---|---|---|---|---|
+| H1 | 32px | 700 Bold | 44px | 0 | `#0D21A0` Heritage Blue |
+| H2 | 24px | 700 Bold | 32px | 0 | `#0D21A0` Heritage Blue |
+| Card title | 20px | 600 SemiBold | 28px | 0 | `#011749` Foundation Blue |
+| Subtitle | 16px | 500 Medium | 24px | 0 | Contextual |
+| Body | 16px | 400 Regular | 22px | 0 | `#2A2A2B` Grey One |
+| Caption | 14px | 500 Medium | 18px | 0 | `#8C8C8F` Grey Three |
+| Small caps | 14px | 500 Medium | 24px | 1.6px | `#8C8C8F` Grey Three |
+
+**Component type scale:**
+
+| Level | Size | Weight | Line Height |
+|---|---|---|---|
+| Button (regular) | 14px | 600 SemiBold | 24px |
+| Button (small) | 14px | 600 SemiBold | 20px |
+| Label | 14px | 500 Medium | 18px |
+| Input value | 16px | 400 Regular | 20px |
+| Helper text | 14px | 400 Regular | 18px |
+| Table header | 14px | 600 SemiBold | 18px |
+| Table cell | 14px | 400 Regular | 18px |
+| Badge / tag | 12px | 600 SemiBold | 16px |
+| Navigation item | 14px | 500 Medium | 18px |
+| Breadcrumb | 12px | 400 Regular | 16px — right-chevron (›) separator, never a slash |
+
+**Layout** — Application content areas are always full-width. Never apply `max-width` to a page's main content area — content must fill the full available width (viewport minus navigation). Only narrow elements like form inputs or modal dialogs may have their own width constraints.
+
+**Spacing** — 4px base unit. Use named tokens from `@computacenter-ro/style-guide/tokens`; never hard-code px values.
+
+| Token | Value | Use |
+|---|---|---|
+| `xs` | 4px | Icon gaps, badge padding |
+| `sm` | 8px | Button gaps, badge rows |
+| `md` | 12px | Table cells, input padding |
+| `base` | 16px | Card padding, form groups |
+| `lg` | 24px | Grid gaps, section margins |
+| `xl` | 32px | Between layout blocks |
+| `page` | 48px | Page horizontal padding |
+| `2xl` | 64px | Section separation |
+
+**Transitions** — `fast` 120ms · `base` 200ms · `slow` 350ms (all `ease`)
+
+**Radius** — only 3 options: `sm` 4px (checkboxes, small tags) · `md` 8px (the regular radius: cards, tables, modals, buttons, inputs, dropdowns) · `full` 9999px (badges, pills). `lg`/`button` are deprecated aliases of `md` (8px) — do not use in new code.
+
+**Shadows** (Foundation Blue tinted) — `sm` cards · `md` hover/elevated · `lg` dropdowns · `xl` modals
+
+**Button labels always use Title Case** — "Open App", "View Details", "Add Application". Sentence case applies to body text and captions only, not to buttons, CTAs, form labels, or table headers.
+
+**One primary button per page maximum.** All other actions: Secondary, Hollow/Outline, or Clear/Ghost.
+
+**Global consistency** — any change to a shared component must propagate to every page automatically. Never patch one page and leave others inconsistent.
+
+## Component specs (summary)
+
+**Buttons** — 4 variants × 2 sizes (Regular 44px / Compact 36px) × 3 types (text / icon-only / text+icon). All 6 states required (Enabled, Hover, Pressed, Focused, Disabled, Loading).
+
+| Variant | Background | Border | Text | Notes |
+|---|---|---|---|---|
+| Primary | `#0D21A0` | none | white | One per page max |
+| Secondary | `#D0E9FA` | none | `#0D21A0` | New — filled light blue |
+| Hollow / Outline | transparent | 1px `#0D21A0` | `#0D21A0` | Was "Secondary" |
+| Clear / Ghost | transparent | none | `#0D21A0` | Low-priority only |
+
+Sizes: Regular = 40px h / 24px padding / 14px 600. Compact = 32px h / 16px padding / 14px 600. All types radius 8px (`md`), including icon-only. Loading state must show spinner — never silently disable.
+
+**Card:** `1px solid #EDF2F8` border · `shadow-cc-sm` default → `shadow-cc-md` on hover · `rounded-cc-md` (8px) · white bg · title 20px/600/`#011749`
+
+**Badge:** pill shape · exact solid hexes below (background, 1px border, text are three **different** colours — border ≠ text; never re-derive via opacity formulas, combinations are accessibility-tested) · 12–13px · sentence case · A shared `Badge` component is planned — until it ships, follow the token spec below exactly (also exported as `badgeColors`)
+
+| Status | Background | Border | Text |
+|---|---|---|---|
+| Error | `#FFE2E4` | `#F12938` | `#A30914` |
+| Warning | `#FFF4E4` | `#FF7900` | `#B45500` |
+| Pending | `#FFFEE4` | `#EABE42` | `#8D6700` |
+| Success | `#E7F4E9` | `#54C664` | `#13681F` |
+| Info | `#EAF7FF` | `#49ABEB` | `#005C99` |
+| Inactive | `#E2E2E2` | `#8C8C8F` | `#4E4E4F` |
+| Other | `#F3EAFF` | `#9459E2` | `#552496` |
+| Primary | `#E7E9F6` | `#1F39DB` | `#0D21A0` |
+
+**Input:** label always above and visible, Title Case ("Connection Name") · 2px Heritage Blue focus border · United Red error border + message below
+
+**Table header:** `#E3E8F4` bg · Foundation Blue `#011749` text, 14px/600/18px, no letter spacing · Title Case ("Device Name", "Assigned To"), never ALL CAPS (deliberate acronyms excepted)
+
+**Table rows:** zebra striping — odd rows default bg, even rows `#F4F4F9` · `1px solid #D6DCE3` bottom separator · `#EDF2F8` hover bg · navigable text in Heritage Blue only
+
+**Top nav:** `#011749` bg · labels-only (no icons next to labels) · white 14px Regular · active = 3px Horizon Blue `#49ABEB` underline flush against the text baseline · hover = white 80% opacity · 5–6 items max · notification badge = Heritage Blue bg `#0D21A0`, white text, `rounded-cc-full`, visible only when count > 0, capped at 99+ · user chip opens profile dropdown
+
+**Side nav:** `#011749` bg · icons required on every item · expanded = icon (Horizon Blue `#49ABEB` inactive / Heritage Blue `#0D21A0` active) + label, 260px, active item = white `#FFFFFF` fill + `rounded-cc-md` · collapsed = icon-only 64px, expandable items open flyout panel (white bg, `shadow-cc-lg`, `rounded-cc-md`) · sub-items indented 36px, no icon, hover fill (`rounded-cc-md`) keeps an 8px gap from the vertical indent line · collapse state persists in localStorage
+
+**User profile dropdown:** white card · `rounded-cc-md` · `shadow-cc-lg` · min-width 200px · header: 40px avatar + name 14px 600 + email 12px `#8C8D8F` · item hover `#EDF2F8` bg + `rounded-cc-sm` · active item Heritage Blue `#0D21A0` · Logout = United Red `#F12938`
+
+## Icons
+
+Source: `@phosphor-icons/react` (required peer dependency). Weight: `regular` only. Never `fill`, `duotone`, or `bold`. Size: 20px UI / 24px emphasis. Colour via `currentColor` or Tailwind class.
+
+Import pattern:
+```tsx
+import { ArrowDown, User, Bell } from '@phosphor-icons/react';
+<ArrowDown className="text-cc-heritage-blue" size={20} />
+```
+
+Never use external icon libraries (Font Awesome, Heroicons, Lucide, etc.). Icons required on every side nav item. No icons next to top nav labels or card/section titles.
+
+## Enforcement workflow
+
+Before writing code:
+1. Identify every page and component affected
+2. Separate global changes (shared components) from local changes (page-specific)
+3. Implement global changes first
+4. Deliver a compliance matrix: item → files changed → global or local
+
+## MSW (dev only)
+
+MSW active only when `NODE_ENV=development` AND `NEXT_PUBLIC_ENABLE_MOCK=true`. Zero MSW code paths in production builds.
+
+For the full specification including tints, grey tokens, icon rules, page-level rules, and handoff workflow — read `docs/frontend-guidelines.md`.

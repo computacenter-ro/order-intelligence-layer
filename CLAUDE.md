@@ -1,433 +1,529 @@
-# Order Intelligence Platform
+# CLAUDE.md
 
-## What this is
+## What this project is
 
-Internal e-commerce platform where **sales employees** order hardware (laptops, GPUs, multiple brands).
-When an order fails somewhere in the pipeline, a WARN/ERROR log lands in Elasticsearch.
-**Today**: IT support reads it and manually forwards it to the right team (devops / networking / DBA).
-**This project**: the AI Service (LangGraph) explains the issue in plain English and routes it
-directly to the right engineering team — WebSocket dashboard + Slack — with no manual triage.
+An **AI-driven log-analysis platform for a simulated order-management pipeline**
+(modeled on a real system). Mock services emit
+realistic logs into a mock Elasticsearch; an AI service (LangGraph) explains
+WARN/ERROR logs in plain English and routes them to the right team; a core
+backend assembles per-order *journeys* and feeds an IT-support dashboard
+(Next.js, WebSockets) and Slack.
 
-8-day POC, 3 developers, monorepo. Detailed day-by-day plan: `docs/plan.md`.
+**Stack:** Python 3.11+ / FastAPI, LangGraph + Pydantic, Next.js (frontend).
+Docker-compose infra: **RabbitMQ**, **PostgreSQL**, **Redis**.
+LLM: **Claude via Azure AI Foundry**.
 
-## Architecture
+Six subsystems, chained:
 
 ```
-Sales UI → Order Engine → RabbitMQ [orders.*] → Validator / RSM-SPT / Avalara
-                                                    └→ WARN/ERROR logs → Elasticsearch
-
-AI Service ← polls ES, sliding window [time()-25s, time()-5s] ← Elasticsearch
-AI Service → RabbitMQ [issues.raw] (TTL, DLQ)      # buffer: fast polling / slow LLM
-AI Service ← consumes issues.raw one at a time:
-    Redis dedup HIT  → ACK and drop (already processed)
-    Redis dedup MISS → LangGraph (ExplainerNode → RouterNode) → RabbitMQ [issues.processed]
-Core Backend ← consumes issues.processed
-Core Backend → order_issues (PostgreSQL) + WebSocket (team dashboards) + Slack webhook
-Core Backend → ES via HTTP, on demand only, for GET /journeys/{trace_id}
+[1] Mock Services (log emitters, ──POST logs──► [2] Mock Elasticsearch
+    orchestrated by a "baton")                      (Log Collector, FastAPI :9200)
+                                                        │ sliding-window poll [now-25s, now-5s]
+                                                        ▼
+                                                 [3] AI Service (LangGraph)
+                                                     dedup (Redis SETNX)
+                                                     ├─ ALL logs ────────► raw.events ─────┐
+                                                     └─ WARN/ERROR → Explainer → Router    │
+                                                              └────► processed.alerts ─────┤
+                                                                    [4] Output RabbitMQ ◄──┘
+                                                                        │ consumes both queues
+                                                                        ▼
+                                                 [5] Core Backend (FastAPI :8000 + PostgreSQL)
+                                                     alerts + Journey Assembler
+                                                        │ WebSockets / Slack webhooks
+                                                        ▼
+                                                 [6] Next.js IT Support Dashboard + Slack
 ```
 
-- **One RabbitMQ broker, distinct queues.** `orders.*` (order flow between microservices), `issues.raw` (AI ingestion buffer, has TTL + DLQ), `issues.processed` (AI results for Core Backend). The two RabbitMQ boxes in the diagram are the same broker.
-- **AI Service owns issue ingestion end-to-end**: polls ES, self-publishes raw logs to `issues.raw`, consumes them back one at a time. This buffer decouples fast polling from slow LLM calls, and unacked messages survive an AI Service crash.
-- **Duplicates are expected** — sliding windows overlap and the same error can appear in consecutive polls. Redis dedup key: hash of normalized log + `trace_id`. On hit: ACK, drop, no LLM call. Redis also caches LLM explanations for similar (not identical) errors.
-- LLM calls go through a circuit breaker; when open, publish a fallback explanation routed to IT_SUPPORT.
-- Every RabbitMQ message and every log line carries `trace_id` — the join key for journey assembly.
-- No Elasticsearch access yet: `ai-service/app/polling/` uses an abstract interface with a mock reading `infra/fixtures/es_events.json`. Real ES REST implementation plugs in without touching other code. Core Backend's on-demand journey lookup uses the same pattern.
-
-## User roles
-
-| Role | Can do |
-|------|--------|
-| `SALES` | Create orders, view own order status |
-| `IT_SUPPORT` | View ALL issues, override AI routing, see audit trail |
-| `ENGINEER` (team: `devops` \| `networking` \| `database_admin`) | View issues routed to their team, ack/resolve |
-
-Auth: JWT with `role` + `team` claims. Simple email+password for POC. Enforce role checks in FastAPI dependencies (`app/api/deps.py`), never only in frontend.
-
-## Tech stack
-
-- Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2 async + asyncpg, aio-pika, Alembic
-- LangGraph (AI Service only) — Claude via Azure AI Foundry
-- Next.js 14 App Router, TypeScript, Tailwind
-- PostgreSQL 16, Redis 7, RabbitMQ 3 — all Docker, no cloud DB
-- pytest + pytest-asyncio, ruff (lint + format), mypy
+Nothing here touches production — all services, hosts, and data are simulated.
 
 ## Repository layout
 
 ```
-order-intelligence/
+.
 ├── CLAUDE.md
-├── docker-compose.yml
-├── docker-compose.dev.yml
-├── .env.example
-├── Makefile
-├── README.md
-├── .gitignore
-│
-├── .claude/
-│   ├── settings.json
-│   ├── commands/
-│   │   ├── review.md
-│   │   ├── test.md
-│   │   └── new-service.md
-│   └── skills/                        # installed via npx skills add
-│
-├── docs/
-│   ├── plan.md
-│   ├── message-contracts.md
-│   └── adr/
-│       └── 001-polling-over-streaming.md
-│
+├── docker-compose.yml            # rabbitmq (5672/15672), redis (6379), postgres (5432)
+├── requirements.txt
 ├── shared/
-│   ├── __init__.py
-│   ├── base_worker.py                 # abstract RabbitMQ consumer — all microservices extend this
-│   ├── publisher.py                   # standalone RabbitMQ publisher
-│   ├── logging_config.py              # structured JSON logging with trace_id
-│   ├── sanitize.py                    # strip secrets/PII before LLM prompts
-│   ├── schemas/
-│   │   ├── __init__.py
-│   │   ├── order_event.py             # RabbitMQ message envelope (trace_id, timestamp, severity)
-│   │   ├── order_issue.py             # what gets written to order_issues DB
-│   │   ├── ai_explanation.py          # ExplainerNode output
-│   │   ├── ai_routing.py             # RouterNode output (Team enum + confidence)
-│   │   ├── notification.py            # Slack/Teams webhook payload
-│   │   └── validation.py             # Validator Service result
-│   └── tests/
-│       ├── __init__.py
-│       ├── test_schemas.py
-│       └── test_base_worker.py
-│
-├── order-engine/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py                    # FastAPI app + lifespan
-│   │   ├── config.py                  # pydantic-settings
-│   │   ├── models/
-│   │   │   ├── __init__.py
-│   │   │   └── order.py               # order domain model
-│   │   ├── services/
-│   │   │   ├── __init__.py
-│   │   │   └── order_service.py       # create order, generate trace_id
-│   │   └── api/
-│   │       ├── __init__.py
-│   │       ├── deps.py                # FastAPI dependencies (auth, db)
-│   │       └── routes/
-│   │           ├── __init__.py
-│   │           ├── orders.py          # POST /orders, GET /orders/{id}
-│   │           └── health.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py
-│       └── test_order_service.py
-│
-├── validator-service/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── config.py
-│   │   ├── consumer.py                # extends BaseWorker
-│   │   ├── publisher.py
-│   │   ├── rules/
-│   │   │   ├── __init__.py
-│   │   │   ├── engine.py              # rule engine
-│   │   │   └── validators.py          # business rules (stock, budget, etc.)
-│   │   └── logging/
-│   │       ├── __init__.py
-│   │       └── es_logger.py           # log WARN/ERROR to Elasticsearch
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py
-│       └── test_validators.py
-│
-├── rsm-spt/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── config.py
-│   │   ├── consumer.py                # extends BaseWorker
-│   │   ├── publisher.py
-│   │   ├── services/
-│   │   │   ├── __init__.py
-│   │   │   ├── pricing.py
-│   │   │   └── stock.py
-│   │   └── logging/
-│   │       ├── __init__.py
-│   │       └── es_logger.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py
-│       └── test_pricing.py
-│
-├── avalara/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── config.py
-│   │   ├── consumer.py                # extends BaseWorker
-│   │   ├── publisher.py
-│   │   ├── services/
-│   │   │   ├── __init__.py
-│   │   │   └── tax_calculator.py
-│   │   └── logging/
-│   │       ├── __init__.py
-│   │       └── es_logger.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py
-│       └── test_tax_calculator.py
-│
-├── ai-service/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── config.py
-│   │   ├── graph.py                   # LangGraph StateGraph definition + compile
-│   │   ├── state.py                   # IssueState Pydantic BaseModel
-│   │   ├── polling/
-│   │   │   ├── __init__.py
-│   │   │   ├── base.py               # abstract poller interface (swap mock ↔ real ES)
-│   │   │   ├── elasticsearch.py      # real ES REST poller (when access arrives)
-│   │   │   ├── mock_poller.py        # reads infra/fixtures/es_events.json
-│   │   │   └── scheduler.py          # sliding window loop [time()-25s, time()-5s]
-│   │   ├── nodes/
-│   │   │   ├── __init__.py
-│   │   │   ├── explainer.py           # ExplainerNode — LLM → natural language explanation
-│   │   │   └── router_node.py         # RouterNode — LLM → Team enum + confidence
-│   │   ├── prompts/
-│   │   │   ├── __init__.py
-│   │   │   ├── explainer.py           # system prompt for ExplainerNode
-│   │   │   └── router.py             # system prompt for RouterNode
-│   │   ├── llm/
-│   │   │   ├── __init__.py
-│   │   │   ├── client.py             # Azure AI Foundry / Claude client
-│   │   │   └── circuit_breaker.py    # pybreaker wrapper
-│   │   ├── messaging/
-│   │   │   ├── __init__.py
-│   │   │   ├── consumer.py           # consumes issues.raw (self-published by poller)
-│   │   │   └── publisher.py          # publishes to issues.raw (poller) + issues.processed (results)
-│   │   └── cache/
-│   │       ├── __init__.py
-│   │       ├── dedup.py              # processed-issue dedup: hash(normalized log + trace_id)
-│   │       └── redis.py              # Redis client + LLM response cache for similar errors
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py
-│       ├── fakes.py                   # mock LLM client — never call real LLM in tests
-│       ├── test_polling/
-│       │   └── test_scheduler.py
-│       ├── test_dedup.py
-│       ├── test_explainer.py
-│       ├── test_router_node.py
-│       ├── test_circuit_breaker.py
-│       └── test_graph.py
-│
-├── backend/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── alembic.ini
-│   ├── migrations/
-│   │   ├── env.py
-│   │   └── versions/
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py                    # FastAPI app + lifespan (startup/shutdown)
-│   │   ├── config.py
-│   │   ├── messaging/
-│   │   │   ├── __init__.py
-│   │   │   ├── consumer.py           # consumes issues.processed (AI Service results)
-│   │   │   └── dlq_handler.py        # DLQ monitoring + reprocessing (all queues)
-│   │   ├── journeys/
-│   │   │   ├── __init__.py
-│   │   │   ├── es_client.py          # on-demand ES HTTP lookup by trace_id (mockable)
-│   │   │   ├── assembler.py          # collect events by trace_id → journey timeline
-│   │   │   └── models.py             # internal journey domain models
-│   │   ├── notifications/
-│   │   │   ├── __init__.py
-│   │   │   ├── slack.py              # HTTP POST → Slack webhook
-│   │   │   ├── teams.py             # HTTP POST → MS Teams webhook
-│   │   │   └── router.py            # decide where to notify based on team/severity
-│   │   ├── websocket/
-│   │   │   ├── __init__.py
-│   │   │   ├── manager.py           # WebSocket connection manager
-│   │   │   └── events.py            # push real-time updates to connected clients
-│   │   ├── db/
-│   │   │   ├── __init__.py
-│   │   │   ├── session.py           # async SQLAlchemy session factory
-│   │   │   ├── models.py            # ORM: users, orders, order_issues
-│   │   │   └── repository.py        # CRUD for order_issues (single write point)
-│   │   └── api/
-│   │       ├── __init__.py
-│   │       ├── deps.py              # FastAPI deps: get_db, get_current_user, require_role
-│   │       └── routes/
-│   │           ├── __init__.py
-│   │           ├── issues.py        # GET /issues, GET /issues/{id}, PATCH /issues/{id}/resolve
-│   │           ├── journeys.py      # GET /journeys/{trace_id}
-│   │           ├── auth.py          # POST /auth/login, POST /auth/register
-│   │           └── health.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py
-│       ├── test_journeys/
-│       │   ├── test_assembler.py
-│       │   └── test_es_client.py
-│       ├── test_messaging/
-│       │   ├── test_consumer.py
-│       │   └── test_dlq_handler.py
-│       └── test_notifications/
-│           └── test_slack.py
-│
-├── frontend/
-│   ├── Dockerfile
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── tailwind.config.ts
-│   ├── next.config.js
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── layout.tsx
-│   │   │   ├── page.tsx              # login / landing
-│   │   │   ├── dashboard/
-│   │   │   │   └── page.tsx          # real-time issues feed (role-filtered)
-│   │   │   ├── issues/
-│   │   │   │   ├── page.tsx          # issues list (historical, filterable)
-│   │   │   │   └── [id]/
-│   │   │   │       └── page.tsx      # issue detail: journey timeline + AI explanation
-│   │   │   ├── orders/
-│   │   │   │   ├── page.tsx          # sales: order list
-│   │   │   │   └── new/
-│   │   │   │       └── page.tsx      # sales: create new order
-│   │   │   └── journeys/
-│   │   │       └── [traceId]/
-│   │   │           └── page.tsx      # full order journey explorer
-│   │   ├── components/
-│   │   │   ├── ui/                   # generic: buttons, cards, modals, badges
-│   │   │   ├── journey-timeline.tsx
-│   │   │   ├── issue-card.tsx
-│   │   │   ├── live-feed.tsx         # WebSocket real-time feed
-│   │   │   ├── status-badge.tsx
-│   │   │   ├── order-form.tsx
-│   │   │   └── nav-bar.tsx           # role-aware navigation
-│   │   ├── hooks/
-│   │   │   ├── use-websocket.ts
-│   │   │   ├── use-issues.ts
-│   │   │   └── use-auth.ts
-│   │   ├── lib/
-│   │   │   ├── api.ts               # HTTP client (axios/fetch) for backend REST
-│   │   │   ├── ws.ts                # WebSocket client with reconnection
-│   │   │   └── auth.ts             # JWT storage, refresh, role helpers
-│   │   ├── types/
-│   │   │   └── index.ts             # TypeScript types mirroring shared/schemas
-│   │   └── context/
-│   │       └── auth-context.tsx     # React context for current user + role
-│   └── tests/
-│
-└── infra/
-    ├── rabbitmq/
-    │   └── definitions.json          # exchanges, queues, bindings, DLQ, TTL config
-    ├── postgres/
-    │   ├── init.sql                  # schema bootstrap (runs on first docker compose up)
-    │   └── demo-seed.sql            # realistic demo data
-    ├── redis/
-    │   └── redis.conf
-    ├── fixtures/
-    │   └── es_events.json           # mock Elasticsearch WARN/ERROR events for dev
-    └── nginx/
-        └── nginx.conf               # reverse proxy (optional, for demo)
+│   ├── models.py                 # Pydantic: LogLine, Baton, ProcessedAlert
+│   ├── log_client.py             # POST log lines to the collector (all services use this)
+│   └── scenarios.py              # scenario definitions + step chains — single source of truth
+├── services/                     # [1] one small script/app per mock service
+│   ├── runner.py                 # shared baton-consuming loop all services reuse
+│   ├── inbound.py  order_engine.py  spt.py  rsm.py  solr.py  jam.py
+│   ├── settings.py  checker.py  avalara.py  validator.py
+│   ├── outbound_osw.py  track_trace.py
+│   └── run_all.py                # starts every service in one command
+├── injector/inject.py            # starts flows (stands in for "Orders B2B / SF")
+├── mock_es/app.py                # [2] Log Collector, FastAPI :9200
+├── ai_service/                   # [3] :8100
+│   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
+├── backend/                      # [5] :8000
+│   ├── main.py  consumers.py  journeys.py  stitching.py  slack.py  ws.py  db.py
+├── dashboard/                    # [6] Next.js app, :3000
+└── tests/
 ```
 
-## Message contract (never bypass)
+---
 
-All inter-service messages are `shared.schemas.OrderEvent`:
-`trace_id: str` (UUID, created once by Order Engine, immutable), `timestamp: datetime`,
-`source_service: str`, `event_type: str` (dot notation: `order.created`, `validation.failed`),
-`severity: "INFO"|"WARN"|"ERROR"`, `payload: dict`.
-AI results are `shared.schemas.AIExplanation` and `shared.schemas.AIRouting`
-(`assigned_team` is a `Team` enum — never a free string).
-Change a schema = update `docs/message-contracts.md` + tests in the same PR.
+## The simulated production system (what the logs imitate)
 
-## AI Service rules (ingestion + LangGraph)
+A microservice order pipeline. One order's path in the real system:
 
-Ingestion pipeline (order matters):
-1. `polling/scheduler.py` polls ES every ~20s, window `[time()-25s, time()-5s]`, filter WARN/ERROR only.
-2. Every found log → publish raw to `issues.raw` (with TTL + DLQ). No processing at poll time.
-3. `messaging/consumer.py` consumes `issues.raw` one at a time (prefetch_count=1).
-4. Dedup check first (`cache/dedup.py`): key = hash(normalized log + trace_id). HIT → **ACK immediately, no LLM call**. MISS → run the graph, mark key in Redis (with TTL), then ACK.
-5. Graph result → publish to `issues.processed`. ACK the raw message only after successful publish.
+1. Orders arrive (B2B / Salesforce) into SAP BTP — simulated by
+   `injector/inject.py`.
+2. **cc-inbound-service** receives the raw order event, transforms it (maps
+   vendor product ids to internal SKUs), publishes to RabbitMQ
+   `order.inbound.queue`.
+3. **cc-order-engine** (central orchestrator) consumes it, **creates the
+   order** (persists cart header to BM DB, generates the order number), and
+   publishes a **creation response** to `order.response.queue`, which inbound
+   reads (→ *bridge event*, see Correlation Model).
+4. cc-order-engine then enriches the order via HTTP/Feign calls:
+   **SPT** (pricing/price lists), **RSM** (rebates/PVC), **SOLR** (product
+   search), **Settings** (margin thresholds, SQL-backed, pushed from
+   Salesforce), **JAM** (user auth/privileges → JWT), **Checker** (margin
+   check — can block the order), **Avalara** (US ship-to address verification,
+   US orders only).
+5. **cc-validator-service** runs validation strategies; then RabbitMQ
+   `order.outbound.queue` → **cc-outbound-osw** submits to SAP fulfilment
+   (RFC) → **cc-track-trace** registers the order for tracking
+   (= success terminal event).
 
-LangGraph rules:
-- Graph state is a **Pydantic BaseModel** (`IssueState`), not TypedDict — we want validation between nodes.
-- `ExplainerNode`: system prompt in `ai-service/app/prompts/explainer.py`. Input: raw log + trace context. Output: 2-4 sentence explanation a non-expert understands.
-- `RouterNode`: uses `llm.with_structured_output(AIRouting)` — output is always a valid `Team` enum + confidence + reasoning. Low confidence (<0.6) routes to IT_SUPPORT for manual triage.
-- Nodes return partial state updates; never mutate state in place.
-- Every LLM call: through `app/llm/client.py` (circuit breaker wrapped). Never call the SDK directly from a node.
-- Prompts never contain: credentials, connection strings, customer PII, full DB dumps. Pass sanitized log excerpts only (`shared/sanitize.py` strips secrets by regex before any prompt).
+Failed queue deliveries go to `_error` dead-letter queues
+(`order.inbound.queue_error`, `order.outbound.queue_error`). The real system's
+Angular UI and the ETL feeds (SAP Master Data → SPT/RSM/SOLR) are not simulated.
 
-## Database essentials
+**In this project none of that business flow physically happens** — the mock
+services only *emit the logs* the real services would produce (see [1]).
 
-Tables: `users` (id, email, hash, role, team), `orders` (id, trace_id, sales_user_id, items JSONB, status),
-`order_issues` (id, trace_id, source_service, severity, ai_explanation, assigned_team, routing_confidence,
-status: open/acked/resolved, raw_event JSONB, created_at).
-Migrations: Alembic only — never hand-edit a deployed schema. `alembic upgrade head` runs on backend startup.
-Demo reset: `make demo-reset` = `docker compose down -v && up && seed from infra/postgres/demo-seed.sql`.
+---
 
-## Commands
+## Log schema (exact field names — do not deviate)
 
+Every log line is one JSON object:
+
+| Field | Type | Always present? | Notes |
+|---|---|---|---|
+| `log_id` | string (UUID) | **yes** | Unique per line. **Dedup key.** |
+| `timestamp` | string | **yes** | ISO-8601 UTC, ms precision: `2026-07-14T08:00:00.432Z` |
+| `app_name` | string | **yes** | e.g. `cc-inbound-service`, `cc-order-engine` |
+| `level` | string | **yes** | `DEBUG` / `INFO` / `WARN` / `ERROR` |
+| `logger` | string | **yes** | Java-style: `c.c.orderengine.service.OrderService` |
+| `host` | string | **yes** | e.g. `CCECMEWEBT001` |
+| `process_id` | string | **yes** | |
+| `thread` | string | **yes** | `rabbit-listener-1`, `pool-3-thread-2`, `http-nio-8080-exec-3` |
+| `eventId` | string | phase-1 + bridge only | `evt-<uuid>` |
+| `orderId` | string | bridge (maybe) + phase 2 | `ORD-NNNN` |
+| `cartHeaderId` | string | bridge (maybe) + phase 2 | 19-digit numeric string |
+| `accountNumber` | string | all phases | **Never use for correlation** — not unique per journey. |
+| `message` | string | **yes** | Free text. Terminal detection matches on it — treat as an API. |
+
+Example of a real sequence (phase 1 → bridge → phase 2) — note exactly which
+id fields appear on each line:
+
+```json
+{"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.OrderListener",
+ "eventId":"evt-372656a7-...","accountNumber":"81036533",
+ "message":"Received inbound order event evt-372656a7-... for account 81036533"}
+   ... transform + SKU-mapping logs, eventId only ...
+{"app_name":"cc-order-engine","logger":"c.c.orderengine.service.OrderCreationService",
+ "eventId":"evt-372656a7-...",
+ "message":"Generated order number ORD-6001 for cart header 1840927365018240001"}
+{"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.ResponseListener",
+ "eventId":"evt-372656a7-...","orderId":"ORD-6001","cartHeaderId":"1840927365018240001",
+ "message":"Received order creation response for event evt-372656a7-...: orderNumber=ORD-6001, cartHeaderId=1840927365018240001"}   ← BRIDGE
+{"app_name":"cc-order-engine","logger":"c.c.orderengine.service.OrderService",
+ "orderId":"ORD-6001","cartHeaderId":"1840927365018240001",
+ "message":"Get order by Order Number:ORD-6001"}                                ← phase 2, no eventId
 ```
-make up               # docker compose up all services
-make down             # stop everything
-make demo-reset       # wipe volumes, recreate schema, load demo seed data
-make test s=backend   # pytest for one service
-make test-all         # pytest for every service (CI runs this)
-make lint             # ruff check + format --check + mypy, all services
-make logs s=ai-service
-make send-order       # POST a sample order to Order Engine (smoke test)
-make break-order      # POST an order crafted to fail validation (demo the AI flow)
+
+---
+
+## ⚠️ THE CORRELATION MODEL (most important section)
+
+An order's logs form a **journey**. There is **no single id present on every
+log of a journey** — the identifier *changes over the journey's lifetime*:
+
+- **Phase 1 — pre-creation.** Inbound receive → transform → publish →
+  order-engine consume/create: logs carry **ONLY `eventId`**
+  (plus `accountNumber`). No `orderId`, no `cartHeaderId` — they don't exist yet.
+- **Bridge event.** Order-engine publishes the creation response to
+  `order.response.queue`; inbound logs it (logger
+  `c.c.inbound.listener.ResponseListener`, message starts
+  `"Received order creation response for event ..."`). That single log carries
+  `eventId` **AND** `orderId` and/or `cartHeaderId` — **usually only ONE of
+  the two (randomly); sometimes both**. It is the only log where `eventId`
+  coexists with the order ids.
+- **Phase 2 — post-creation.** `eventId` disappears. All downstream logs
+  (enrichment, checker, validator, outbound, track-trace) carry **both
+  `orderId` and `cartHeaderId`**.
+
+### Invariants (code and tests must respect these)
+1. A journey = internal `journey_id` + an **alias set** of ids accumulated
+   over time. Correlating by any single field is impossible.
+2. Every log that introduces a *new* id also carries an *already-known* id:
+   bridge = known `eventId` + new order id(s); first phase-2 log = BOTH order
+   ids, at least one known from the bridge. Single-pass stitching in timestamp
+   order therefore always works, whichever id the bridge exposed.
+   **Test all three bridge variants: both / orderId-only / cartHeaderId-only.**
+3. Journeys failing before creation (transform failure, creation DB failure)
+   **never get order ids** — complete, valid journeys identified only by
+   `eventId`. Correct behavior, not a data gap.
+4. Logs of one journey can be split across polls — assembly must be
+   incremental ("lazy"): a journey grows as future polls deliver more of it.
+
+Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
+NOT stitch — it processes individual logs.
+
+---
+
+## [1] Mock Services — log emitters + baton orchestration
+
+Each service is a **standalone script that only generates its own logs and
+POSTs them to the Log Collector** (`shared/log_client.py`). No business data
+moves between services. What moves is a **baton** — a control message that
+tells the next service "your turn to emit", carrying the flow context.
+
+### The Baton (Pydantic, `shared/models.py`)
+```json
+{
+  "flow_id": "internal-uuid",
+  "scenario": 6,
+  "steps": [["inbound","receive"],["order_engine","create"],["inbound","bridge"],
+            ["order_engine","enrich"],["spt","serve"], "..."],
+  "cursor": 3,
+  "ctx": {
+    "eventId": "evt-...",
+    "accountNumber": "81036533",
+    "country": "UK",
+    "user": "RFLORIA",
+    "lines": [{"productId": "3652269", "sku": "SKU-GPU-A100-80GB"}],
+    "orderId": null,
+    "cartHeaderId": null,
+    "bridge_ids": "random",
+    "fail_at": null
+  }
+}
 ```
 
-## Code conventions
+- **Transport:** RabbitMQ control queues, one per service:
+  `sim.step.<service>` (e.g. `sim.step.inbound`). A service consumes a baton,
+  emits the log block for `steps[cursor]`, advances `cursor`, publishes the
+  baton to the next step's queue. `services/runner.py` implements this loop
+  once; each service only defines its log blocks.
+- **Step chains are compiled from `shared/scenarios.py`** — the scenario
+  defines the exact (service, block) sequence, including satellite
+  interleaving during enrichment (OE client log → satellite server log → OE
+  response log) and early termination on failures.
+- **Timing:** a service sleeps 10–110 ms (random) between its log lines, and
+  the baton hop adds natural delay — so timestamps (always real `utcnow`)
+  interleave realistically across concurrently running flows.
+- **Id rules (this is what keeps the Correlation Model honest):**
+  - `ctx.orderId`/`ctx.cartHeaderId` start null; **only order_engine's
+    `create` block fills them**.
+  - A service must only put into its logs the ids present in `ctx` *at that
+    moment* — phase-1 blocks therefore physically cannot log order ids.
+  - The `inbound.bridge` block logs `eventId` + the ids selected by
+    `bridge_ids` (`both|order|cart|random`).
+  - Phase-2 blocks log `orderId` + `cartHeaderId`, **never** `eventId`.
+- **Failures:** `ctx.fail_at` names the block that must emit its failure
+  variant (ERROR/WARN lines, retries, DLQ message) and **stop the chain** —
+  the baton is not forwarded past a fatal failure.
 
-- Async everywhere: async SQLAlchemy, aio-pika, httpx. A sync call in a request path is a review blocker.
-- All cross-service data uses `shared/schemas` models. Inline dicts crossing a boundary = review blocker.
-- Type hints on every function. `Any` requires a `# why:` comment.
-- Business logic lives in `services/` or `journeys/`, not in route handlers or consumers.
-- Config via pydantic-settings from env vars only. No hardcoded URLs, ports, keys.
-- Every log line: structured (JSON), includes `trace_id` when one exists.
-- Frontend: server components by default; client components only for WebSocket/live UI. Types in `frontend/src/types` mirror `shared/schemas` — update together.
+### Services
 
-## Testing requirements (from Ways of Working — gate for every merge)
+| Service | app_name | host | Blocks / notable logs |
+|---|---|---|---|
+| inbound | cc-inbound-service | CCECMETLT001 | `receive` (transform + SKU mapping, publish log), `bridge` (**the bridge log**). Fail `transform`: unknown product → 3 redeliveries → `"routing message to order.inbound.queue_error"`. |
+| order_engine | cc-order-engine | CCECMEWEBT001 | `create` (fills ids; creation-response publish log), `enrich` (client `--->`/`<---` Feign-style logs around each satellite), `dispatch` (publish to order.outbound.queue log). Fail `create`: BM-DB timeout ×3 → failure response (still eventId-only). |
+| spt | cc-spt-service | CCECMSRVT001 | price list lookup logs. Fail `spt`: OE logs timeouts ×3 → `"Order processing aborted"`. |
+| rsm | cc-rsm-service | CCECMSRVT001 | rebates / PVC rates logs. |
+| solr | cc-solr-service | CCECMSRVT001 | product search / id resolution logs. |
+| jam | cc-jam-service | CCECMSRVT001 | auth + privileges + JWT logs. Fail `jam`: 403 account disabled → abort. |
+| settings | cc-settings-service | CCECMSRVT002 | margin threshold settings; Hibernate-style SQL log. |
+| checker | cc-checker-service | CCECMSRVT002 | per-line margin logs. Fail `margin`: below threshold → `"blocked by margin check"`. |
+| avalara | cc-avalara-service | CCECMSRVT002 | US address verification (US flows only). |
+| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs. Fail `udf`: missing `costCenter` UDF → 422 → abort. |
+| outbound_osw | cc-outbound-osw | CCECMEWEBT002 | SAP submission logs. Fail `sap`: RFC failure ×3 → `"moved to order.outbound.queue_error"`. |
+| track_trace | cc-track-trace | CCECMEWEBT002 | `"Registered order ... for tracking"` (**success terminal**). |
 
-- New logic ships with tests in the same PR. Failure paths are mandatory for: circuit breaker open, RabbitMQ down, malformed OrderEvent, LLM timeout, low routing confidence.
-- LLM is always mocked in tests (`ai-service/tests/fakes.py`). No live LLM calls in CI.
-- Run the affected service's tests + `make lint` before every commit.
+### The 10 canonical scenarios (`shared/scenarios.py` — ground truth for tests)
 
-## Git workflow (from Ways of Working)
+| # | Outcome | fail_at | bridge_ids |
+|---|---|---|---|
+| 1 | `SUCCESS` (UK, 3 lines) | — | both |
+| 2 | `SUCCESS` (DE via Salesforce) | — | order |
+| 3 | `SUCCESS` (US, Avalara runs) | — | cart |
+| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) |
+| 5 | `ORDER_CREATION_FAILED` | create | — (never created) |
+| 6 | `MARGIN_CHECK_FAILED` | margin | order |
+| 7 | `VALIDATION_FAILED` | udf | both |
+| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart |
+| 9 | `AUTH_FAILED` (JAM 403) | jam | order |
+| 10 | `SAP_SUBMISSION_FAILED` | sap | both |
 
-- Feature branches → PR → 1 human review minimum → merge. Never push to main.
-- Tag PRs `ai-first` when Claude materially wrote the code. AI is never a commit co-author.
-- The PR author must be able to explain every changed line. "It works" is not an explanation.
-- One thin slice per PR (one consumer, one endpoint, one component) — not a whole service.
+### Injector (`injector/inject.py`)
+Creates fresh ids (`eventId` = new UUID, `orderId` = `ORD-<seq>`,
+`cartHeaderId` = unique 19-digit), compiles the scenario's step chain into a
+baton, publishes it to `sim.step.inbound`.
+`--scenario N` | `--all` (10 staggered) | `--mode continuous --interval S`.
 
-## Never do
+---
 
-- Never commit secrets, `.env`, or real API keys (use `.env.example` as template).
-- Never put PII, credentials, or raw DB dumps in an LLM prompt — sanitize first.
-- Never bypass RabbitMQ with direct HTTP calls between microservices.
-- Never write to `order_issues` from anywhere except Core Backend's repository layer.
-- Never let frontend trust its own role checks — the API enforces authz.
-- Never merge with failing tests, failing lint, or an unexplained diff.
+## [2] Mock Elasticsearch — Log Collector (`mock_es/app.py`, :9200)
 
-## Deeper docs (read when relevant)
+FastAPI, in-memory storage. Intentionally dumb — **no journey logic here, ever**.
 
-- `docs/plan.md` — 8-day plan, who owns what, critical path
-- `docs/message-contracts.md` — full event catalog with examples
-- `docs/adr/` — architecture decision records (why polling not streaming, why circuit breaker, etc.)
-- `infra/fixtures/es_events.json` — realistic WARN/ERROR events for dev without ES access
+| Endpoint | Behavior |
+|---|---|
+| `POST /logs` | Single log object or array. Validates `log_id` + `timestamp` (422 otherwise). Returns `{"ingested": N}`. |
+| `GET /logs?from=<iso>&to=<iso>` | `from <= timestamp < to`, sorted ascending. |
+| `GET /logs?id=<X>` | Logs where `eventId==X` OR `orderId==X` OR `cartHeaderId==X`, ascending. **Debug/ops tool only** — no runtime component depends on it. |
+| `GET /health` | `{"status":"ok","stored":N}` |
+
+Only the AI service's poller reads from it at runtime.
+
+---
+
+## [3] AI Service (LangGraph, :8100)
+
+### Poller (`poller.py`)
+Every `POLL_INTERVAL` (default 10s) query the collector with the sliding
+window **`[now - 25s, now - 5s]`** (the 5s tail is the ingestion-lag guard;
+consecutive windows overlap — that's intentional and safe because of dedup):
+
+```python
+for log in es.range(now - 25, now - 5):                    # sorted asc
+    if not redis.set(f"dedup:{log['log_id']}", 1, nx=True, ex=3600):
+        continue                                            # SETNX dedup
+    publish("raw.events", log)                              # ALL logs, unprocessed
+    if log["level"] in ("WARN", "ERROR") and not suppressed(log):
+        input_queue.put(log)                                # → LangGraph
+```
+
+- **Every deduped log** is duplicated onto **`raw.events`** (journey material
+  for the backend).
+- Only **WARN + ERROR** enter the LangGraph pipeline.
+- **Suppression list** (config, data-driven): benign WARNs that must not
+  become alerts — `"Not implemented"` (validator strategies),
+  `"No internal contracts found"`. They still go to `raw.events`.
+
+### LangGraph pipeline (`graph.py`, `nodes.py`)
+```
+input_queue → Explainer Node ──LLM call 1 (plain-English explanation)──► Router Node ──LLM call 2 (team)──► ProcessedAlert → processed.alerts
+                   │ circuit breaker wraps the LLM calls
+                   └── breaker open / LLM error ──► ProcessedAlert with explanation=null, department=null,
+                                                    source="fallback"  (raw log passed straight through)
+```
+- **Explainer Node** — LLM call 1: plain-English explanation of the log for an
+  IT-support agent (what happened, which service, likely cause).
+- **Router Node** — LLM call 2: pick a `department` + `confidence` (0–1).
+- **Fallback is a pass-through, NOT rule-based**: when the LLM is down, the
+  log is sent down the pipe unexplained and unrouted (`source: "fallback"`).
+  The backend routes those to the **general** Slack channel. There is no
+  keyword/rule classification anywhere.
+- **Circuit breaker** (`breaker.py`): 3 consecutive LLM failures → open 60s →
+  half-open probe. State in Redis (`ai:breaker:state`) so it survives restarts.
+  While open, skip LLM calls entirely.
+
+### `ProcessedAlert` (Pydantic, `shared/models.py`) — contract on `processed.alerts`
+```python
+class Department(str, Enum):
+    networking = "networking"; devops = "devops"; backend = "backend"
+    database = "database"; general = "general"
+
+class ProcessedAlert(BaseModel):
+    alert_id: str                       # uuid
+    emitted_at: datetime
+    log: LogLine                        # the full original log line
+    explanation: str | None             # plain English; None when source="fallback"
+    department: Department | None      # None when source="fallback"
+    confidence: float | None            # 0..1; None when source="fallback"
+    source: Literal["ai", "fallback"]
+```
+
+### Journey summary API (`api.py`)
+`POST /summarize-journey` — body: journey meta + ordered raw logs. Returns an
+LLM-written summary (services touched, where it stopped, why). Called by the
+backend **on journey completion**. Same breaker; when LLM is down return a
+plain template built from journey meta (`source: "fallback"`).
+
+### LLM config — Claude via Azure AI Foundry
+All provider wiring in ONE module, via LangChain's chat-model abstraction:
+```
+AZURE_AI_FOUNDRY_ENDPOINT / AZURE_AI_FOUNDRY_API_KEY
+AZURE_AI_FOUNDRY_DEPLOYMENT_EXPLAINER   # fast/cheap
+AZURE_AI_FOUNDRY_DEPLOYMENT_ROUTER      # fast/cheap
+AZURE_AI_FOUNDRY_DEPLOYMENT_SUMMARY     # stronger
+```
+
+---
+
+## [4] Output RabbitMQ
+
+Two durable queues, both published by the AI service, both consumed by the
+backend:
+
+| Queue | Payload | Purpose |
+|---|---|---|
+| `processed.alerts` | `ProcessedAlert` JSON | explained/routed WARN+ERROR alerts (or fallback pass-throughs) |
+| `raw.events` | raw `LogLine` JSON | every deduped log — journey assembly material |
+
+Delivery is **at-least-once** → backend consumers must be idempotent
+(`alert_id` / `log_id` unique constraints).
+
+---
+
+## [5] Core Backend (FastAPI, :8000)
+
+### Consumers (`consumers.py`)
+- **`processed.alerts`** → dedup on `alert_id` → persist → WebSocket push
+  (`alert.new`) → Slack: department channel when `source="ai"` and department
+  set; **general channel** when `source="fallback"`.
+- **`raw.events`** → dedup on `log_id` → feed the Journey Assembler.
+
+### Journey Assembler (`journeys.py` + `stitching.py`)
+Assembles journeys **incrementally** from the `raw.events` stream — one poll
+almost never contains a full journey; later polls extend it ("lazy" assembly).
+
+Stitching per the Correlation Model (single pass, logs processed in timestamp
+order):
+```python
+ids = [log.eventId?, log.orderId?, log.cartHeaderId?]
+jid = first id found in alias map, else new journey
+register ALL ids on this log as aliases of jid
+append log to journey jid
+```
+
+**Journey-over rules** (exactly these three):
+
+| Condition | Journey outcome |
+|---|---|
+| Last event = track-trace `"Registered order ... for tracking"` | `SUCCESS` |
+| Last event = a publish-to-`_error`-queue log (message contains `order.inbound.queue_error` / `order.outbound.queue_error`) or a fatal abort ERROR (`"Order creation failed for event"`, `"Order processing aborted"`, `"submission aborted"`, `"blocked by margin check"`) | `FAILED` (subtype from the message) |
+| No new event for the journey's ids for **90s** (`STALLED_TIMEOUT`) | `TIMED_OUT` |
+
+On journey completion: persist outcome → request LLM summary from AI service
+(`POST /summarize-journey`) → WebSocket push (`journey.completed`, includes
+summary) → Slack notification. While in progress, each appended chunk pushes
+`journey.updated` — the dashboard's journey view fills in progressively,
+possibly later than the alert that referenced it.
+
+### PostgreSQL schema (sketch)
+```
+alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
+       event_id, order_id, cart_header_id, account_number,
+       explanation, department, confidence, source, journey_id FK NULL)
+journeys(journey_id PK, status, outcome NULL, first_ts, last_ts,
+         event_id, order_id, cart_header_id, summary NULL)
+journey_events(journey_id FK, log_id UNIQUE, ts, raw JSONB)
+```
+
+### API
+```
+GET  /alerts?since=&department=&source=
+GET  /journeys?status=
+GET  /journeys/{id}                     # journey + its events + summary
+WS   /ws                                # alert.new | journey.updated | journey.completed
+```
+
+### Slack (`slack.py`)
+Webhook per department channel + general:
+`SLACK_WEBHOOK_NETWORKING`, `_DEVOPS`, `_BACKEND`, `_DATABASE`, `_GENERAL`
+(channels like `#devops-logs`, ... , `#general-logs`). Card: level/outcome,
+service, explanation (or "unprocessed — LLM unavailable"), ids, confidence,
+`AI` vs `fallback` badge, link to the dashboard journey view. **If a webhook
+env var is unset, print the card to stdout** — never crash on missing config.
+
+---
+
+## [6] Next.js IT Support Dashboard (`dashboard/`, :3000)
+
+Connects to backend WS + REST. Feature contract:
+- Real-time alert feed with plain-English explanations.
+- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**
+  (from `ProcessedAlert.source`).
+- Order journey timeline view: complete path — services touched, where it
+  stopped, why; per-step alert explanations where they exist; LLM journey
+  summary once completed; `TIMED_OUT` flag surfaced. The journey may appear /
+  fill in **later** than its alerts — the UI must handle progressive updates
+  (`journey.updated`).
+
+---
+
+## Redis keys
+
+| Key | Type | TTL | Purpose |
+|---|---|---|---|
+| `dedup:{log_id}` | string | 1h | AI-service poller SETNX dedup |
+| `ai:last_to` | string | — | poller watermark (optional; window is time-anchored) |
+| `ai:breaker:state` | hash | — | circuit breaker state |
+
+Journey state lives in Postgres — the backend owns journeys.
+
+---
+
+## Running everything
+
+```bash
+docker compose up -d                          # rabbitmq, redis, postgres
+pip install -r requirements.txt
+uvicorn mock_es.app:app --port 9200           # [2]
+python -m services.run_all                    # [1] all mock services (baton consumers)
+python -m ai_service.main                     # [3] poller + graph + api (:8100)
+python -m backend.main                        # [5] api + consumers + ws (:8000)
+cd dashboard && npm run dev                   # [6] :3000
+python injector/inject.py --all               # fire the 10 scenarios
+```
+
+Env defaults: `ES_URL=http://localhost:9200`,
+`REDIS_URL=redis://localhost:6379/0`,
+`RABBITMQ_URL=amqp://guest:guest@localhost:5672/`,
+`DATABASE_URL=postgresql://...`, `POLL_INTERVAL=10`, `WINDOW_START_OFFSET=25`,
+`WINDOW_END_OFFSET=5`, `STALLED_TIMEOUT=90`, plus Azure AI Foundry vars and
+Slack webhooks above.
+
+---
+
+## Testing
+
+- **Correlation invariants**: phase-1 logs never contain order ids; the bridge
+  always has `eventId` + ≥1 order id; phase-2 logs never contain `eventId`;
+  stitching succeeds for all three bridge variants; pre-creation failures
+  produce eventId-only journeys.
+- **Cross-poll assembly**: split one flow's logs across ≥3 polls (including a
+  split right at the bridge) → exactly one journey, correct outcome.
+- **Dedup / idempotency**: overlapping windows re-deliver logs → no duplicate
+  raw.events processing, no duplicate alerts; re-delivered queue messages
+  change nothing.
+- **AI service**: WARN/ERROR filtering + suppression; breaker opens after 3
+  failures; fallback alerts have null explanation/department,
+  `source="fallback"`, and land in the general Slack channel; router output is
+  always one of the 5 departments.
+- **Journey rules**: each of the 10 scenarios ends with its expected outcome;
+  killing the chain mid-flow (drop the baton) produces `TIMED_OUT` after 90s.
+- **End-to-end**: `injector --all` → 10 journeys with the exact outcomes
+  table, alerts visible on WS, journey completions with summaries.
+
+## Gotchas / rules for future changes
+
+- **Never** correlate by `accountNumber`.
+- **Never** assume `orderId` exists at the start of a journey — pre-creation
+  failures live and die with only `eventId`.
+- The bridge may expose only one order id — both stitching directions must
+  work and be tested.
+- Message texts are load-bearing: journey terminal detection matches on them.
+  Changing a log message in a service block requires updating the detection
+  rules and tests together.
+- Mock services stay hollow: they emit logs and forward the baton — nothing
+  else. The baton `ctx` id rules are what keep the Correlation Model honest;
+  never bypass them.
+- The collector is intentionally dumb; journey intelligence lives ONLY in the
+  backend, alert intelligence ONLY in the AI service.
+- There is **no rule-based classification** — the LLM-down path is a raw
+  pass-through to the general channel. Don't reintroduce keyword routing.
+- Both output queues are at-least-once: consumers must be idempotent.
+- The system must remain useful with the LLM completely down (breaker +
+  pass-through alerts + template journey summaries). Test this path.
+- All LLM/provider wiring stays in one module (Azure AI Foundry today).

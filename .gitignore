@@ -22,3 +22,6 @@ Thumbs.db
 
 # Logs / local scratch
 *.log
+
+# Local agent config
+.claude/

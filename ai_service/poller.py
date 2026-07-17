@@ -46,6 +46,11 @@ def is_new(log_id: str) -> bool:
     return bool(_redis.set(f"dedup:{log_id}", 1, nx=True, ex=3600))
 
 
+def needs_alert(log: dict) -> bool:
+    """WARN/ERROR only for now — suppression criteria pending team discussion."""
+    return log["level"] in ("WARN", "ERROR")
+
+
 def poll_once(now: datetime | None = None) -> list[dict]:
     """Fetch the current window, keep only logs not seen before (dedup), return them."""
     from_iso, to_iso = poll_window(now)
@@ -54,10 +59,15 @@ def poll_once(now: datetime | None = None) -> list[dict]:
 
 
 def run() -> None:
-    """Continuously poll every POLL_INTERVAL seconds, printing deduped logs as they arrive."""
+    """Continuously poll every POLL_INTERVAL seconds.
+
+    Every deduped log is raw.events material; WARN/ERROR ones also need an alert.
+    """
     while True:
         for log in poll_once():
-            print(log)
+            print(f"[raw] {log}")
+            if needs_alert(log):
+                print(f"[alert] {log}")
         time.sleep(POLL_INTERVAL)
 
 

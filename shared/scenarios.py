@@ -80,9 +80,20 @@ def _enrich_resp(sat: str) -> str:
 
 
 # --- Enrichment satellite order ----------------------------------------------
-# The order the order engine calls each satellite during enrich (CLAUDE.md [1]
-# / mock-order-flows-v2.json). Avalara is US-only and appended conditionally.
-ENRICH_SATELLITES: list[str] = [SPT, RSM, SOLR, SETTINGS, JAM, CHECKER]
+# The order the order engine calls each satellite during enrich, taken from the
+# reference dataset (data/mock-order-flows-v2.json): SPT -> RSM -> SETTINGS ->
+# JAM -> CHECKER.
+#
+# Two services from the CLAUDE.md table are deliberately NOT standalone enrich
+# satellites, because the reference dataset does not emit them as separate
+# server-side steps during enrichment:
+#   * SOLR  — product-id resolution happens inside the order engine; there is no
+#             cc-solr-service `serve` block in any reference flow.
+#   * AVALARA — US ship-to verification is emitted by cc-validator-service (its
+#             AvalaraClient + ValidateShipToWithAvalara strategy), NOT by a
+#             standalone service. So Avalara is handled inside the validator's
+#             `validate` block for US flows, not as an enrich satellite.
+ENRICH_SATELLITES: list[str] = [SPT, RSM, SETTINGS, JAM, CHECKER]
 
 
 # --- Scenario definition ------------------------------------------------------
@@ -137,11 +148,10 @@ def _full_chain(scenario: Scenario) -> list[tuple[str, str]]:
     # bridge
     steps.append((INBOUND, BLOCKS.BRIDGE))
 
-    # phase 2 — enrichment (fine-grained satellite trio each)
-    satellites = list(ENRICH_SATELLITES)
-    if scenario.country == "US":
-        satellites.append(AVALARA)  # US ship-to verification only
-    for sat in satellites:
+    # phase 2 — enrichment (fine-grained satellite trio each). US Avalara
+    # verification is NOT a satellite here — the validator emits it (see the
+    # ENRICH_SATELLITES note and services/validator.py).
+    for sat in ENRICH_SATELLITES:
         steps.append((ORDER_ENGINE, _enrich_call(sat)))
         steps.append((sat, BLOCKS.SERVE))
         steps.append((ORDER_ENGINE, _enrich_resp(sat)))

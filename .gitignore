@@ -23,5 +23,9 @@ Thumbs.db
 # Logs / local scratch
 *.log
 
+# capture_flow.py output (local log-capture dumps, not source)
+captured_logs.json
+flow*.json
+
 # Local agent config
 .claude/

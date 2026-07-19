@@ -20,7 +20,9 @@ from shared.scenarios import (
     INBOUND,
     ORDER_ENGINE,
     SCENARIOS,
+    SOLR,
     TRACK_TRACE,
+    VALIDATOR,
     BLOCKS,
     all_scenarios,
     compile_steps,
@@ -102,11 +104,30 @@ def test_all_three_bridge_variants_are_represented():
     assert {"both", "order", "cart"} <= variants
 
 
-def test_avalara_runs_only_for_us():
+def test_avalara_is_not_a_standalone_enrich_satellite():
+    # Per the reference dataset, Avalara ship-to verification is emitted by the
+    # validator (US flows only), not by a standalone cc-avalara-service `serve`
+    # step. So no chain contains an (avalara, serve) step, and avalara is not in
+    # the satellite list.
+    assert AVALARA not in ENRICH_SATELLITES
     for s in all_scenarios():
-        steps = compile_steps(s)
-        ran_avalara = (AVALARA, BLOCKS.SERVE) in steps
-        assert ran_avalara == (s.country == "US" and s.reaches_creation)
+        assert (AVALARA, BLOCKS.SERVE) not in compile_steps(s)
+
+
+def test_solr_is_not_a_standalone_enrich_satellite():
+    # SOLR product-id resolution is internal to the order engine in the
+    # reference dataset — there is no cc-solr-service `serve` step.
+    assert SOLR not in ENRICH_SATELLITES
+    for s in all_scenarios():
+        assert (SOLR, BLOCKS.SERVE) not in compile_steps(s)
+
+
+def test_us_flow_reaches_the_validator_where_avalara_is_emitted():
+    # The US success flow (S3) must reach the validator's validate block — that
+    # is where the validator emits the Avalara ship-to verification lines.
+    s3 = SCENARIOS[3]
+    assert s3.country == "US"
+    assert (VALIDATOR, BLOCKS.VALIDATE) in compile_steps(s3)
 
 
 def test_enrichment_uses_fine_grained_call_serve_resp_trio():

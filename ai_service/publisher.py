@@ -13,7 +13,7 @@ and the backend consumers are the idempotent side (dedup on ``log_id`` /
 hand-built dicts, so the wire format (canonical timestamp, exact field set)
 matches what the backend expects.
 
-The aio-pika usage mirrors ``services/runner.py`` (connect_robust, idempotent
+The aio-pika usage mirrors ``pipeline/services/runner.py`` (connect_robust, idempotent
 durable ``declare_queue``, ``default_exchange.publish`` with PERSISTENT delivery)
 so the whole project speaks RabbitMQ the same way. The channel is injectable so
 unit tests exercise routing/serialization with a fake — no broker required.

@@ -13,9 +13,9 @@ Prerequisites (all via docker compose): RabbitMQ + the collector + the mock
 services must be running. Typical local setup::
 
     docker compose up -d rabbitmq redis
-    uvicorn mock_es.app:app --port 9200          # the collector
-    python -m services.run_all                   # the mock services
-    python -m scripts.capture_flow --scenario scenario_number --out flowX.json
+    uvicorn pipeline.mock_es.app:app --port 9200          # the collector
+    python -m pipeline.services.run_all                   # the mock services
+    python -m pipeline.scripts.capture_flow --scenario scenario_number --out flowX.json
 
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import httpx
 
-from injector.inject import inject_scenario
+from pipeline.injector.inject import inject_scenario
 from shared.scenarios import SCENARIOS, all_scenarios
 
 ES_URL = os.getenv("ES_URL", "http://localhost:9200").rstrip("/")
@@ -103,7 +103,7 @@ async def _run(args: argparse.Namespace) -> int:
             baseline = len(await _all_logs(client))
         except httpx.HTTPError as exc:
             print(f"[capture] ERROR: cannot reach collector at {ES_URL} ({exc})")
-            print("[capture] is the collector running? uvicorn mock_es.app:app --port 9200")
+            print("[capture] is the collector running? uvicorn pipeline.mock_es.app:app --port 9200")
             return 1
 
         print(f"[capture] collector has {baseline} logs; firing {len(scenario_ids)} scenario(s)")

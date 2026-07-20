@@ -14,7 +14,7 @@ No service block is implemented here — only the loop and the dispatch.
 
 Run one service::
 
-    python -m services.runner inbound
+    python -m pipeline.services.runner inbound
 """
 from __future__ import annotations
 
@@ -32,11 +32,11 @@ from shared.models import Baton
 
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
-# The registry lives in ``services.registry`` (a single module object) so that
-# blocks register into the same ``BLOCKS`` the dispatch loop reads, regardless of
-# the ``python -m`` double-import of this module. ``register`` is re-exported so
-# existing ``from services.runner import register`` imports keep working.
-from services.registry import BLOCKS, Block, EmitFn, register  # noqa: E402,F401
+# The registry lives in ``pipeline.services.registry`` (a single module object) so
+# that blocks register into the same ``BLOCKS`` the dispatch loop reads, regardless
+# of the ``python -m`` double-import of this module. ``register`` is re-exported so
+# existing ``from pipeline.services.runner import register`` imports keep working.
+from pipeline.services.registry import BLOCKS, Block, EmitFn, register  # noqa: E402,F401
 
 
 def _queue_name(service: str) -> str:
@@ -119,14 +119,14 @@ async def _handle(
 
 
 def _load_blocks(service_name: str) -> None:
-    """Import ``services.<service_name>`` so its ``@register`` blocks populate ``BLOCKS``.
+    """Import ``pipeline.services.<service_name>`` so its ``@register`` blocks populate ``BLOCKS``.
 
     Registration is an import side-effect: unless the service module is
     imported, its ``@register(...)`` decorators never run and ``BLOCKS`` stays
     empty for that service. The service stem (``inbound``, ``order_engine``, ...)
     is also the module name, so this resolves generically.
     """
-    module = f"services.{service_name}"
+    module = f"pipeline.services.{service_name}"
     try:
         importlib.import_module(module)
     except ModuleNotFoundError as exc:
@@ -184,7 +184,7 @@ async def run_service(service_name: str) -> None:
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
-        print("usage: python -m services.runner <service_name>", file=sys.stderr)
+        print("usage: python -m pipeline.services.runner <service_name>", file=sys.stderr)
         return 2
     asyncio.run(run_service(argv[1]))
     return 0

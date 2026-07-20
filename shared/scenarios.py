@@ -4,14 +4,14 @@ This module is *declarative*: it defines the ten canonical order flows
 (CLAUDE.md "[1] ... The 10 canonical scenarios") and compiles each into the
 ordered ``(service, block)`` step chain a Baton carries. It writes **no log
 text** and mints **no ids** — the service blocks emit logs from the Baton
-``ctx`` at run time, and ``injector/inject.py`` mints the concrete
+``ctx`` at run time, and ``pipeline/injector/inject.py`` mints the concrete
 ``eventId`` / ``orderId`` / ``cartHeaderId`` when it turns a scenario into a
 live Baton.
 
 Consumers:
-* ``injector/inject.py`` — compiles ``SCENARIOS[n]`` + fresh ids into a Baton.
-* ``services/`` + ``services/runner.py`` — the block names emitted here are the
-  vocabulary each service must register (see ``BLOCKS`` below).
+* ``pipeline/injector/inject.py`` — compiles ``SCENARIOS[n]`` + fresh ids into a Baton.
+* ``pipeline/services/`` + ``pipeline/services/runner.py`` — the block names
+  emitted here are the vocabulary each service must register (see ``BLOCKS`` below).
 * tests — ``Scenario`` metadata (``outcome``, ``reaches_creation``,
   ``terminal``) is the ground truth for outcome / correlation-invariant tests.
 

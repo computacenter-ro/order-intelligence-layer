@@ -11,9 +11,9 @@ Failure variant (``fail_at=udf``, scenario 7): a mandatory line UDF
 """
 from __future__ import annotations
 
-from services.blocklib import emit_line, phase2_ids
-from services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
-from services.registry import EmitFn, register
+from pipeline.services.blocklib import emit_line, phase2_ids
+from pipeline.services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
+from pipeline.services.registry import EmitFn, register
 from shared.models import Baton
 
 _PROF = profile("validator")

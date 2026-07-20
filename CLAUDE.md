@@ -44,18 +44,23 @@ Nothing here touches production — all services, hosts, and data are simulated.
 ├── CLAUDE.md
 ├── docker-compose.yml            # rabbitmq (5672/15672), redis (6379), postgres (5432)
 ├── requirements.txt
-├── shared/
+├── shared/                       # cross-cutting: used by pipeline/, ai_service/, and backend/
 │   ├── models.py                 # Pydantic: LogLine, Baton, ProcessedAlert
 │   ├── log_client.py             # POST log lines to the collector (all services use this)
 │   └── scenarios.py              # scenario definitions + step chains — single source of truth
-├── services/                     # [1] one small script/app per mock service
-│   ├── runner.py                 # shared baton-consuming loop all services reuse
-│   ├── inbound.py  order_engine.py  spt.py  rsm.py  solr.py  jam.py
-│   ├── settings.py  checker.py  avalara.py  validator.py
-│   ├── outbound_osw.py  track_trace.py
-│   └── run_all.py                # starts every service in one command
-├── injector/inject.py            # starts flows (stands in for "Orders B2B / SF")
-├── mock_es/app.py                # [2] Log Collector, FastAPI :9200
+├── pipeline/                     # the simulated order pipeline: emitters + collector + dev tooling
+│   ├── services/                 # [1] one small script/app per mock service
+│   │   ├── runner.py              # shared baton-consuming loop all services reuse
+│   │   ├── registry.py            # (service, block) -> handler registry
+│   │   ├── blocklib.py  profiles.py
+│   │   ├── inbound.py  order_engine.py  spt.py  rsm.py  jam.py
+│   │   ├── settings.py  checker.py  validator.py
+│   │   ├── outbound_osw.py  track_trace.py
+│   │   └── run_all.py             # starts every service in one command
+│   ├── injector/inject.py        # starts flows (stands in for "Orders B2B / SF")
+│   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
+│   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
+│   └── data/                     # reference fixtures (e.g. captured real-system log samples)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 ├── backend/                      # [5] :8000
@@ -71,7 +76,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 A microservice order pipeline. One order's path in the real system:
 
 1. Orders arrive (B2B / Salesforce) into SAP BTP — simulated by
-   `injector/inject.py`.
+   `pipeline/injector/inject.py`.
 2. **cc-inbound-service** receives the raw order event, transforms it (maps
    vendor product ids to internal SKUs), publishes to RabbitMQ
    `order.inbound.queue`.
@@ -210,8 +215,8 @@ tells the next service "your turn to emit", carrying the flow context.
 - **Transport:** RabbitMQ control queues, one per service:
   `sim.step.<service>` (e.g. `sim.step.inbound`). A service consumes a baton,
   emits the log block for `steps[cursor]`, advances `cursor`, publishes the
-  baton to the next step's queue. `services/runner.py` implements this loop
-  once; each service only defines its log blocks.
+  baton to the next step's queue. `pipeline/services/runner.py` implements this
+  loop once; each service only defines its log blocks.
 - **Step chains are compiled from `shared/scenarios.py`** — the scenario
   defines the exact (service, block) sequence, including satellite
   interleaving during enrichment (OE client log → satellite server log → OE
@@ -263,7 +268,7 @@ tells the next service "your turn to emit", carrying the flow context.
 | 9 | `AUTH_FAILED` (JAM 403) | jam | order |
 | 10 | `SAP_SUBMISSION_FAILED` | sap | both |
 
-### Injector (`injector/inject.py`)
+### Injector (`pipeline/injector/inject.py`)
 Creates fresh ids (`eventId` = new UUID, `orderId` = `ORD-<seq>`,
 `cartHeaderId` = unique 19-digit), compiles the scenario's step chain into a
 baton, publishes it to `sim.step.inbound`.
@@ -271,7 +276,7 @@ baton, publishes it to `sim.step.inbound`.
 
 ---
 
-## [2] Mock Elasticsearch — Log Collector (`mock_es/app.py`, :9200)
+## [2] Mock Elasticsearch — Log Collector (`pipeline/mock_es/app.py`, :9200)
 
 FastAPI, in-memory storage. Intentionally dumb — **no journey logic here, ever**.
 
@@ -469,12 +474,12 @@ Journey state lives in Postgres — the backend owns journeys.
 ```bash
 docker compose up -d                          # rabbitmq, redis, postgres
 pip install -r requirements.txt
-uvicorn mock_es.app:app --port 9200           # [2]
-python -m services.run_all                    # [1] all mock services (baton consumers)
+uvicorn pipeline.mock_es.app:app --port 9200  # [2]
+python -m pipeline.services.run_all           # [1] all mock services (baton consumers)
 python -m ai_service.main                     # [3] poller + graph + api (:8100)
 python -m backend.main                        # [5] api + consumers + ws (:8000)
 cd dashboard && npm run dev                   # [6] :3000
-python injector/inject.py --all               # fire the 10 scenarios
+python -m pipeline.injector.inject --all      # fire the 10 scenarios
 ```
 
 Env defaults: `ES_URL=http://localhost:9200`,

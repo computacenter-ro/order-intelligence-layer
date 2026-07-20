@@ -12,8 +12,8 @@ import asyncio
 import os
 import random
 
-from services.profiles import ServiceProfile, make_log
-from services.registry import EmitFn
+from pipeline.services.profiles import ServiceProfile, make_log
+from pipeline.services.registry import EmitFn
 from shared.models import BatonContext, Level, LogLine
 
 # Inter-line delay bounds (seconds) — CLAUDE.md: "sleeps 10-110 ms between lines".

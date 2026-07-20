@@ -1,9 +1,9 @@
 """cc-rsm-service emitter block (CLAUDE.md [1]) — rebates / PVC rates."""
 from __future__ import annotations
 
-from services.blocklib import emit_line, phase2_ids
-from services.profiles import profile
-from services.registry import EmitFn, register
+from pipeline.services.blocklib import emit_line, phase2_ids
+from pipeline.services.profiles import profile
+from pipeline.services.registry import EmitFn, register
 from shared.models import Baton
 
 _PROF = profile("rsm")

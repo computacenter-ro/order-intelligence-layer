@@ -1,10 +1,10 @@
 """Start every mock service baton consumer in one process (CLAUDE.md [1]).
 
-Each service is normally ``python -m services.runner <service>``; this launches
-all of them concurrently on one event loop so a single command brings the whole
-emitter tier up::
+Each service is normally ``python -m pipeline.services.runner <service>``; this
+launches all of them concurrently on one event loop so a single command brings
+the whole emitter tier up::
 
-    python -m services.run_all
+    python -m pipeline.services.run_all
 
 The set of services is derived from ``shared.scenarios`` (the services that
 appear in any compiled step chain), so it stays in sync with the scenarios.
@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from services.runner import run_service
+from pipeline.services.runner import run_service
 from shared.scenarios import all_scenarios, compile_steps
 
 # The runner's diagnostic prints use a few non-ASCII glyphs (arrows, em-dashes).

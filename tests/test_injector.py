@@ -1,4 +1,4 @@
-"""Tests for injector/inject.py — the pure baton-assembly layer (model B) + CLI.
+"""Tests for pipeline/injector/inject.py — the pure baton-assembly layer (model B) + CLI.
 
 The publish layer (aio-pika → sim.step.inbound) needs RabbitMQ and is covered by
 integration once the runner exists; here we test everything that doesn't do I/O.
@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from injector.inject import (
+from pipeline.injector.inject import (
     INBOUND_QUEUE,
     _parse_args,
     build_baton,

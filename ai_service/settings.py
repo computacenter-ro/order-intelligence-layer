@@ -5,13 +5,22 @@ and "Env defaults"). Plain ``os.getenv`` reads, matching the convention already
 used across the project (``backend/db.py``, ``ai_service/poller.py``,
 ``shared/log_client.py``) rather than pulling in pydantic-settings.
 
-Nothing here does I/O — importing this module just resolves env vars to typed
-module-level constants, so tests can monkeypatch the env and re-read, and every
-other AI-service module imports its config from here.
+On import this loads a project-root ``.env`` (if present) into the environment
+first, so local secrets/config (e.g. the Azure creds) live in a gitignored
+``.env`` instead of the shell or the code. ``.env`` never overrides values
+already set in the real environment (``override=False``), so an explicit shell
+export or a container's env still wins — and CI/prod, which set real env vars,
+are unaffected. Missing ``.env`` is a no-op.
 """
 from __future__ import annotations
 
 import os
+
+from dotenv import load_dotenv
+
+# Load .env from the project root before any getenv below. override=False keeps
+# real environment variables authoritative over the file.
+load_dotenv(override=False)
 
 # --- Poller / collector -------------------------------------------------------
 ES_URL = os.getenv("ES_URL", "http://localhost:9200").rstrip("/")
@@ -22,6 +31,14 @@ WINDOW_END_OFFSET = int(os.getenv("WINDOW_END_OFFSET", "5"))
 # --- Redis (dedup + breaker state) --------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "3600"))
+
+# --- API server (POST /summarize-journey, GET /health) ------------------------
+# Default binds to loopback only — the endpoint is unauthenticated and calls the
+# LLM (i.e. costs money), so it must not be reachable off-box by default. When
+# the backend runs in a separate container/host, set API_HOST=0.0.0.0 AND keep
+# the port on a trusted private network (do NOT publish it publicly without auth).
+API_HOST = os.getenv("API_HOST", "127.0.0.1")
+API_PORT = int(os.getenv("API_PORT", "8100"))
 
 # --- RabbitMQ output queues ---------------------------------------------------
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")

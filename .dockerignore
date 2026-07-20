@@ -1,0 +1,23 @@
+# Keep the build context small and secret-free.
+.venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.git/
+.github/
+dashboard/node_modules/
+dashboard/.next/
+
+# Never bake secrets or local dumps into an image
+.env
+*.env
+!.env.example
+results.txt
+backend_dump.*
+*.log
+
+# Docs / editor noise
+docs/
+ways-of-working/
+.idea/
+.vscode/

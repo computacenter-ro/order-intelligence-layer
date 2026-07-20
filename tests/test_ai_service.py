@@ -28,12 +28,26 @@ from ai_service.publisher import Publisher
 from shared.models import Department, LogLine, ProcessedAlert
 
 
+# Manual wide/live test of the whole top-of-stack (real infra, LLM in fallback),
+# each command in its own terminal:
+#   1. collector:      python -m uvicorn pipeline.mock_es.app:app --port 9200
+#   2. mock services:  python -m pipeline.services.run_all
+#   3. AI service:     python -m ai_service.main   (prints "LLM mode: FALLBACK")
+#   4. fire scenarios: python -m pipeline.injector.inject --all
+# Then watch raw.events + processed.alerts fill up in the RabbitMQ UI (:15672).
+
+
 # --- fakes -------------------------------------------------------------------
 class FakeRedis:
-    """Minimal async stand-in for redis.asyncio.Redis (hash ops only)."""
+    """Minimal async stand-in for redis.asyncio.Redis.
+
+    Hash ops (breaker) + SETNX (poller dedup). ``set(..., nx=True)`` returns
+    True only the first time a key is set, mirroring real SETNX.
+    """
 
     def __init__(self) -> None:
         self.store: dict[str, dict] = {}
+        self.keys: dict[str, object] = {}
 
     async def hgetall(self, name: str) -> dict:
         return dict(self.store.get(name, {}))
@@ -41,6 +55,12 @@ class FakeRedis:
     async def hset(self, name: str, mapping: dict) -> int:
         self.store.setdefault(name, {}).update(mapping)
         return len(mapping)
+
+    async def set(self, key: str, value, nx: bool = False, ex: int | None = None):
+        if nx and key in self.keys:
+            return None
+        self.keys[key] = value
+        return True
 
 
 class FakeClock:
@@ -437,3 +457,210 @@ async def test_live_roundtrip_publish_then_consume():
             await alerts_queue.delete(if_unused=False, if_empty=False)
     finally:
         await connection.close()
+
+
+# =============================================================================
+# Poller — routing/dedup/suppression logic with fakes (no collector/broker/LLM)
+# =============================================================================
+from ai_service.poller import Poller, needs_alert, poll_window  # noqa: E402
+
+
+class FakePublisher:
+    """Records what the poller publishes to each queue."""
+
+    def __init__(self) -> None:
+        self.raw: list[LogLine] = []
+        self.alerts: list[ProcessedAlert] = []
+
+    async def publish_raw(self, log: LogLine) -> None:
+        self.raw.append(log)
+
+    async def publish_alert(self, alert: ProcessedAlert) -> None:
+        self.alerts.append(alert)
+
+
+def _raw_dict(level: str = "INFO", message: str = "ok", log_id: str = "L1") -> dict:
+    """A collector-shaped raw log dict (what fetch_logs returns)."""
+    return {
+        "log_id": log_id,
+        "timestamp": "2026-07-14T08:00:00.000Z",
+        "app_name": "cc-order-engine",
+        "level": level,
+        "logger": "c.c.orderengine.service.OrderService",
+        "host": "CCECMEWEBT001",
+        "process_id": "9201",
+        "thread": "pool-3-thread-1",
+        "orderId": "ORD-6001",
+        "cartHeaderId": "1840927365018240001",
+        "message": message,
+    }
+
+
+def _make_poller(window_logs: list[dict], *, healthy_llm: bool = False):
+    """A Poller whose fetch_logs returns ``window_logs``; fake redis+publisher."""
+    redis = FakeRedis()
+    pub = FakePublisher()
+    if healthy_llm:
+        deps = _healthy_deps()
+    else:
+        deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+    poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+    poller.fetch_logs = lambda f, t: _async(window_logs)  # type: ignore[method-assign]
+    return poller, pub
+
+
+async def _async(value):
+    return value
+
+
+# --- needs_alert gate --------------------------------------------------------
+def test_needs_alert_only_warn_error_and_not_suppressed():
+    assert needs_alert(_log(level="ERROR", message="boom"))
+    assert needs_alert(_log(level="WARN", message="something odd"))
+    assert not needs_alert(_log(level="INFO", message="boom"))
+    assert not needs_alert(_log(level="DEBUG", message="boom"))
+    # suppressed WARN → NOT an alert
+    assert not needs_alert(_log(level="WARN", message="Not implemented"))
+
+
+# --- fan-out: raw always, alerts conditionally -------------------------------
+async def test_every_log_goes_to_raw_events():
+    logs = [_raw_dict("INFO", "a", "L1"), _raw_dict("DEBUG", "b", "L2"),
+            _raw_dict("ERROR", "c", "L3")]
+    poller, pub = _make_poller(logs)
+    n = await poller.poll_once()
+    assert n == 3
+    assert {l.log_id for l in pub.raw} == {"L1", "L2", "L3"}  # ALL levels → raw
+
+
+async def test_only_warn_error_becomes_alert():
+    logs = [_raw_dict("INFO", "a", "L1"), _raw_dict("ERROR", "boom", "L2")]
+    poller, pub = _make_poller(logs)
+    await poller.poll_once()
+    assert len(pub.raw) == 2
+    assert len(pub.alerts) == 1
+    assert pub.alerts[0].log.log_id == "L2"
+
+
+async def test_suppressed_warn_reaches_raw_but_not_alerts():
+    logs = [_raw_dict("WARN", "Not implemented", "L1")]
+    poller, pub = _make_poller(logs)
+    await poller.poll_once()
+    assert len(pub.raw) == 1          # still journey material
+    assert len(pub.alerts) == 0       # but never an alert
+
+
+# --- dedup -------------------------------------------------------------------
+async def test_dedup_across_overlapping_windows():
+    logs = [_raw_dict("ERROR", "boom", "L1")]
+    poller, pub = _make_poller(logs)
+    await poller.poll_once()          # first sight → processed
+    n2 = await poller.poll_once()     # same log again (overlap) → skipped
+    assert n2 == 0
+    assert len(pub.raw) == 1          # not re-published
+    assert len(pub.alerts) == 1
+
+
+async def test_log_missing_id_is_skipped():
+    bad = _raw_dict("ERROR", "boom", "L1")
+    del bad["log_id"]
+    poller, pub = _make_poller([bad])
+    n = await poller.poll_once()
+    assert n == 0 and not pub.raw
+
+
+# --- alert content: fallback when LLM down -----------------------------------
+async def test_alert_is_fallback_when_llm_down():
+    poller, pub = _make_poller([_raw_dict("ERROR", "boom", "L1")])  # explainer=None
+    await poller.poll_once()
+    assert pub.alerts[0].source == "fallback"
+    assert pub.alerts[0].explanation is None
+
+
+async def test_alert_is_ai_when_llm_healthy():
+    poller, pub = _make_poller([_raw_dict("ERROR", "boom", "L1")], healthy_llm=True)
+    await poller.poll_once()
+    assert pub.alerts[0].source == "ai"
+    assert pub.alerts[0].department == Department.backend
+
+
+# --- window helper -----------------------------------------------------------
+def test_poll_window_spans_the_configured_offsets():
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 14, 8, 0, 30, tzinfo=timezone.utc)
+    frm, to = poll_window(now, start_offset=25, end_offset=5)
+    assert frm == "2026-07-14T08:00:05.000Z"  # now - 25s
+    assert to == "2026-07-14T08:00:25.000Z"   # now - 5s
+
+
+# =============================================================================
+# Journey summary API — TestClient, fake summary model / breaker-open fallback
+# =============================================================================
+from fastapi.testclient import TestClient  # noqa: E402
+
+from ai_service import api  # noqa: E402
+
+
+def _summary_request() -> dict:
+    return {
+        "journey_id": "J1",
+        "outcome": "ENRICHMENT_FAILED",
+        "event_id": "evt-1",
+        "order_id": "ORD-6008",
+        "cart_header_id": None,
+        "logs": [
+            _log(level="INFO", message="Get order by Order Number:ORD-6008").model_dump(mode="json"),
+            _log(level="ERROR", message="Order processing aborted: SPT unavailable").model_dump(mode="json"),
+        ],
+    }
+
+
+def test_health_reports_fallback_without_model():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "llm": "fallback"}
+
+
+def test_summarize_journey_ai_path():
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("Order ORD-6008 was created then failed at SPT enrichment."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["journey_id"] == "J1"
+    assert "SPT" in body["summary"]
+
+
+def test_summarize_journey_falls_back_to_template_when_no_model():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "fallback"
+    # deterministic template built from meta: outcome + services touched
+    assert "ENRICHMENT_FAILED" in body["summary"]
+    assert "ORD-6008" in body["summary"]
+    assert "cc-spt-service" in body["summary"]  # the app_name from the logs
+
+
+def test_template_summary_is_deterministic_and_llm_free():
+    req = api.SummaryRequest(**_summary_request())
+    s1 = api.template_summary(req)
+    s2 = api.template_summary(req)
+    assert s1 == s2
+    assert str(len(req.logs)) in s1  # mentions the log count
+
+
+def test_summary_request_contract_shape():
+    # The backend must match this contract — assert the fields it depends on.
+    req = api.SummaryRequest(**_summary_request())
+    assert req.journey_id and req.outcome
+    assert isinstance(req.logs[0], LogLine)  # logs deserialize to the model

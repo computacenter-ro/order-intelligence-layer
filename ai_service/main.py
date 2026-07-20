@@ -46,7 +46,9 @@ async def _run() -> None:
         )
     )
     server = uvicorn.Server(
-        uvicorn.Config(api.app, host="0.0.0.0", port=8100, log_level="info")
+        uvicorn.Config(
+            api.app, host=settings.API_HOST, port=settings.API_PORT, log_level="info"
+        )
     )
 
     mode = "AI" if settings.llm_configured() else "FALLBACK (no Azure creds)"

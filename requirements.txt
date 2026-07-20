@@ -8,6 +8,7 @@ uvicorn[standard]>=0.30          # includes websockets support for backend /ws
 # --- Models / config ---
 pydantic>=2.7                    # LogLine, Baton, ProcessedAlert
 pydantic-settings>=2.3           # env-based config (ES_URL, RABBITMQ_URL, ...)
+python-dotenv>=1.0               # load a gitignored .env into the environment
 
 # --- AI service (LangGraph pipeline) ---
 langgraph>=0.2

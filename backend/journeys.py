@@ -393,6 +393,14 @@ class JourneyAssembler:
             )
             await session.execute(stmt)
 
+        # Attach any orphan alerts (journey_id IS NULL) that arrived before their
+        # journey was assembled — the alert side links eagerly when the journey
+        # already exists, this covers the reverse ordering (CLAUDE.md: the FK
+        # "fills in later").
+        from backend.linking import backfill_journey_alerts
+
+        await backfill_journey_alerts(session, journeys)
+
     @staticmethod
     async def _finalize_journey(
         session, completion: Completion, summary: str | None = None

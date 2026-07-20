@@ -41,6 +41,14 @@ _ROUTE_SYSTEM = (
     "No prose, no code fence."
 )
 
+_SUMMARY_SYSTEM = (
+    "You summarize the end-to-end journey of ONE order through a microservice "
+    "order-management pipeline, for an IT-support engineer. Given the journey's "
+    "outcome and its ordered log lines, write 2-4 plain-English sentences: which "
+    "services the order touched, where it stopped, and why. Do not speculate "
+    "beyond the logs. Reply with the summary only."
+)
+
 
 def _log_brief(log: LogLine) -> str:
     """The log fields the LLM needs, as a compact prompt block."""
@@ -86,6 +94,31 @@ async def route(
         raise LLMError(f"router call failed: {exc}") from exc
 
     return _parse_route(_content_text(resp))
+
+
+async def summarize_journey(
+    outcome: str, logs: list[LogLine], model: BaseChatModel | None
+) -> str:
+    """LLM journey summary. Returns the summary text; raises LLMError otherwise.
+
+    Builds a compact prompt from the journey outcome + its ordered log lines
+    (app_name + message each, which is what the narrative needs). The caller
+    (api.py) runs this under the shared breaker and falls back to a template.
+    """
+    if model is None:
+        raise LLMError("no summary model configured")
+    lines = "\n".join(f"{log.app_name}: {log.message}" for log in logs)
+    prompt = f"outcome={outcome}\nlogs:\n{lines}"
+    try:
+        resp = await model.ainvoke(
+            [SystemMessage(content=_SUMMARY_SYSTEM), HumanMessage(content=prompt)]
+        )
+    except Exception as exc:
+        raise LLMError(f"summary call failed: {exc}") from exc
+    text = _content_text(resp).strip()
+    if not text:
+        raise LLMError("summary returned empty text")
+    return text
 
 
 def _parse_route(text: str) -> tuple[Department, float]:

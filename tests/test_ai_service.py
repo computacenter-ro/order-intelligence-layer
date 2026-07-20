@@ -592,3 +592,75 @@ def test_poll_window_spans_the_configured_offsets():
     frm, to = poll_window(now, start_offset=25, end_offset=5)
     assert frm == "2026-07-14T08:00:05.000Z"  # now - 25s
     assert to == "2026-07-14T08:00:25.000Z"   # now - 5s
+
+
+# =============================================================================
+# Journey summary API — TestClient, fake summary model / breaker-open fallback
+# =============================================================================
+from fastapi.testclient import TestClient  # noqa: E402
+
+from ai_service import api  # noqa: E402
+
+
+def _summary_request() -> dict:
+    return {
+        "journey_id": "J1",
+        "outcome": "ENRICHMENT_FAILED",
+        "event_id": "evt-1",
+        "order_id": "ORD-6008",
+        "cart_header_id": None,
+        "logs": [
+            _log(level="INFO", message="Get order by Order Number:ORD-6008").model_dump(mode="json"),
+            _log(level="ERROR", message="Order processing aborted: SPT unavailable").model_dump(mode="json"),
+        ],
+    }
+
+
+def test_health_reports_fallback_without_model():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "llm": "fallback"}
+
+
+def test_summarize_journey_ai_path():
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("Order ORD-6008 was created then failed at SPT enrichment."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["journey_id"] == "J1"
+    assert "SPT" in body["summary"]
+
+
+def test_summarize_journey_falls_back_to_template_when_no_model():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "fallback"
+    # deterministic template built from meta: outcome + services touched
+    assert "ENRICHMENT_FAILED" in body["summary"]
+    assert "ORD-6008" in body["summary"]
+    assert "cc-spt-service" in body["summary"]  # the app_name from the logs
+
+
+def test_template_summary_is_deterministic_and_llm_free():
+    req = api.SummaryRequest(**_summary_request())
+    s1 = api.template_summary(req)
+    s2 = api.template_summary(req)
+    assert s1 == s2
+    assert str(len(req.logs)) in s1  # mentions the log count
+
+
+def test_summary_request_contract_shape():
+    # The backend must match this contract — assert the fields it depends on.
+    req = api.SummaryRequest(**_summary_request())
+    assert req.journey_id and req.outcome
+    assert isinstance(req.logs[0], LogLine)  # logs deserialize to the model

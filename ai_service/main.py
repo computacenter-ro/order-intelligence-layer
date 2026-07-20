@@ -19,8 +19,9 @@ from __future__ import annotations
 import asyncio
 
 import redis.asyncio as aioredis
+import uvicorn
 
-from ai_service import llm, settings
+from ai_service import api, llm, settings
 from ai_service.breaker import CircuitBreaker
 from ai_service.graph import PipelineDeps
 from ai_service.poller import Poller
@@ -37,15 +38,27 @@ async def _run() -> None:
     )
     poller = Poller(redis=redis_client, publisher=publisher, pipeline_deps=deps)
 
+    # The summary API shares the same breaker + Redis; its model is the stronger
+    # summary deployment (None with no creds → template fallback).
+    api.configure(
+        api.SummaryDeps(
+            breaker=CircuitBreaker(redis_client), model=llm.summary_model()
+        )
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(api.app, host="0.0.0.0", port=8100, log_level="info")
+    )
+
     mode = "AI" if settings.llm_configured() else "FALLBACK (no Azure creds)"
     print(
         f"[ai_service] started — poll every {settings.POLL_INTERVAL}s, "
         f"window [-{settings.WINDOW_START_OFFSET}s, -{settings.WINDOW_END_OFFSET}s], "
-        f"LLM mode: {mode}",
+        f"API on :8100, LLM mode: {mode}",
         flush=True,
     )
     try:
-        await poller.run()
+        # Poller loop + summary API on one event loop.
+        await asyncio.gather(poller.run(), server.serve())
     finally:
         await poller.aclose()
         await publisher.close()

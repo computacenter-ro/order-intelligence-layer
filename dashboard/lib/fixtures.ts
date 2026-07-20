@@ -212,7 +212,8 @@ export const journeys: Journey[] = [
     event_id: "evt-372656a7",
     order_id: "ORD-6042",
     cart_header_id: "1840927365018240042",
-    summary: null,
+    summary:
+      "Order ORD-6042 was received and created successfully, then enriched with pricing, rebates, and product data. During the margin check, the order fell below the configured threshold and was blocked by the Checker service. It never reached validation or fulfilment — route to the backend team to review the margin rule for this SKU.",
     events: [
       journeyEvent("2026-07-14T08:00:00.432Z", {
         log_id: "j6042-e1",
@@ -278,7 +279,8 @@ export const journeys: Journey[] = [
     event_id: "evt-91ab22c1",
     order_id: "ORD-6039",
     cart_header_id: "1840927365018240039",
-    summary: null,
+    summary:
+      "Order ORD-6039 was created and passed validation, but SAP fulfilment submission failed after 3 RFC retries and was moved to the dead-letter queue. The order exists in the system but was never submitted downstream — the backend team should investigate the SAP connector.",
     events: [
       journeyEvent("2026-07-14T07:59:00.000Z", {
         log_id: "j6039-e1",
@@ -410,7 +412,8 @@ export const journeys: Journey[] = [
     event_id: "evt-6612aa03",
     order_id: "ORD-6041",
     cart_header_id: "1840927365018240041",
-    summary: null,
+    summary:
+      "Order ORD-6041 was created and enriched without any warnings, then submitted to SAP and registered for tracking — a clean, uneventful run through the entire pipeline.",
     events: [
       journeyEvent("2026-07-14T07:59:50.000Z", {
         log_id: "j6041-e1",
@@ -476,7 +479,8 @@ export const journeys: Journey[] = [
     event_id: "evt-aa3391bd",
     order_id: null,
     cart_header_id: null,
-    summary: null,
+    summary:
+      "This event never became an order — the BM database timed out 3 times while the order engine tried to persist the cart header. No order number was ever generated, so there is nothing to retry automatically; the database team should check BM connectivity around this time window.",
     events: [
       journeyEvent("2026-07-14T07:56:59.000Z", {
         log_id: "jaa33-e1",
@@ -515,7 +519,8 @@ export const journeys: Journey[] = [
     event_id: "evt-88bb1290",
     order_id: "ORD-6033",
     cart_header_id: "1840927365018240033",
-    summary: null,
+    summary:
+      "Order ORD-6033 was created and began enrichment, with SOLR resolving product ids as the last recorded step. No further activity was seen for over 90 seconds, so this journey is flagged as stalled rather than failed — it's unclear whether processing is still happening upstream or was silently dropped.",
     events: [
       journeyEvent("2026-07-14T07:54:10.000Z", {
         log_id: "j6033-e1",
@@ -581,7 +586,8 @@ export const journeys: Journey[] = [
     event_id: "evt-4501fe23",
     order_id: "ORD-6030",
     cart_header_id: "1840927365018240030",
-    summary: null,
+    summary:
+      "Order ORD-6030 moved cleanly through the full pipeline — creation, enrichment, and fulfilment — and was registered for tracking with no warnings or errors along the way.",
     events: [
       journeyEvent("2026-07-14T07:54:00.000Z", {
         log_id: "j6030-e1",
@@ -647,7 +653,8 @@ export const journeys: Journey[] = [
     event_id: "evt-55dd90f2",
     order_id: null,
     cart_header_id: null,
-    summary: null,
+    summary:
+      "This event failed before an order could be created — the inbound service hit an unhandled exception while mapping the vendor product id to an internal SKU, and the message was routed to the dead-letter queue after retries. No order number was ever generated.",
     events: [
       journeyEvent("2026-07-14T07:59:11.000Z", {
         log_id: "j55dd-e1",

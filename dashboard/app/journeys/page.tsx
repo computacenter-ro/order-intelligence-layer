@@ -1,33 +1,16 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { Card } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
-import { formatTime } from "@/lib/format";
-import type { BadgeStatus, Journey, JourneyStatus } from "@/lib/types";
+import { formatTime, stoppedAt } from "@/lib/format";
+import { JOURNEY_STATUS_BADGE, JOURNEY_STATUS_LABEL } from "@/lib/journeyStatus";
 import { journeys } from "@/lib/fixtures";
-
-const STATUS_BADGE: Record<JourneyStatus, BadgeStatus> = {
-  success: "success",
-  failed: "error",
-  timed_out: "pending",
-  in_progress: "info",
-};
-
-const STATUS_LABEL: Record<JourneyStatus, string> = {
-  success: "Success",
-  failed: "Failed",
-  timed_out: "Timed out",
-  in_progress: "In progress",
-};
 
 const COLUMN_HEADINGS = ["Status", "Order ID", "Event ID", "Outcome", "Stopped At", "Last Seen"];
 
-function stoppedAt(journey: Journey): string {
-  const lastEvent = journey.events[journey.events.length - 1];
-  return lastEvent ? lastEvent.raw.app_name : "—";
-}
-
 export default function JourneysPage() {
+  const router = useRouter();
   const sorted = [...journeys].sort(
     (a, b) => new Date(b.last_ts).getTime() - new Date(a.last_ts).getTime()
   );
@@ -51,9 +34,19 @@ export default function JourneysPage() {
           </thead>
           <tbody>
             {sorted.map((journey) => (
-              <tr key={journey.journey_id}>
+              <tr
+                key={journey.journey_id}
+                role="link"
+                tabIndex={0}
+                onClick={() => router.push(`/journeys/${journey.journey_id}`)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") router.push(`/journeys/${journey.journey_id}`);
+                }}
+              >
                 <td>
-                  <Badge status={STATUS_BADGE[journey.status]}>{STATUS_LABEL[journey.status]}</Badge>
+                  <Badge status={JOURNEY_STATUS_BADGE[journey.status]}>
+                    {JOURNEY_STATUS_LABEL[journey.status]}
+                  </Badge>
                 </td>
                 <td className="oil-mono">{journey.order_id ?? "—"}</td>
                 <td className="oil-mono">{journey.event_id ?? "—"}</td>

@@ -55,6 +55,14 @@ body {
   background: var(--cc-grey-six);
 }
 
+.oil-journeys-table tbody tr {
+  cursor: pointer;
+}
+
 .oil-mono {
   font-family: ui-monospace, Menlo, monospace;
+}
+
+.oil-pipeline-current {
+  animation: cc-pulse 2s infinite;
 }

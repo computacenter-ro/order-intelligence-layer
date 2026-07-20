@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { useRouter } from "next/navigation";
-import { X } from "@phosphor-icons/react";
+import Link from "next/link";
+import { XIcon } from "@phosphor-icons/react";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { levelLabel, formatTime } from "@/lib/format";
@@ -46,7 +46,6 @@ function KeyValueRow({ label, value }: { label: string; value: string }) {
 }
 
 export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
-  const router = useRouter();
 
   useEffect(() => {
     if (!alert) return;
@@ -99,7 +98,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
             padding: "4px",
           }}
         >
-          <X size={20} />
+          <XIcon size={20} />
         </button>
         <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
           {alert.log.app_name}
@@ -156,17 +155,13 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
         </pre>
 
         <SectionLabel>Related</SectionLabel>
-        <a
-          onClick={(e) => {
-            e.preventDefault();
-            onClose();
-            router.push("/journeys");
-          }}
+        <Link
           href="/journeys"
+          onClick={onClose}
           style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
         >
           → View full order journey
-        </a>
+        </Link>
       </aside>
     </>
   );

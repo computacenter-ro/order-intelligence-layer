@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { SideNav } from "@computacenter-ro/style-guide/components";
 import type { BaseNavItem, SideNavItem } from "@computacenter-ro/style-guide/components";
-import { Bell, MapTrifold } from "@phosphor-icons/react";
+import { BellIcon, MapTrifoldIcon } from "@phosphor-icons/react";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
 
@@ -33,8 +33,8 @@ export function AppShell({ children }: AppShellProps) {
   };
 
   const items: SideNavItem[] = [
-    { label: "Alert Feed", href: "/", icon: <Bell size={20} />, active: pathname === "/" },
-    { label: "Journeys", href: "/journeys", icon: <MapTrifold size={20} />, active: pathname === "/journeys" },
+    { label: "Alert Feed", href: "/", icon: <BellIcon size={20} />, active: pathname === "/" },
+    { label: "Journeys", href: "/journeys", icon: <MapTrifoldIcon size={20} />, active: pathname === "/journeys" },
   ];
 
   const handleItemClick = (item: BaseNavItem) => {

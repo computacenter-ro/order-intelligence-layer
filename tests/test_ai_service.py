@@ -6,8 +6,17 @@ pytest.ini means async test functions run without an explicit marker.)
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+
 from ai_service import settings
 from ai_service.breaker import CLOSED, HALF_OPEN, OPEN, CircuitBreaker
+from ai_service.graph import PipelineDeps, process
+from ai_service.llm import LLMError
+from ai_service.nodes import route
+from shared.models import Department, LogLine
 
 
 # --- fakes -------------------------------------------------------------------
@@ -174,3 +183,119 @@ async def test_call_returns_result_and_resets_on_success():
     assert await b.call(ok) == "value"
     state, failures, _o = await b._read()
     assert state == CLOSED and failures == 0
+
+
+# =============================================================================
+# Pipeline (nodes + graph) — fake chat models, no network/creds
+# =============================================================================
+def _log(level: str = "ERROR", message: str = "SPT price list unavailable") -> LogLine:
+    return LogLine(
+        log_id="log-1",
+        timestamp=datetime(2026, 7, 14, 8, 0, 0, tzinfo=timezone.utc),
+        app_name="cc-spt-service",
+        level=level,
+        logger="c.c.spt.service.PriceListService",
+        host="CCECMSRVT001",
+        process_id="6340",
+        thread="http-nio-8080-exec-8",
+        orderId="ORD-6001",
+        cartHeaderId="1840927365018240001",
+        message=message,
+    )
+
+
+def _fake(text: str) -> GenericFakeChatModel:
+    """A chat model that returns ``text`` once per invocation."""
+    return GenericFakeChatModel(messages=iter([AIMessage(content=text)] * 50))
+
+
+def _healthy_deps() -> PipelineDeps:
+    return PipelineDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        explainer=_fake("SPT pricing service was unreachable; the order engine could not price the order."),
+        router=_fake('{"department": "backend", "confidence": 0.82}'),
+    )
+
+
+# --- happy path: source="ai" -------------------------------------------------
+async def test_pipeline_ai_alert_on_healthy_llm():
+    alert = await process(_log(), _healthy_deps())
+    assert alert.source == "ai"
+    assert alert.explanation and "SPT" in alert.explanation
+    assert alert.department == Department.backend
+    assert alert.confidence == 0.82
+    assert alert.log.log_id == "log-1"
+    assert alert.emitted_at.tzinfo is not None  # tz-aware UTC
+
+
+async def test_pipeline_alert_ids_are_unique():
+    a1 = await process(_log(), _healthy_deps())
+    a2 = await process(_log(), _healthy_deps())
+    assert a1.alert_id != a2.alert_id
+
+
+# --- router constrained to the 5 departments --------------------------------
+async def test_router_rejects_unknown_department():
+    # 'frontend' is not one of the 5 → LLMError (never a silent wrong route).
+    import pytest
+
+    with pytest.raises(LLMError):
+        await route(_log(), "explained", _fake('{"department": "frontend", "confidence": 0.9}'))
+
+
+async def test_router_accepts_all_five_departments():
+    for dept in Department:
+        d, c = await route(_log(), "x", _fake(f'{{"department": "{dept.value}", "confidence": 0.5}}'))
+        assert d == dept
+
+
+async def test_router_tolerates_code_fence_and_prose():
+    d, c = await route(
+        _log(), "x",
+        _fake('Here you go:\n```json\n{"department": "database", "confidence": 0.7}\n```'),
+    )
+    assert d == Department.database and c == 0.7
+
+
+async def test_router_clamps_out_of_range_confidence():
+    d, c = await route(_log(), "x", _fake('{"department": "devops", "confidence": 5}'))
+    assert c == 1.0
+
+
+# --- fallback paths: source="fallback", all null -----------------------------
+def _assert_fallback(alert):
+    assert alert.source == "fallback"
+    assert alert.explanation is None
+    assert alert.department is None
+    assert alert.confidence is None
+
+
+async def test_pipeline_fallback_when_no_models():
+    deps = PipelineDeps(breaker=_breaker(FakeRedis(), FakeClock()), explainer=None, router=None)
+    _assert_fallback(await process(_log(), deps))
+
+
+async def test_pipeline_fallback_when_breaker_open():
+    b = _breaker(FakeRedis(), FakeClock())
+    for _ in range(3):
+        await b.record_failure()  # force open
+    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","confidence":0.5}'))
+    _assert_fallback(await process(_log(), deps))
+
+
+async def test_pipeline_fallback_when_router_returns_bad_department():
+    deps = PipelineDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        explainer=_fake("a clear explanation"),
+        router=_fake('{"department": "nonsense", "confidence": 0.9}'),
+    )
+    # explainer succeeds but router output is invalid → clean fallback, no partial AI alert.
+    _assert_fallback(await process(_log(), deps))
+
+
+async def test_pipeline_records_breaker_failure_on_llm_error():
+    b = _breaker(FakeRedis(), FakeClock())
+    deps = PipelineDeps(breaker=b, explainer=None, router=None)  # explain() raises LLMError
+    await process(_log(), deps)
+    _state, failures, _o = await b._read()
+    assert failures >= 1  # the breaker counted the failure

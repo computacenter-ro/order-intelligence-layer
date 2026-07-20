@@ -38,12 +38,18 @@ journeys carry only ``event_id``. That is correct and complete, not a data gap.
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from shared.models import LogLine
 from backend.stitching import StitchedJourney, Stitcher
+
+# An optional async sink for WebSocket-style events (see backend/ws.py). Kept as
+# a bare Callable so the assembler stays decoupled from the transport: when None
+# (the default) the assembler broadcasts nothing — it is fully usable headless.
+OnEvent = Callable[[dict], Awaitable[None]]
 
 # --- Config ------------------------------------------------------------------
 
@@ -247,11 +253,23 @@ class JourneyAssembler:
 
     # --- Persistence --------------------------------------------------------
 
-    async def ingest(self, session, logs, now: datetime | None = None) -> list[Completion]:
+    async def ingest(
+        self,
+        session,
+        logs,
+        now: datetime | None = None,
+        on_event: OnEvent | None = None,
+    ) -> list[Completion]:
         """Stitch + persist a batch, then persist any journeys that completed.
 
         Idempotent: events are written with ON CONFLICT DO NOTHING on
         ``log_id`` (the output queues are at-least-once).
+
+        When ``on_event`` is given (else no-op), after a successful commit it
+        emits — for every journey this chunk grew but did not finish — a
+        ``journey.updated`` event, and a ``journey.completed`` event for each
+        journey that reached a terminal state. Emitting after commit means we
+        never broadcast state that failed to persist.
         """
         new_events = self.add(logs)
         touched = _distinct_journeys(new_events)
@@ -264,15 +282,37 @@ class JourneyAssembler:
         for completion in completions:
             await self._finalize_journey(session, completion)
         await session.commit()
+
+        if on_event is not None:
+            # A journey that completed in this chunk is in ``_completed`` now, so
+            # it gets a completed event, not an updated one.
+            for journey in touched:
+                if journey.journey_id not in self._completed:
+                    await on_event(_journey_updated_event(journey))
+            for completion in completions:
+                await on_event(_journey_completed_event(completion))
         return completions
 
-    async def sweep_stalled(self, session, now: datetime | None = None) -> list[Completion]:
-        """Finalize journeys that have crossed the stall timeout since last seen."""
+    async def sweep_stalled(
+        self,
+        session,
+        now: datetime | None = None,
+        on_event: OnEvent | None = None,
+    ) -> list[Completion]:
+        """Finalize journeys that have crossed the stall timeout since last seen.
+
+        Emits a ``journey.completed`` event (TIMED_OUT) per finalized journey
+        when ``on_event`` is given.
+        """
         completions = self.evaluate(now)
         for completion in completions:
             await self._finalize_journey(session, completion)
         if completions:
             await session.commit()
+
+        if on_event is not None:
+            for completion in completions:
+                await on_event(_journey_completed_event(completion))
         return completions
 
     @staticmethod
@@ -364,3 +404,55 @@ def _distinct_journeys(new_events) -> list[StitchedJourney]:
             seen.add(journey.journey_id)
             out.append(journey)
     return out
+
+
+# --- WebSocket event builders ------------------------------------------------
+# The "data" payloads use the API response schemas (backend/schemas.py) so the
+# dashboard sees exactly the REST shape. Imports are lazy to keep this module's
+# import path free of the web layer.
+
+
+def _journey_updated_event(journey: StitchedJourney) -> dict:
+    """A ``journey.updated`` envelope for an in-progress journey (a grown chunk)."""
+    from backend.schemas import JourneyOut
+    from backend.ws import EVENT_JOURNEY_UPDATED, make_event
+
+    data = JourneyOut(
+        journey_id=journey.journey_id,
+        status=JourneyStatus.IN_PROGRESS.value,
+        outcome=None,
+        first_ts=journey.first_ts,
+        last_ts=journey.last_ts,
+        event_id=journey.event_id,
+        order_id=journey.order_id,
+        cart_header_id=journey.cart_header_id,
+        summary=None,
+    ).model_dump(mode="json")
+    return make_event(EVENT_JOURNEY_UPDATED, data)
+
+
+def _journey_completed_event(completion: Completion) -> dict:
+    """A ``journey.completed`` envelope (full detail incl. summary + events)."""
+    from backend.schemas import JourneyDetailOut, JourneyEventOut
+    from backend.ws import EVENT_JOURNEY_COMPLETED, make_event
+
+    journey = completion.journey
+    events = [
+        JourneyEventOut(log_id=log.log_id, ts=log.timestamp, raw=log.model_dump(mode="json"))
+        for log in journey.logs
+    ]
+    data = JourneyDetailOut(
+        journey_id=journey.journey_id,
+        status=completion.status.value,
+        outcome=completion.outcome,
+        first_ts=journey.first_ts,
+        last_ts=journey.last_ts,
+        event_id=journey.event_id,
+        order_id=journey.order_id,
+        cart_header_id=journey.cart_header_id,
+        # The LLM summary is fetched separately on completion (AI service); it is
+        # null here until that wiring populates it. The field is always present.
+        summary=None,
+        events=events,
+    ).model_dump(mode="json")
+    return make_event(EVENT_JOURNEY_COMPLETED, data)

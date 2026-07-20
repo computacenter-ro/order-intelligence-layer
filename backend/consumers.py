@@ -36,7 +36,7 @@ import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractIncomingMessage
 
 from shared.models import LogLine, ProcessedAlert
-from backend.journeys import JourneyAssembler
+from backend.journeys import JourneyAssembler, OnEvent
 
 # --- Config (env-driven, matching ai_service/settings.py conventions) --------
 
@@ -82,6 +82,15 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
     }
 
 
+def _alert_new_event(alert: ProcessedAlert) -> dict:
+    """Build the ``alert.new`` WebSocket envelope, with the API ``AlertOut`` shape."""
+    from backend.schemas import AlertOut
+    from backend.ws import EVENT_ALERT_NEW, make_event
+
+    data = AlertOut(**alert_row_values(alert)).model_dump(mode="json")
+    return make_event(EVENT_ALERT_NEW, data)
+
+
 # --- Base consumer -----------------------------------------------------------
 
 
@@ -100,12 +109,16 @@ class _QueueConsumer:
         prefetch: int = 1,
         channel: AbstractChannel | None = None,
         session_factory=None,
+        on_event: OnEvent | None = None,
     ) -> None:
         self.queue = queue
         self._url = url
         self._prefetch = prefetch
         self._channel = channel
         self._session_factory = session_factory
+        # Optional async event sink (WebSocket hub). None => no broadcasting, so
+        # the consumer stays fully usable standalone.
+        self._on_event = on_event
         self._connection: AbstractConnection | None = None
         self._queue_obj = None
 
@@ -206,8 +219,14 @@ class AlertsConsumer(_QueueConsumer):
             .on_conflict_do_nothing()  # dedup on unique alert_id / log_id
         )
         async with self._factory()() as session:
-            await session.execute(stmt)
+            result = await session.execute(stmt)
             await session.commit()
+
+        # Broadcast only a genuinely new alert: a redelivered duplicate inserts
+        # nothing (rowcount 0) and must not double-push to the dashboard, keeping
+        # at-least-once delivery idempotent end-to-end.
+        if self._on_event is not None and result.rowcount != 0:
+            await self._on_event(_alert_new_event(alert))
 
 
 # --- raw.events --------------------------------------------------------------
@@ -234,22 +253,26 @@ class RawEventsConsumer(_QueueConsumer):
 
     async def _process(self, log: LogLine) -> None:
         # The assembler persists events (ON CONFLICT DO NOTHING on log_id) and
-        # journeys, and commits — so raw-event consumption is idempotent too.
+        # journeys, and commits — so raw-event consumption is idempotent too. It
+        # also emits journey.updated / journey.completed via on_event (if set).
         async with self._factory()() as session:
-            await self._assembler.ingest(session, [log])
+            await self._assembler.ingest(session, [log], on_event=self._on_event)
 
 
 # --- run both ----------------------------------------------------------------
 
 
-async def _sweep_stalled_loop(assembler: JourneyAssembler) -> None:
+async def _sweep_stalled_loop(
+    assembler: JourneyAssembler, on_event: OnEvent | None = None
+) -> None:
     """Periodically finalize stalled (TIMED_OUT) journeys.
 
     A stalled journey stops receiving ``raw.events``, so the raw consumer never
     re-evaluates it — it would sit at IN_PROGRESS forever. This background task
     fills that gap: every ``STALLED_SWEEP_INTERVAL`` seconds it opens a session
     and runs ``assembler.sweep_stalled`` on the **same** assembler instance the
-    raw consumer uses, so the in-memory journeys are visible.
+    raw consumer uses, so the in-memory journeys are visible. Finalized journeys
+    are broadcast as ``journey.completed`` via ``on_event`` (if set).
     """
     import asyncio
 
@@ -260,7 +283,7 @@ async def _sweep_stalled_loop(assembler: JourneyAssembler) -> None:
             await asyncio.sleep(STALLED_SWEEP_INTERVAL)
             try:
                 async with SessionLocal() as session:
-                    await assembler.sweep_stalled(session)
+                    await assembler.sweep_stalled(session, on_event=on_event)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[stalled-sweep] ERROR (continuing): {exc}", flush=True)
     except asyncio.CancelledError:
@@ -269,12 +292,21 @@ async def _sweep_stalled_loop(assembler: JourneyAssembler) -> None:
         raise
 
 
-async def run_consumers(assembler: JourneyAssembler | None = None) -> None:
+async def run_consumers(
+    assembler: JourneyAssembler | None = None,
+    on_event: OnEvent | None = None,
+) -> None:
     """Run both consumers + the stalled-journey sweep concurrently.
 
     Called by ``backend.main``. Each consumer gets its own channel so their
     prefetch windows are independent. The sweep task shares the raw consumer's
     assembler instance so it can time out in-memory journeys.
+
+    ``on_event`` is an optional async sink (e.g. the WebSocket hub's
+    ``broadcast``) wired to all three streams: ``alert.new`` from the alerts
+    consumer, ``journey.updated`` / ``journey.completed`` from the assembler and
+    the sweep. Left as ``None`` (the default), the consumers run without any
+    WebSocket coupling — standalone and headless.
     """
     import asyncio
 
@@ -286,12 +318,14 @@ async def run_consumers(assembler: JourneyAssembler | None = None) -> None:
     async with connection:
         alerts_channel = await connection.channel()
         raw_channel = await connection.channel()
-        alerts = AlertsConsumer(channel=alerts_channel)
-        raw = RawEventsConsumer(channel=raw_channel, assembler=assembler)
+        alerts = AlertsConsumer(channel=alerts_channel, on_event=on_event)
+        raw = RawEventsConsumer(
+            channel=raw_channel, assembler=assembler, on_event=on_event
+        )
         await asyncio.gather(
             alerts.run(),
             raw.run(),
-            _sweep_stalled_loop(assembler),
+            _sweep_stalled_loop(assembler, on_event=on_event),
         )
 
 

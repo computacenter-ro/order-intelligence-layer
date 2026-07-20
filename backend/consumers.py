@@ -212,6 +212,7 @@ class AlertsConsumer(_QueueConsumer):
     async def _process(self, alert: ProcessedAlert) -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from backend.db import Alert
+        from backend.linking import link_alert
 
         stmt = (
             pg_insert(Alert)
@@ -220,6 +221,10 @@ class AlertsConsumer(_QueueConsumer):
         )
         async with self._factory()() as session:
             result = await session.execute(stmt)
+            # Link to its journey if one already exists (else it stays null and
+            # the raw consumer back-fills it once the journey is assembled).
+            if result.rowcount != 0:
+                await link_alert(session, alert)
             await session.commit()
 
         # Broadcast only a genuinely new alert: a redelivered duplicate inserts

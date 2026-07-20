@@ -151,10 +151,21 @@ async def test_alerts_process_persists_with_on_conflict_do_nothing():
     consumer = AlertsConsumer(session_factory=lambda: session)
     await consumer._process(_alert("fallback"))
     assert session.commits == 1
-    assert len(session.executed) == 1
+    # A new alert runs two statements: the INSERT, then a linking UPDATE that
+    # attaches it to its journey (Fix 2). The first is the idempotent insert.
+    assert len(session.executed) == 2
     # idempotency is enforced by ON CONFLICT DO NOTHING (dedup on the unique
     # alert_id / log_id) so a redelivered message inserts nothing new.
     assert "ON CONFLICT DO NOTHING" in _compiled(session.executed[0])
+
+
+async def test_alerts_process_skips_linking_when_duplicate():
+    # A redelivered alert (rowcount 0 = nothing inserted) must NOT run the
+    # linking UPDATE — only the insert attempt.
+    session = _FakeSession(rowcount=0)
+    consumer = AlertsConsumer(session_factory=lambda: session)
+    await consumer._process(_alert("fallback"))
+    assert len(session.executed) == 1  # insert only, no link
 
 
 # --- RawEventsConsumer -------------------------------------------------------

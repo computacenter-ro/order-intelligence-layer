@@ -1,4 +1,5 @@
 import { CheckCircleIcon, XCircleIcon, ClockIcon, CircleDashedIcon } from "@phosphor-icons/react";
+import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { pipelineStages } from "@/lib/pipeline";
 import type { PipelineStageState } from "@/lib/pipeline";
 import type { Journey } from "@/lib/types";
@@ -8,12 +9,17 @@ interface PipelineTrailProps {
 }
 
 const STAGE_COLOR: Record<PipelineStageState, string> = {
-  done: "var(--cc-circuit-green)",
+  done: badgeColors.success.text,
   current: "var(--cc-fibre-orange)",
   stopped: "var(--cc-united-red)",
   stalled: "var(--cc-voltage-yellow)",
-  skipped: "var(--cc-grey-four)",
-  pending: "var(--cc-grey-four)",
+  skipped: "var(--cc-grey-three)",
+  pending: "var(--cc-grey-three)",
+};
+
+const STAGE_BG: Partial<Record<PipelineStageState, string>> = {
+  done: badgeColors.success.bg,
+  stopped: badgeColors.error.bg,
 };
 
 function StageIcon({ state }: { state: PipelineStageState }) {
@@ -40,7 +46,7 @@ export function PipelineTrail({ journey }: PipelineTrailProps) {
               padding: "6px 12px",
               borderRadius: "8px",
               border: `1px solid ${STAGE_COLOR[stage.state]}`,
-              opacity: stage.state === "skipped" || stage.state === "pending" ? 0.5 : 1,
+              background: STAGE_BG[stage.state] ?? "transparent",
               fontFamily: "ui-monospace, Menlo, monospace",
               fontSize: "12px",
               color: STAGE_COLOR[stage.state],

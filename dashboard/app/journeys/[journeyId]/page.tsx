@@ -16,11 +16,16 @@ export default function JourneyDetailPage() {
   if (!journey) {
     return (
       <div>
-        <Button variant="ghost" onClick={() => router.push("/journeys")}>
-          ← Back to journeys
-        </Button>
-        <p style={{ fontSize: "16px", color: "var(--cc-grey-three)", marginTop: "24px" }}>
-          Journey not found.
+        <div style={{ marginBottom: "16px" }}>
+          <Button variant="ghost" onClick={() => router.push("/journeys")}>
+            ← Back to Journeys
+          </Button>
+        </div>
+        <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: 0 }}>
+          Journey not found
+        </h1>
+        <p style={{ fontSize: "16px", color: "var(--cc-grey-three)", marginTop: "8px" }}>
+          No journey matches this id — it may not exist, or the id is wrong.
         </p>
       </div>
     );
@@ -30,9 +35,12 @@ export default function JourneyDetailPage() {
     <div>
       <div style={{ marginBottom: "16px" }}>
         <Button variant="ghost" onClick={() => router.push("/journeys")}>
-          ← Back to journeys
+          ← Back to Journeys
         </Button>
       </div>
+      <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: "0 0 16px" }}>
+        Journey {journey.order_id ?? journey.event_id}
+      </h1>
       <OutcomeBanner journey={journey} />
       <AiSummaryPanel summary={journey.summary} />
       <h2 style={{ fontSize: "16px", fontWeight: 500, color: "var(--cc-grey-two)", margin: "0 0 8px" }}>

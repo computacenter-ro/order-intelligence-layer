@@ -160,7 +160,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
           onClick={onClose}
           style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
         >
-          → View full order journey
+          → View Full Order Journey
         </Link>
       </aside>
     </>

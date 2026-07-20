@@ -34,7 +34,12 @@ export function AppShell({ children }: AppShellProps) {
 
   const items: SideNavItem[] = [
     { label: "Alert Feed", href: "/", icon: <BellIcon size={20} />, active: pathname === "/" },
-    { label: "Journeys", href: "/journeys", icon: <MapTrifoldIcon size={20} />, active: pathname === "/journeys" },
+    {
+      label: "Journeys",
+      href: "/journeys",
+      icon: <MapTrifoldIcon size={20} />,
+      active: pathname === "/journeys" || pathname.startsWith("/journeys/"),
+    },
   ];
 
   const handleItemClick = (item: BaseNavItem) => {
@@ -42,7 +47,7 @@ export function AppShell({ children }: AppShellProps) {
   };
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh" }}>
+    <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
       <SideNav
         logo={
           <span style={{ color: "var(--cc-cloud-white)", fontSize: "14px", fontWeight: 600 }}>
@@ -66,6 +71,7 @@ export function AppShell({ children }: AppShellProps) {
           minWidth: 0,
           background: "var(--cc-cloud-white)",
           padding: "48px",
+          overflowY: "auto",
         }}
       >
         {children}

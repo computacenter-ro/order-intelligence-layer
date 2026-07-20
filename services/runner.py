@@ -70,7 +70,7 @@ async def _handle(
         # means a routing bug upstream — log loudly and drop (don't requeue).
         print(
             f"[{service_name}] ERROR: baton flow={baton.flow_id} at cursor "
-            f"{baton.cursor} targets '{service}', not this service — dropping",
+            f"{baton.cursor} targets '{service}', not this service - dropping",
             flush=True,
         )
         return
@@ -78,7 +78,7 @@ async def _handle(
     handler = BLOCKS.get((service, block))
     if handler is None:
         print(
-            f"[{service_name}] no block registered for ({service}, {block}) — "
+            f"[{service_name}] no block registered for ({service}, {block}) - "
             f"cannot emit, chain stops for flow={baton.flow_id}",
             flush=True,
         )
@@ -87,7 +87,7 @@ async def _handle(
     last = len(baton.steps) - 1
     print(
         f"[{service_name}] flow={baton.flow_id} scenario={baton.scenario} "
-        f"step {baton.cursor}/{last} → running block '{block}'",
+        f"step {baton.cursor}/{last} -> running block '{block}'",
         flush=True,
     )
 
@@ -95,7 +95,7 @@ async def _handle(
     if not forward:
         print(
             f"[{service_name}] flow={baton.flow_id} block '{block}' signalled "
-            f"fatal failure — not forwarding baton",
+            f"fatal failure - not forwarding baton",
             flush=True,
         )
         return
@@ -112,7 +112,7 @@ async def _handle(
     next_service = baton.steps[baton.cursor][0]
     await _publish(channel, next_service, baton)
     print(
-        f"[{service_name}] flow={baton.flow_id} forwarded baton → "
+        f"[{service_name}] flow={baton.flow_id} forwarded baton -> "
         f"{_queue_name(next_service)} (cursor {baton.cursor})",
         flush=True,
     )
@@ -133,7 +133,7 @@ def _load_blocks(service_name: str) -> None:
         # A missing module means this service has no emitter yet — fail loudly
         # rather than silently listen on a queue whose blocks can never fire.
         raise SystemExit(
-            f"[{service_name}] no emitter module {module!r} — cannot register "
+            f"[{service_name}] no emitter module {module!r} - cannot register "
             f"any blocks ({exc})"
         ) from exc
     registered = sorted(block for svc, block in BLOCKS if svc == service_name)

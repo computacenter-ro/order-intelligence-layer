@@ -49,8 +49,91 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  # --- Uncomment for prod-like/demo runs once the app is containerized ---
+  # --- Python apps (share one image; differ only in `command`) --------------
+  # Enable with: docker compose --profile app up -d
+  # (Left in a profile so `docker compose up -d` alone still starts infra only,
+  # preserving the native-dev workflow.)
+
+  # Migrations run once, then exit. Everything that touches the DB waits on it.
+  migrate:
+    profiles: ["app"]
+    build: .
+    image: oil-app
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oil}:${POSTGRES_PASSWORD:-oil}@postgres:5432/${POSTGRES_DB:-oil}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  collector:
+    profiles: ["app"]
+    build: .
+    image: oil-app
+    command: uvicorn pipeline.mock_es.app:app --host 0.0.0.0 --port 9200
+    ports:
+      - "9200:9200"
+
+  mock-services:
+    profiles: ["app"]
+    image: oil-app
+    command: python -m pipeline.services.run_all
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      ES_URL: http://collector:9200
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      collector:
+        condition: service_started
+
+  ai-service:
+    profiles: ["app"]
+    image: oil-app
+    command: python -m ai_service.main
+    environment:
+      ES_URL: http://collector:9200
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # /summarize-journey must be reachable by the backend container.
+      API_HOST: 0.0.0.0
+      # Azure creds come from .env (unset => LLM fallback mode).
+      AZURE_AI_FOUNDRY_ENDPOINT: ${AZURE_AI_FOUNDRY_ENDPOINT:-}
+      AZURE_AI_FOUNDRY_API_KEY: ${AZURE_AI_FOUNDRY_API_KEY:-}
+      AZURE_AI_FOUNDRY_DEPLOYMENT_EXPLAINER: ${AZURE_AI_FOUNDRY_DEPLOYMENT_EXPLAINER:-}
+      AZURE_AI_FOUNDRY_DEPLOYMENT_ROUTER: ${AZURE_AI_FOUNDRY_DEPLOYMENT_ROUTER:-}
+      AZURE_AI_FOUNDRY_DEPLOYMENT_SUMMARY: ${AZURE_AI_FOUNDRY_DEPLOYMENT_SUMMARY:-}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
+
+  backend:
+    profiles: ["app"]
+    image: oil-app
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oil}:${POSTGRES_PASSWORD:-oil}@postgres:5432/${POSTGRES_DB:-oil}
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # Reserved: the backend does NOT yet call /summarize-journey (see the TODO
+      # in backend/journeys.py — summary is currently left None). Pre-wired by
+      # service name so the integration works once that call is added.
+      AI_SERVICE_URL: http://ai-service:8100
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # --- Uncomment for prod-like/demo runs once the frontend is built ---------
   # dashboard:
+  #   profiles: ["app"]
   #   build:
   #     context: ./dashboard
   #     args:

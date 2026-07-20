@@ -74,9 +74,10 @@ class _FakeResult:
 class _FakeSession:
     """Records execute() statements and commit()s; usable as an async CM."""
 
-    def __init__(self) -> None:
+    def __init__(self, rowcount: int = 1) -> None:
         self.executed: list[object] = []
         self.commits = 0
+        self._rowcount = rowcount
 
     async def __aenter__(self) -> "_FakeSession":
         return self
@@ -86,7 +87,7 @@ class _FakeSession:
 
     async def execute(self, stmt):
         self.executed.append(stmt)
-        return _FakeResult()
+        return _FakeResult(self._rowcount)
 
     async def commit(self) -> None:
         self.commits += 1
@@ -94,10 +95,10 @@ class _FakeSession:
 
 class _FakeAssembler:
     def __init__(self) -> None:
-        self.ingested: list[tuple[object, list]] = []
+        self.ingested: list[tuple[object, list, object]] = []
 
-    async def ingest(self, session, logs, now=None):
-        self.ingested.append((session, list(logs)))
+    async def ingest(self, session, logs, now=None, on_event=None):
+        self.ingested.append((session, list(logs), on_event))
         return []
 
 
@@ -173,9 +174,26 @@ async def test_raw_process_forwards_log_to_assembler():
     log = _log(message="one")
     await consumer._process(log)
     assert len(assembler.ingested) == 1
-    passed_session, passed_logs = assembler.ingested[0]
+    passed_session, passed_logs, passed_on_event = assembler.ingested[0]
     assert passed_session is session
     assert passed_logs == [log]
+    assert passed_on_event is None  # no hub wired -> no broadcasting
+
+
+async def test_raw_process_forwards_on_event_to_assembler():
+    session = _FakeSession()
+    assembler = _FakeAssembler()
+    events: list[dict] = []
+
+    async def sink(ev):
+        events.append(ev)
+
+    consumer = RawEventsConsumer(
+        session_factory=lambda: session, assembler=assembler, on_event=sink
+    )
+    await consumer._process(_log(message="one"))
+    _s, _logs, passed_on_event = assembler.ingested[0]
+    assert passed_on_event is sink  # the assembler does the actual emitting
 
 
 # --- config ------------------------------------------------------------------
@@ -327,3 +345,48 @@ async def test_sweep_stalled_leaves_fresh_journey_in_progress():
 
     assert completions == []
     assert session.commits == 0  # nothing finalized, nothing committed
+
+
+# --- alert.new broadcast -----------------------------------------------------
+
+
+async def test_alerts_process_broadcasts_alert_new_after_persist():
+    session = _FakeSession(rowcount=1)  # a genuinely new row
+    events: list[dict] = []
+
+    async def sink(ev):
+        events.append(ev)
+
+    consumer = AlertsConsumer(session_factory=lambda: session, on_event=sink)
+    await consumer._process(_alert("ai"))
+
+    assert session.commits == 1  # persisted first
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["type"] == "alert.new"
+    assert ev["data"]["alert_id"] == "alert-1"
+    assert ev["data"]["source"] == "ai"
+    assert ev["data"]["department"] == "backend"
+
+
+async def test_alerts_process_does_not_broadcast_a_duplicate():
+    # ON CONFLICT DO NOTHING inserts nothing on redelivery (rowcount 0) — no
+    # WebSocket push, so at-least-once delivery stays idempotent end-to-end.
+    session = _FakeSession(rowcount=0)
+    events: list[dict] = []
+
+    async def sink(ev):
+        events.append(ev)
+
+    consumer = AlertsConsumer(session_factory=lambda: session, on_event=sink)
+    await consumer._process(_alert("ai"))
+
+    assert session.commits == 1
+    assert events == []
+
+
+async def test_alerts_process_without_hub_does_not_broadcast():
+    session = _FakeSession()
+    consumer = AlertsConsumer(session_factory=lambda: session)  # on_event=None
+    await consumer._process(_alert("fallback"))  # must not raise
+    assert session.commits == 1

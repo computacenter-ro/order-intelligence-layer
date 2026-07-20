@@ -1,13 +1,30 @@
 "use client";
 
-import { useState } from "react";
-import { alerts } from "@/lib/fixtures";
+import { useCallback, useEffect, useState } from "react";
+import { fetchAlerts } from "@/lib/api";
+import { useWebSocket } from "@/lib/useWebSocket";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
-import type { ProcessedAlert } from "@/lib/types";
+import type { ProcessedAlert, WsEvent } from "@/lib/types";
 
 export default function AlertFeedPage() {
+  const [alerts, setAlerts] = useState<ProcessedAlert[]>([]);
   const [selected, setSelected] = useState<ProcessedAlert | null>(null);
+
+  useEffect(() => {
+    fetchAlerts()
+      .then(setAlerts)
+      .catch((err) => console.error("Failed to load alerts:", err));
+  }, []);
+
+  const handleEvent = useCallback((event: WsEvent) => {
+    if (event.type !== "alert.new") return;
+    setAlerts((prev) =>
+      prev.some((a) => a.alert_id === event.data.alert_id) ? prev : [event.data, ...prev]
+    );
+  }, []);
+
+  useWebSocket(handleEvent);
 
   const sorted = [...alerts].sort(
     (a, b) => new Date(b.emitted_at).getTime() - new Date(a.emitted_at).getTime()

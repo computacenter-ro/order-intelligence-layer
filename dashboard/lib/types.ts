@@ -39,7 +39,7 @@ export interface ProcessedAlert {
   journey_id: string | null;
 }
 
-export type JourneyStatus = "in_progress" | "success" | "failed" | "timed_out";
+export type JourneyStatus = "IN_PROGRESS" | "SUCCESS" | "FAILED" | "TIMED_OUT";
 
 export interface JourneyEvent {
   log_id: string;

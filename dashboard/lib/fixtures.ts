@@ -181,7 +181,7 @@ function journeyEvent(ts: string, raw: LogLine): JourneyEvent {
 export const journeys: Journey[] = [
   {
     journey_id: "journey-6042",
-    status: "failed",
+    status: "FAILED",
     outcome: "MARGIN_CHECK_FAILED",
     first_ts: "2026-07-14T08:00:00.432Z",
     last_ts: "2026-07-14T08:00:03.501Z",
@@ -248,7 +248,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-6039",
-    status: "failed",
+    status: "FAILED",
     outcome: "SAP_SUBMISSION_FAILED",
     first_ts: "2026-07-14T07:59:00.000Z",
     last_ts: "2026-07-14T07:59:41.000Z",
@@ -315,7 +315,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-6045",
-    status: "in_progress",
+    status: "IN_PROGRESS",
     outcome: null,
     first_ts: "2026-07-14T08:00:05.000Z",
     last_ts: "2026-07-14T08:00:11.000Z",
@@ -381,7 +381,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-6041",
-    status: "success",
+    status: "SUCCESS",
     outcome: "SUCCESS",
     first_ts: "2026-07-14T07:59:50.000Z",
     last_ts: "2026-07-14T07:59:58.000Z",
@@ -448,7 +448,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-aa3391bd",
-    status: "failed",
+    status: "FAILED",
     outcome: "ORDER_CREATION_FAILED",
     first_ts: "2026-07-14T07:56:59.000Z",
     last_ts: "2026-07-14T07:57:02.000Z",
@@ -488,7 +488,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-6033",
-    status: "timed_out",
+    status: "TIMED_OUT",
     outcome: "STALLED_TIMEOUT",
     first_ts: "2026-07-14T07:54:10.000Z",
     last_ts: "2026-07-14T07:55:40.000Z",
@@ -555,7 +555,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-6030",
-    status: "success",
+    status: "SUCCESS",
     outcome: "SUCCESS",
     first_ts: "2026-07-14T07:54:00.000Z",
     last_ts: "2026-07-14T07:54:12.000Z",
@@ -622,7 +622,7 @@ export const journeys: Journey[] = [
   },
   {
     journey_id: "journey-55dd90f2",
-    status: "failed",
+    status: "FAILED",
     outcome: "INBOUND_TRANSFORM_FAILED",
     first_ts: "2026-07-14T07:59:11.000Z",
     last_ts: "2026-07-14T07:59:12.400Z",

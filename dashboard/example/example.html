@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IT Support Dashboard — Wireframe</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --txt:#e6e9ef; --muted:#8b93a3; --dim:#5c6474;
+    --blue:#4f8cff; --bluebg:#16233d;
+    --amber:#f0b429; --amberbg:#2e2410;
+    --red:#ef5b5b; --redbg:#2e1414;
+    --green:#3fb950; --greenbg:#12251a;
+    --violet:#a371f7; --violetbg:#241a33;
+    --grey:#6b7280; --greybg:#20242d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    background:var(--bg);color:var(--txt);font-size:14px;line-height:1.5}
+  .app{display:flex;min-height:100vh}
+
+  /* Sidebar */
+  .side{width:210px;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:16px 0;position:fixed;height:100vh}
+  .brand{padding:0 18px 16px;border-bottom:1px solid var(--line);margin-bottom:10px}
+  .brand h1{font-size:14px;margin:0;letter-spacing:.3px}
+  .brand span{font-size:11px;color:var(--dim)}
+  .nav a{display:flex;align-items:center;gap:10px;padding:10px 18px;color:var(--muted);
+    cursor:pointer;text-decoration:none;border-left:3px solid transparent}
+  .nav a:hover{background:var(--panel2);color:var(--txt)}
+  .nav a.active{color:var(--txt);border-left-color:var(--blue);background:var(--panel2)}
+  .nav .ico{width:16px;text-align:center}
+  .ws-status{margin-top:auto;padding:12px 18px;font-size:12px;color:var(--muted);
+    display:flex;align-items:center;gap:8px;border-top:1px solid var(--line)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+    box-shadow:0 0 0 3px rgba(63,185,80,.18);animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+
+  /* Main */
+  .main{margin-left:210px;flex:1;padding:22px 28px;max-width:1200px}
+  .page{display:none}.page.active{display:block}
+  .pagehead{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:18px}
+  .pagehead h2{margin:0;font-size:20px}
+  .pagehead p{margin:4px 0 0;color:var(--muted);font-size:13px}
+
+  /* Filters */
+  .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center}
+  .chip{padding:5px 11px;border:1px solid var(--line);border-radius:20px;background:var(--panel);
+    color:var(--muted);cursor:pointer;font-size:12px}
+  .chip.on{background:var(--bluebg);border-color:var(--blue);color:#cfe0ff}
+  .search{margin-left:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:7px 12px;color:var(--txt);width:220px}
+  .search::placeholder{color:var(--dim)}
+
+  /* Alert cards */
+  .newpill{display:inline-block;background:var(--blue);color:#fff;font-size:11px;font-weight:600;
+    padding:3px 10px;border-radius:20px;margin-bottom:12px;cursor:pointer}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;
+    margin-bottom:10px;cursor:pointer;transition:border-color .15s;position:relative;overflow:hidden}
+  .card:hover{border-color:#3a4150}
+  .card.fallback{opacity:.85;border-style:dashed}
+  .card .accent{position:absolute;left:0;top:0;bottom:0;width:3px}
+  .card.err .accent{background:var(--red)} .card.warn .accent{background:var(--amber)}
+  .card.fallback .accent{background:var(--grey)}
+  .cardtop{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+  .lvl{font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px;letter-spacing:.4px}
+  .lvl.err{background:var(--redbg);color:var(--red)} .lvl.warn{background:var(--amberbg);color:var(--amber)}
+  .svc{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted)}
+  .time{margin-left:auto;font-size:12px;color:var(--dim)}
+  .explain{font-size:14px;color:var(--txt);margin:2px 0 10px;line-height:1.45}
+  .fallback .explain{color:var(--muted);font-style:italic}
+  .cardbot{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .badge{font-size:11px;padding:2px 9px;border-radius:20px;font-weight:600;display:inline-flex;gap:5px;align-items:center}
+  .badge.ai{background:var(--violetbg);color:var(--violet)}
+  .badge.fb{background:var(--greybg);color:var(--grey);border:1px dashed var(--dim)}
+  .dept{font-size:11px;padding:2px 9px;border-radius:20px;background:var(--bluebg);color:#a9c6ff}
+  .conf{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .confbar{width:46px;height:5px;border-radius:3px;background:var(--line);overflow:hidden}
+  .confbar i{display:block;height:100%;background:var(--green)}
+  .ids{margin-left:auto;font-family:ui-monospace,monospace;font-size:11px;color:var(--dim)}
+  .ids b{color:var(--muted);font-weight:500}
+
+  /* Overview cards */
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .stat .n{font-size:26px;font-weight:700}
+  .stat .l{font-size:12px;color:var(--muted);margin-top:2px}
+  .stat.good .n{color:var(--green)} .stat.bad .n{color:var(--red)} .stat.warnc .n{color:var(--amber)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+  .panel h3{margin:0 0 14px;font-size:14px}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .bar-row{display:flex;align-items:center;gap:10px;margin-bottom:9px;font-size:13px}
+  .bar-row .lab{width:130px;color:var(--muted)}
+  .bar-row .track{flex:1;height:16px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .bar-row .track i{display:block;height:100%}
+  .bar-row .val{width:34px;text-align:right;color:var(--muted);font-size:12px}
+  .spark{display:flex;align-items:flex-end;gap:3px;height:70px;margin-top:6px}
+  .spark i{flex:1;background:var(--blue);border-radius:2px 2px 0 0;opacity:.8}
+  .health{display:flex;gap:10px;align-items:center;padding:10px 0}
+  .health .ind{width:10px;height:10px;border-radius:50%}
+  .ind.ok{background:var(--green)} .ind.warn{background:var(--amber)} .ind.err{background:var(--red)}
+
+  /* Journeys */
+  .jtable{width:100%;border-collapse:collapse}
+  .jtable th{text-align:left;font-size:11px;color:var(--dim);text-transform:uppercase;
+    letter-spacing:.5px;padding:8px 10px;border-bottom:1px solid var(--line)}
+  .jtable td{padding:11px 10px;border-bottom:1px solid var(--line);font-size:13px}
+  .jtable tr{cursor:pointer}.jtable tbody tr:hover{background:var(--panel2)}
+  .st{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600}
+  .st.success{background:var(--greenbg);color:var(--green)}
+  .st.failed{background:var(--redbg);color:var(--red)}
+  .st.timed{background:var(--amberbg);color:var(--amber)}
+  .st.prog{background:var(--bluebg);color:#a9c6ff}
+  .mono{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted)}
+
+  /* Journey detail */
+  .back{color:var(--blue);cursor:pointer;font-size:13px;margin-bottom:12px;display:inline-block}
+  .outcome{border-radius:10px;padding:16px 18px;margin-bottom:16px;border:1px solid}
+  .outcome.failed{background:var(--redbg);border-color:#5a2626}
+  .outcome.success{background:var(--greenbg);border-color:#265a34}
+  .outcome.prog{background:var(--bluebg);border-color:#26406a}
+  .outcome h3{margin:0 0 4px;font-size:16px}
+  .outcome .sub{font-size:13px;color:var(--muted)}
+  .summary{background:var(--violetbg);border:1px solid #3a2d52;border-radius:10px;padding:14px 16px;margin-bottom:16px}
+  .summary .tag{font-size:11px;color:var(--violet);font-weight:700;letter-spacing:.4px;margin-bottom:6px}
+  .summary p{margin:0;line-height:1.55}
+  .pipe{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 18px}
+  .pipe .node{padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel);
+    font-size:12px;font-family:ui-monospace,monospace;color:var(--muted)}
+  .pipe .node.done{border-color:#265a34;color:var(--green)}
+  .pipe .node.stop{border-color:#5a2626;color:var(--red);background:var(--redbg)}
+  .pipe .node.skip{opacity:.35}
+  .pipe .arr{color:var(--dim);align-self:center}
+  .tl{position:relative;padding-left:24px}
+  .tl:before{content:"";position:absolute;left:7px;top:4px;bottom:4px;width:2px;background:var(--line)}
+  .ev{position:relative;margin-bottom:16px}
+  .ev:before{content:"";position:absolute;left:-21px;top:4px;width:12px;height:12px;border-radius:50%;
+    background:var(--panel);border:2px solid var(--dim)}
+  .ev.ok:before{border-color:var(--green);background:var(--green)}
+  .ev.err:before{border-color:var(--red);background:var(--red)}
+  .ev.warn:before{border-color:var(--amber);background:var(--amber)}
+  .ev .evtop{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+  .ev .msg{font-family:ui-monospace,monospace;font-size:12px;color:var(--txt);margin:3px 0}
+  .ev .ai-note{background:var(--panel);border-left:2px solid var(--violet);padding:8px 12px;
+    border-radius:0 6px 6px 0;margin-top:6px;font-size:13px;color:var(--muted)}
+  .assembling{background:var(--panel);border:1px dashed var(--line);border-radius:8px;padding:12px;
+    color:var(--dim);font-size:13px;text-align:center;margin-top:8px}
+
+  /* Detail slide-over */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:20}
+  .overlay.open{display:block}
+  .drawer{position:fixed;top:0;right:0;height:100vh;width:440px;background:var(--panel);
+    border-left:1px solid var(--line);z-index:21;transform:translateX(100%);transition:transform .2s;
+    overflow-y:auto;padding:20px}
+  .drawer.open{transform:translateX(0)}
+  .drawer h3{margin:0 0 4px}
+  .close{float:right;color:var(--muted);cursor:pointer;font-size:20px;line-height:1}
+  .kv{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+  .kv b{color:var(--muted);font-weight:500}
+  .kv span{font-family:ui-monospace,monospace;color:var(--txt)}
+  .raw{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px;
+    font-family:ui-monospace,monospace;font-size:11px;color:#9fb0c9;white-space:pre-wrap;margin-top:8px;overflow-x:auto}
+  .section-lbl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin:16px 0 6px}
+  .wf-note{font-size:11px;color:var(--dim);border:1px dashed var(--line);border-radius:6px;
+    padding:6px 10px;margin-bottom:14px;background:rgba(255,255,255,.02)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- SIDEBAR -->
+  <nav class="side">
+    <div class="brand"><h1>⬡ LogLens</h1><span>IT Support Dashboard</span></div>
+    <div class="nav">
+      <a data-page="feed" class="active"><span class="ico">📡</span> Alert Feed</a>
+      <a data-page="journeys"><span class="ico">🧭</span> Journeys</a>
+      <a data-page="overview"><span class="ico">📊</span> Overview</a>
+    </div>
+    <div class="ws-status"><span class="dot"></span> WebSocket · live</div>
+  </nav>
+
+  <main class="main">
+    <!-- ============ ALERT FEED ============ -->
+    <section class="page active" id="feed">
+      <div class="pagehead">
+        <div><h2>Alert Feed</h2><p>Real-time WARN / ERROR alerts, explained in plain English</p></div>
+      </div>
+      <div class="wf-note">Wireframe — click any card to open its detail panel. "View journey" jumps to the Journeys view.</div>
+      <div class="filters">
+        <span class="chip on">All departments</span>
+        <span class="chip">devops</span>
+        <span class="chip">backend</span>
+        <span class="chip">database</span>
+        <span class="chip">networking</span>
+        <span class="chip">general</span>
+        <span class="chip" style="margin-left:14px">All sources</span>
+        <span class="chip">AI only</span>
+        <span class="chip">Fallback only</span>
+        <input class="search" placeholder="Search orderId / message…">
+      </div>
+      <div class="newpill">↑ 3 new alerts</div>
+      <div id="feedlist"></div>
+    </section>
+
+    <!-- ============ JOURNEYS LIST ============ -->
+    <section class="page" id="journeys">
+      <div class="pagehead">
+        <div><h2>Order Journeys</h2><p>Each order's full path through the pipeline — where it went, where it stopped</p></div>
+      </div>
+      <div class="wf-note">Click a row to open the journey timeline.</div>
+      <div class="filters">
+        <span class="chip on">All</span>
+        <span class="chip">In progress</span>
+        <span class="chip">Success</span>
+        <span class="chip">Failed</span>
+        <span class="chip">Timed out</span>
+        <input class="search" placeholder="Search by order / event id…">
+      </div>
+      <div class="panel" style="padding:4px 6px">
+        <table class="jtable">
+          <thead><tr><th>Status</th><th>Order ID</th><th>Event ID</th><th>Outcome</th><th>Stopped at</th><th>Last seen</th></tr></thead>
+          <tbody id="jbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============ JOURNEY DETAIL ============ -->
+    <section class="page" id="journey-detail">
+      <span class="back" onclick="show('journeys')">← Back to journeys</span>
+      <div class="outcome failed">
+        <h3>❌ FAILED · MARGIN_CHECK_FAILED</h3>
+        <div class="sub">Order ORD-6042 · UK · 2 lines · stopped at cc-checker-service</div>
+      </div>
+      <div class="summary">
+        <div class="tag">◆ AI JOURNEY SUMMARY</div>
+        <p>Order ORD-6042 was received and created successfully, then enriched with pricing (SPT),
+        rebates (RSM) and product data (SOLR). During the margin check, line SKU-GPU-A100-80GB fell
+        below the configured margin threshold, so the Checker service blocked the order. The order never
+        reached validation or fulfilment. Likely cause: a pricing/rebate combination that leaves margin
+        under policy — route to the <b>backend</b> team to review the margin rule for this SKU.</p>
+      </div>
+
+      <div class="section-lbl">Pipeline path</div>
+      <div class="pipe">
+        <span class="node done">inbound</span><span class="arr">→</span>
+        <span class="node done">order-engine</span><span class="arr">→</span>
+        <span class="node done">spt</span><span class="arr">→</span>
+        <span class="node done">rsm</span><span class="arr">→</span>
+        <span class="node done">solr</span><span class="arr">→</span>
+        <span class="node stop">checker ✕</span><span class="arr">→</span>
+        <span class="node skip">validator</span><span class="arr">→</span>
+        <span class="node skip">outbound-osw</span><span class="arr">→</span>
+        <span class="node skip">track-trace</span>
+      </div>
+
+      <div class="section-lbl">Event timeline</div>
+      <div class="tl">
+        <div class="ev ok">
+          <div class="evtop"><span class="mono">cc-inbound-service</span> · 08:00:00.432</div>
+          <div class="msg">Received inbound order event evt-372656a7 for account 81036533</div>
+        </div>
+        <div class="ev ok">
+          <div class="evtop"><span class="mono">cc-order-engine</span> · 08:00:01.117</div>
+          <div class="msg">Generated order number ORD-6042 for cart header 1840927365018240042</div>
+        </div>
+        <div class="ev ok">
+          <div class="evtop"><span class="mono">cc-spt-service</span> · 08:00:01.980</div>
+          <div class="msg">Price list resolved for 2 lines</div>
+        </div>
+        <div class="ev warn">
+          <div class="evtop"><span class="mono">cc-rsm-service</span> · 08:00:02.640 <span class="lvl warn">WARN</span></div>
+          <div class="msg">No PVC rate found for SKU-GPU-A100-80GB, applying default</div>
+          <div class="ai-note">◆ Rebate service couldn't find a specific rebate rate for this GPU SKU and fell back to a default — this reduced the effective margin and contributed to the later block.</div>
+        </div>
+        <div class="ev err">
+          <div class="evtop"><span class="mono">cc-checker-service</span> · 08:00:03.501 <span class="lvl err">ERROR</span></div>
+          <div class="msg">Order ORD-6042 blocked by margin check (line SKU-GPU-A100-80GB below threshold)</div>
+          <div class="ai-note">◆ The margin checker rejected the order because one line's margin dropped below the configured minimum. The order chain stops here — no fulfilment. Review margin thresholds / pricing for this SKU. <b>Dept: backend · confidence 0.88</b></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ OVERVIEW ============ -->
+    <section class="page" id="overview">
+      <div class="pagehead">
+        <div><h2>Overview</h2><p>System health at a glance — last 60 minutes</p></div>
+      </div>
+      <div class="grid">
+        <div class="stat"><div class="n">142</div><div class="l">Journeys processed</div></div>
+        <div class="stat good"><div class="n">98</div><div class="l">Succeeded</div></div>
+        <div class="stat bad"><div class="n">37</div><div class="l">Failed</div></div>
+        <div class="stat warnc"><div class="n">7</div><div class="l">Timed out (stalled)</div></div>
+      </div>
+
+      <div class="panel" style="border-color:#5a4310;background:var(--amberbg)">
+        <h3 style="color:var(--amber)">⚠ LLM health — degraded</h3>
+        <div class="health"><span class="ind warn"></span> Circuit breaker: <b>half-open</b> (probing) · 12% of alerts served as <b>fallback</b> in the last 15 min — routing & explanations unavailable for those. Manual triage may be needed.</div>
+      </div>
+
+      <div class="row2">
+        <div class="panel">
+          <h3>Alerts by department</h3>
+          <div class="bar-row"><span class="lab">backend</span><div class="track"><i style="width:70%;background:var(--blue)"></i></div><span class="val">64</span></div>
+          <div class="bar-row"><span class="lab">database</span><div class="track"><i style="width:44%;background:var(--violet)"></i></div><span class="val">40</span></div>
+          <div class="bar-row"><span class="lab">devops</span><div class="track"><i style="width:30%;background:var(--green)"></i></div><span class="val">27</span></div>
+          <div class="bar-row"><span class="lab">networking</span><div class="track"><i style="width:18%;background:var(--amber)"></i></div><span class="val">16</span></div>
+          <div class="bar-row"><span class="lab">general (fallback)</span><div class="track"><i style="width:12%;background:var(--grey)"></i></div><span class="val">11</span></div>
+        </div>
+        <div class="panel">
+          <h3>Failures by type</h3>
+          <div class="bar-row"><span class="lab">MARGIN_CHECK</span><div class="track"><i style="width:60%;background:var(--red)"></i></div><span class="val">11</span></div>
+          <div class="bar-row"><span class="lab">SAP_SUBMISSION</span><div class="track"><i style="width:48%;background:var(--red)"></i></div><span class="val">9</span></div>
+          <div class="bar-row"><span class="lab">VALIDATION</span><div class="track"><i style="width:38%;background:var(--red)"></i></div><span class="val">7</span></div>
+          <div class="bar-row"><span class="lab">ENRICHMENT (SPT)</span><div class="track"><i style="width:27%;background:var(--red)"></i></div><span class="val">5</span></div>
+          <div class="bar-row"><span class="lab">AUTH (JAM 403)</span><div class="track"><i style="width:16%;background:var(--red)"></i></div><span class="val">3</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Alert volume — last hour</h3>
+        <div class="spark" id="spark"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Detail drawer -->
+<div class="overlay" id="overlay" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <span class="close" onclick="closeDrawer()">✕</span>
+  <div id="drawer-body"></div>
+</aside>
+
+<script>
+// ---- mock data derived from the 10 canonical scenarios ----
+const alerts = [
+  {lvl:'err', svc:'cc-checker-service', time:'08:00:03', explain:'Order ORD-6042 was blocked by the margin check — one line fell below the configured margin threshold. The order will not be fulfilled.', dept:'backend', conf:0.88, src:'ai', order:'ORD-6042', evt:'evt-372656a7'},
+  {lvl:'err', svc:'cc-outbound-osw', time:'07:59:41', explain:'SAP fulfilment submission failed after 3 RFC retries and was moved to the dead-letter queue. The order was created but never submitted downstream.', dept:'backend', conf:0.91, src:'ai', order:'ORD-6039', evt:'evt-91ab22c1'},
+  {lvl:'err', svc:'cc-inbound-service', time:'07:59:12', explain:null, dept:null, conf:null, src:'fallback', order:'—', evt:'evt-55dd90f2'},
+  {lvl:'warn', svc:'cc-rsm-service', time:'07:58:55', explain:'No PVC rebate rate was found for this SKU, so a default rate was applied. Not fatal, but it lowers the order margin.', dept:'backend', conf:0.72, src:'ai', order:'ORD-6042', evt:'evt-372656a7'},
+  {lvl:'err', svc:'cc-jam-service', time:'07:58:30', explain:'Authentication failed with a 403 — the user account is disabled. The order was aborted before enrichment completed.', dept:'networking', conf:0.84, src:'ai', order:'ORD-6035', evt:'evt-7c1180aa'},
+  {lvl:'err', svc:'cc-validator-service', time:'07:57:47', explain:'Validation failed with a 422 — the order is missing the required costCenter UDF. It was rejected before fulfilment.', dept:'backend', conf:0.79, src:'ai', order:'ORD-6031', evt:'evt-2f45ce88'},
+  {lvl:'err', svc:'cc-order-engine', time:'07:57:02', explain:'Order creation failed — the BM database timed out 3 times while persisting the cart header. No order number was ever generated.', dept:'database', conf:0.93, src:'ai', order:'—', evt:'evt-aa3391bd'},
+  {lvl:'err', svc:'cc-spt-service', time:'07:56:20', explain:'Pricing service (SPT) was unreachable; the order engine timed out 3 times and aborted enrichment. Order processing stopped.', dept:'devops', conf:0.87, src:'ai', order:'ORD-6028', evt:'evt-c0ffee12'},
+];
+const journeys = [
+  {st:'failed', stl:'FAILED', order:'ORD-6042', evt:'evt-372656a7', out:'MARGIN_CHECK_FAILED', stop:'cc-checker-service', seen:'08:00:03'},
+  {st:'failed', stl:'FAILED', order:'ORD-6039', evt:'evt-91ab22c1', out:'SAP_SUBMISSION_FAILED', stop:'cc-outbound-osw', seen:'07:59:41'},
+  {st:'prog', stl:'IN PROGRESS', order:'ORD-6045', evt:'evt-11de77f0', out:'—', stop:'cc-order-engine (enriching)', seen:'08:00:11'},
+  {st:'success', stl:'SUCCESS', order:'ORD-6041', evt:'evt-6612aa03', out:'SUCCESS', stop:'cc-track-trace', seen:'07:59:58'},
+  {st:'failed', stl:'FAILED', order:'—', evt:'evt-aa3391bd', out:'ORDER_CREATION_FAILED', stop:'cc-order-engine', seen:'07:57:02'},
+  {st:'timed', stl:'TIMED OUT', order:'ORD-6033', evt:'evt-88bb1290', out:'STALLED (90s)', stop:'cc-solr-service', seen:'07:55:40'},
+  {st:'success', stl:'SUCCESS', order:'ORD-6030', evt:'evt-4501fe23', out:'SUCCESS', stop:'cc-track-trace', seen:'07:54:12'},
+  {st:'failed', stl:'FAILED', order:'—', evt:'evt-55dd90f2', out:'INBOUND_TRANSFORM_FAILED', stop:'cc-inbound-service', seen:'07:59:12'},
+];
+
+function confColor(c){return c>=0.8?'var(--green)':c>=0.6?'var(--amber)':'var(--red)';}
+
+function renderFeed(){
+  document.getElementById('feedlist').innerHTML = alerts.map((a,i)=>`
+    <div class="card ${a.lvl} ${a.src==='fallback'?'fallback':''}" onclick="openAlert(${i})">
+      <span class="accent"></span>
+      <div class="cardtop">
+        <span class="lvl ${a.lvl}">${a.lvl.toUpperCase()}</span>
+        <span class="svc">${a.svc}</span>
+        <span class="time">${a.time}</span>
+      </div>
+      <div class="explain">${a.explain || 'Unprocessed — LLM unavailable. Raw log passed straight through; no explanation or routing.'}</div>
+      <div class="cardbot">
+        ${a.src==='ai'
+          ? `<span class="badge ai">◆ AI-analyzed</span><span class="dept">${a.dept}</span>
+             <span class="conf">conf <div class="confbar"><i style="width:${a.conf*100}%;background:${confColor(a.conf)}"></i></div> ${a.conf}</span>`
+          : `<span class="badge fb">⚠ fallback</span><span class="dept" style="background:var(--greybg);color:var(--grey)">general</span>`}
+        <span class="ids"><b>order</b> ${a.order} &nbsp; <b>evt</b> ${a.evt}</span>
+      </div>
+    </div>`).join('');
+}
+function renderJourneys(){
+  document.getElementById('jbody').innerHTML = journeys.map(j=>`
+    <tr onclick="show('journey-detail')">
+      <td><span class="st ${j.st}">${j.stl}</span></td>
+      <td class="mono">${j.order}</td>
+      <td class="mono">${j.evt}</td>
+      <td>${j.out}</td>
+      <td class="mono">${j.stop}</td>
+      <td class="mono">${j.seen}</td>
+    </tr>`).join('');
+}
+function renderSpark(){
+  const h=[30,45,38,52,60,48,70,65,80,55,62,90,72,58,66,84,78,95,70,60,52,74,88,62];
+  document.getElementById('spark').innerHTML = h.map(v=>`<i style="height:${v}%"></i>`).join('');
+}
+
+function openAlert(i){
+  const a=alerts[i];
+  document.getElementById('drawer-body').innerHTML=`
+    <h3>${a.svc}</h3>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:14px">${a.lvl.toUpperCase()} · ${a.time}</div>
+    <div class="section-lbl">Explanation</div>
+    <div class="explain">${a.explain || 'Unprocessed — LLM unavailable. This alert was passed straight through as a fallback and needs manual triage.'}</div>
+    ${a.src==='ai'?`<div class="cardbot" style="margin:10px 0"><span class="badge ai">◆ AI-analyzed</span><span class="dept">${a.dept}</span><span class="conf">conf ${a.conf}</span></div>`
+      :`<div class="cardbot" style="margin:10px 0"><span class="badge fb">⚠ fallback → #general-logs</span></div>`}
+    <div class="section-lbl">Correlation ids</div>
+    <div class="kv"><b>orderId</b><span>${a.order}</span></div>
+    <div class="kv"><b>eventId</b><span>${a.evt}</span></div>
+    <div class="kv"><b>source</b><span>${a.src}</span></div>
+    <div class="section-lbl">Raw log line</div>
+    <div class="raw">{
+  "log_id": "b2f1...c9",
+  "app_name": "${a.svc}",
+  "level": "${a.lvl.toUpperCase()}",
+  "logger": "c.c.checker.service.MarginService",
+  "host": "CCECMSRVT002",
+  "orderId": "${a.order}",
+  "eventId": "${a.evt}",
+  "message": "..."
+}</div>
+    <div class="section-lbl">Related</div>
+    <a class="back" onclick="closeDrawer();show('journey-detail')">→ View full order journey</a>`;
+  document.getElementById('overlay').classList.add('open');
+  document.getElementById('drawer').classList.add('open');
+}
+function closeDrawer(){
+  document.getElementById('overlay').classList.remove('open');
+  document.getElementById('drawer').classList.remove('open');
+}
+function show(page){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById(page).classList.add('active');
+  document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('active'));
+  const nav=document.querySelector(`.nav a[data-page="${page}"]`);
+  if(nav) nav.classList.add('active');
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('.nav a').forEach(a=>a.addEventListener('click',()=>show(a.dataset.page)));
+document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',function(){
+  // simple visual toggle within a group
+  this.classList.toggle('on');
+}));
+renderFeed();renderJourneys();renderSpark();
+</script>
+</body>
+</html>

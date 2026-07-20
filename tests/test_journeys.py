@@ -510,3 +510,75 @@ def test_overlapping_polls_do_not_duplicate(flow):
     assert len(a.stitcher.journeys) == 1
     assert len(a.stitcher.journeys[0].logs) == len(logs)
     assert completions[0].outcome == flow["outcome"]
+
+
+# =============================================================================
+# Journey summary wiring (Fix 1): summarizer callable injected into the
+# assembler; fetched on completion, persisted, and put in the completed event.
+# =============================================================================
+
+_COMPLETING_LOGS = [
+    mk(0, "Received inbound order event evt-1", eventId="evt-1"),
+    mk(2, "Received order creation response for event evt-1",
+       eventId="evt-1", orderId="ORD-1", cartHeaderId="C1"),
+    mk(5, "Registered order ORD-1 for tracking",
+       app_name="cc-track-trace", orderId="ORD-1", cartHeaderId="C1"),
+]
+
+
+async def test_summary_populated_in_completed_event_when_summarizer_set():
+    calls = []
+
+    async def fake_summarizer(completion):
+        calls.append(completion.journey_id)
+        return "This UK order completed successfully through to tracking."
+
+    a = JourneyAssembler(summarizer=fake_summarizer)
+    events, on_event = _sink()
+    await a.ingest(_FakeSession(), _COMPLETING_LOGS,
+                   now=BASE + timedelta(seconds=6), on_event=on_event)
+
+    assert len(calls) == 1  # summarizer called once, for the completed journey
+    data = events[0]["data"]
+    assert data["summary"] == "This UK order completed successfully through to tracking."
+
+
+async def test_summary_none_when_summarizer_returns_none():
+    async def down_summarizer(completion):
+        return None  # AI service unreachable / LLM down
+
+    a = JourneyAssembler(summarizer=down_summarizer)
+    events, on_event = _sink()
+    await a.ingest(_FakeSession(), _COMPLETING_LOGS,
+                   now=BASE + timedelta(seconds=6), on_event=on_event)
+
+    # completion still happens; summary is simply null — never blocks the journey
+    data = events[0]["data"]
+    assert data["status"] == "SUCCESS"
+    assert data["summary"] is None
+
+
+async def test_no_summarizer_makes_no_call_and_leaves_summary_null():
+    # The default assembler (no summarizer) must not attempt any summary work.
+    a = JourneyAssembler()  # summarizer defaults to None
+    events, on_event = _sink()
+    await a.ingest(_FakeSession(), _COMPLETING_LOGS,
+                   now=BASE + timedelta(seconds=6), on_event=on_event)
+    assert events[0]["data"]["summary"] is None
+
+
+async def test_summarizer_called_from_sweep_stalled():
+    seen = []
+
+    async def fake_summarizer(completion):
+        seen.append(completion.outcome)
+        return f"Timed out at {completion.outcome}."
+
+    a = JourneyAssembler(stalled_timeout=90, summarizer=fake_summarizer)
+    events, on_event = _sink()
+    a.add([mk(0, "Received inbound order event evt-1", eventId="evt-1")])
+    await a.sweep_stalled(_FakeSession(), now=BASE + timedelta(seconds=120),
+                          on_event=on_event)
+
+    assert seen == ["TIMED_OUT"]
+    assert events[0]["data"]["summary"] == "Timed out at TIMED_OUT."

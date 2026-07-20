@@ -311,8 +311,13 @@ async def run_consumers(
     import asyncio
 
     # One shared assembler: the raw consumer builds journeys into it, the sweep
-    # task times them out from the same in-memory state.
-    assembler = assembler if assembler is not None else JourneyAssembler()
+    # task times them out from the same in-memory state. The default assembler
+    # is wired to fetch each completed journey's summary from the AI service;
+    # an injected assembler (tests) is used as-is.
+    if assembler is None:
+        from backend.summarizer import fetch_summary
+
+        assembler = JourneyAssembler(summarizer=fetch_summary)
 
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     async with connection:

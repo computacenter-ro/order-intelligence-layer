@@ -193,10 +193,19 @@ class JourneyAssembler:
     persistence on top.
     """
 
-    def __init__(self, stalled_timeout: int | None = None) -> None:
+    def __init__(
+        self,
+        stalled_timeout: int | None = None,
+        summarizer=None,
+    ) -> None:
         self._stitcher = Stitcher()
         self._completed: dict[str, Completion] = {}
         self._timeout = STALLED_TIMEOUT if stalled_timeout is None else stalled_timeout
+        # Optional async callable ``(Completion) -> str | None`` that fetches the
+        # journey summary from the AI service. None => summaries are skipped
+        # (the DB-free decision layer and tests stay network-free). Wired to
+        # backend.summarizer.fetch_summary by backend.consumers at runtime.
+        self._summarizer = summarizer
 
     # --- DB-free decision layer ---------------------------------------------
 
@@ -279,8 +288,11 @@ class JourneyAssembler:
         await self._upsert_journeys(session, touched)
         await self._persist_events(session, new_events)
         completions = self.evaluate(now)
+        summaries = await self._summaries_for(completions)
         for completion in completions:
-            await self._finalize_journey(session, completion)
+            await self._finalize_journey(
+                session, completion, summaries.get(completion.journey_id)
+            )
         await session.commit()
 
         if on_event is not None:
@@ -290,7 +302,11 @@ class JourneyAssembler:
                 if journey.journey_id not in self._completed:
                     await on_event(_journey_updated_event(journey))
             for completion in completions:
-                await on_event(_journey_completed_event(completion))
+                await on_event(
+                    _journey_completed_event(
+                        completion, summaries.get(completion.journey_id)
+                    )
+                )
         return completions
 
     async def sweep_stalled(
@@ -305,14 +321,21 @@ class JourneyAssembler:
         when ``on_event`` is given.
         """
         completions = self.evaluate(now)
+        summaries = await self._summaries_for(completions)
         for completion in completions:
-            await self._finalize_journey(session, completion)
+            await self._finalize_journey(
+                session, completion, summaries.get(completion.journey_id)
+            )
         if completions:
             await session.commit()
 
         if on_event is not None:
             for completion in completions:
-                await on_event(_journey_completed_event(completion))
+                await on_event(
+                    _journey_completed_event(
+                        completion, summaries.get(completion.journey_id)
+                    )
+                )
         return completions
 
     @staticmethod
@@ -371,25 +394,46 @@ class JourneyAssembler:
             await session.execute(stmt)
 
     @staticmethod
-    async def _finalize_journey(session, completion: Completion) -> None:
+    async def _finalize_journey(
+        session, completion: Completion, summary: str | None = None
+    ) -> None:
         from sqlalchemy import update
         from backend.db import Journey
 
         journey = completion.journey
+        values = {
+            "status": completion.status.value,
+            "outcome": completion.outcome,
+            "first_ts": journey.first_ts,
+            "last_ts": journey.last_ts,
+            "event_id": journey.event_id,
+            "order_id": journey.order_id,
+            "cart_header_id": journey.cart_header_id,
+        }
+        # Only overwrite summary when we actually got one — a failed/absent
+        # summary must not clobber a summary a prior finalize may have stored.
+        if summary is not None:
+            values["summary"] = summary
         stmt = (
             update(Journey)
             .where(Journey.journey_id == completion.journey_id)
-            .values(
-                status=completion.status.value,
-                outcome=completion.outcome,
-                first_ts=journey.first_ts,
-                last_ts=journey.last_ts,
-                event_id=journey.event_id,
-                order_id=journey.order_id,
-                cart_header_id=journey.cart_header_id,
-            )
+            .values(**values)
         )
         await session.execute(stmt)
+
+    async def _summaries_for(self, completions) -> dict[str, str | None]:
+        """Fetch summaries for completed journeys (empty if no summarizer set).
+
+        Best-effort: the summarizer itself never raises (returns None on any
+        failure), so a slow/down AI service degrades to summary=None without
+        breaking completion.
+        """
+        if self._summarizer is None or not completions:
+            return {}
+        summaries: dict[str, str | None] = {}
+        for completion in completions:
+            summaries[completion.journey_id] = await self._summarizer(completion)
+        return summaries
 
 
 def _as_list(logs) -> list[LogLine]:
@@ -431,8 +475,12 @@ def _journey_updated_event(journey: StitchedJourney) -> dict:
     return make_event(EVENT_JOURNEY_UPDATED, data)
 
 
-def _journey_completed_event(completion: Completion) -> dict:
-    """A ``journey.completed`` envelope (full detail incl. summary + events)."""
+def _journey_completed_event(completion: Completion, summary: str | None = None) -> dict:
+    """A ``journey.completed`` envelope (full detail incl. summary + events).
+
+    ``summary`` is the AI-service journey summary fetched on completion (or
+    ``None`` when no summarizer is wired / the AI service was unreachable).
+    """
     from backend.schemas import JourneyDetailOut, JourneyEventOut
     from backend.ws import EVENT_JOURNEY_COMPLETED, make_event
 
@@ -450,9 +498,7 @@ def _journey_completed_event(completion: Completion) -> dict:
         event_id=journey.event_id,
         order_id=journey.order_id,
         cart_header_id=journey.cart_header_id,
-        # The LLM summary is fetched separately on completion (AI service); it is
-        # null here until that wiring populates it. The field is always present.
-        summary=None,
+        summary=summary,
         events=events,
     ).model_dump(mode="json")
     return make_event(EVENT_JOURNEY_COMPLETED, data)

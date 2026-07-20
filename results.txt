@@ -1,0 +1,672 @@
+========================================================================
+BACKEND OUTPUT DUMP
+========================================================================
+
+OVERVIEW
+  alert_count: 32
+  journey_count: 10
+  alerts_by_source: {'fallback': 32}
+  journeys_by_status: {'FAILED': 7, 'SUCCESS': 3}
+  journeys_by_outcome: {'ENRICHMENT_FAILED': 1, 'SUCCESS': 3, 'MARGIN_CHECK_FAILED': 1, 'SAP_SUBMISSION_FAILED': 1, 'INBOUND_TRANSFORM_FAILED': 1, 'ORDER_CREATION_FAILED': 1, 'VALIDATION_FAILED': 1, 'AUTH_FAILED': 1}
+
+========================================================================
+JOURNEYS (10)
+========================================================================
+
+journey_id : f26e6afe42304f8cb7da797a923b16a2
+  status   : FAILED   outcome: ENRICHMENT_FAILED
+  ids      : event=evt-9daf685f-7b39-4411-a450-7ebcd9823082 order=ORD-6472 cart=1840927365018247627
+  span     : 2026-07-20T13:12:21.650000Z -> 2026-07-20T13:12:27.164000Z
+  summary  : None
+  events (25):
+    - INFO  cc-inbound-service     Received inbound order event evt-9daf685f-7b39-4411-a450-7ebcd9823082 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-9daf685f-7b39-4411-a450-7ebcd9823082, 1 line(s)
+    - DEBUG cc-inbound-service     Mapped product 3652269 to internal SKU SKU-GPU-A100-80GB
+    - INFO  cc-inbound-service     Published event evt-9daf685f-7b39-4411-a450-7ebcd9823082 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-9daf685f-7b39-4411-a450-7ebcd9823082
+    - INFO  cc-order-engine        Creating order from event evt-9daf685f-7b39-4411-a450-7ebcd9823082 for account 81036533
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018247627
+    - INFO  cc-order-engine        Generated order number ORD-6472 for cart header 1840927365018247627
+    - INFO  cc-order-engine        Published order creation response for event evt-9daf685f-7b39-4411-a450-7ebcd9823082 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-9daf685f-7b39-4411-a450-7ebcd9823082: cartHeaderId=1840927365018247627
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6472
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018247627
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018247627
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 8100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018247627
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/81036533 HTTP/1.1
+    - ERROR cc-order-engine        [SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException: connect timed out (10014ms)
+    - WARN  cc-order-engine        Retrying SPT price list call for account 81036533 (attempt 2/3)
+    - ERROR cc-order-engine        [SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException: connect timed out (10014ms)
+    - WARN  cc-order-engine        Retrying SPT price list call for account 81036533 (attempt 3/3)
+    - ERROR cc-order-engine        [SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException: connect timed out (10014ms)
+    - ERROR cc-order-engine        Order processing aborted for order ORD-6472: SPT price list service unavailable after 3 attempt(s)
+
+journey_id : 49f5ee7bbacf4029af8fcd92d17c6be2
+  status   : SUCCESS   outcome: SUCCESS
+  ids      : event=evt-8d6589f3-5d75-44f0-9485-43435c4434c0 order=ORD-6982 cart=1840927365018252371
+  span     : 2026-07-20T13:12:15.128000Z -> 2026-07-20T13:12:35.064000Z
+  summary  : None
+  events (60):
+    - INFO  cc-inbound-service     Received inbound order event evt-8d6589f3-5d75-44f0-9485-43435c4434c0 for account 62011948
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-8d6589f3-5d75-44f0-9485-43435c4434c0, 1 line(s)
+    - DEBUG cc-inbound-service     Mapped product 3652269 to internal SKU SKU-GPU-A100-80GB
+    - INFO  cc-inbound-service     Published event evt-8d6589f3-5d75-44f0-9485-43435c4434c0 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-8d6589f3-5d75-44f0-9485-43435c4434c0
+    - INFO  cc-order-engine        Creating order from event evt-8d6589f3-5d75-44f0-9485-43435c4434c0 for account 62011948
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018252371
+    - INFO  cc-order-engine        Generated order number ORD-6982 for cart header 1840927365018252371
+    - INFO  cc-order-engine        Published order creation response for event evt-8d6589f3-5d75-44f0-9485-43435c4434c0 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-8d6589f3-5d75-44f0-9485-43435c4434c0: orderNumber=ORD-6982
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6982
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018252371
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018252371
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 3100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018252371
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/62011948 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 62011948
+    - DEBUG cc-spt-service         Resolved price list code PL-DE-TIER2 for account 62011948
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (12ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 39.63
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018252371
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [3652269]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/62011948/products/pvc?countryIdentifier=DE HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 62011948, 1 product(s), country DE
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (97ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018252371
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/62011948/products/oe?countryIdentifier=DE HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (114ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/DE/CC_DE/3100/62011948?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (91ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 3100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 3100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode DE
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018252371
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018252371
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018252371
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018252371
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/MWEBER HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user MWEBER
+    - INFO  cc-jam-service         User MWEBER granted 14 privilege(s)
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 200 (435ms)
+    - DEBUG cc-order-engine        Generated jwt: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJMWEBERIiwiZXhwIjoxNzUyNDg4ODAwfQ.mock-signature
+    - INFO  cc-checker-service     Running margin check for order ORD-6982, account 62011948
+    - DEBUG cc-checker-service     Line 1: cost=3200.26, sell=5775.60, margin=44.59%, threshold=15.00%
+    - INFO  cc-checker-service     Margin check passed for order ORD-6982: overall margin 44.59% exceeds threshold 15.00%
+    - INFO  cc-validator-service   Validating internal contracts for order lines.
+    - INFO  cc-validator-service   Validating line UDF fields
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - INFO  cc-validator-service   POST /api/strategy/create-order-press-save-submit/run 200
+    - INFO  cc-order-engine        Published order ORD-6982 to queue order.outbound.queue for SAP submission
+    - INFO  cc-outbound-osw        Submitting order ORD-6982 to SAP (1 lines, total: 34442.52 EUR)
+    - DEBUG cc-outbound-osw        Mapped order ORD-6982 to SAP document type ZOR
+    - INFO  cc-outbound-osw        Order ORD-6982 submitted to SAP successfully, SAP order number: 5191925
+    - INFO  cc-track-trace         Registered order ORD-6982 for tracking, SAP ref: 5327624
+
+journey_id : ab2c93ce8a2742c795bb7dae3c723861
+  status   : SUCCESS   outcome: SUCCESS
+  ids      : event=evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35 order=ORD-6395 cart=1840927365018213917
+  span     : 2026-07-20T13:12:16.224000Z -> 2026-07-20T13:12:36.785000Z
+  summary  : None
+  events (64):
+    - INFO  cc-inbound-service     Received inbound order event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35 for account 55829104
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35, 2 line(s)
+    - DEBUG cc-inbound-service     Mapped product 3652269 to internal SKU SKU-GPU-A100-80GB
+    - DEBUG cc-inbound-service     Mapped product 4788230 to internal SKU SKU-APC-UPS-3000VA
+    - INFO  cc-inbound-service     Published event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35
+    - INFO  cc-order-engine        Creating order from event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35 for account 55829104
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018213917
+    - INFO  cc-order-engine        Generated order number ORD-6395 for cart header 1840927365018213917
+    - INFO  cc-order-engine        Published order creation response for event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-932c6c4f-5bf6-4ab1-821d-4c542b31fd35: cartHeaderId=1840927365018213917
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6395
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018213917
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018213917
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 7100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018213917
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/55829104 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 55829104
+    - DEBUG cc-spt-service         Resolved price list code PL-US-TIER2 for account 55829104
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (6ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 26.09
+    - DEBUG cc-order-engine        Returning retained margin of: 31.07
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018213917
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [3652269, 4788230]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/55829104/products/pvc?countryIdentifier=US HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 55829104, 2 product(s), country US
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (69ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018213917
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/55829104/products/oe?countryIdentifier=US HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (111ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/US/CC_US/7100/55829104?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (128ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 7100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 7100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode US
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018213917
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018213917
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018213917
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018213917
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/JSMITH HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user JSMITH
+    - INFO  cc-jam-service         User JSMITH granted 14 privilege(s)
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 200 (450ms)
+    - DEBUG cc-order-engine        Generated jwt: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJJSMITHIiwiZXhwIjoxNzUyNDg4ODAwfQ.mock-signature
+    - INFO  cc-checker-service     Running margin check for order ORD-6395, account 55829104
+    - DEBUG cc-checker-service     Line 1: cost=6078.77, sell=10891.90, margin=44.19%, threshold=15.00%
+    - DEBUG cc-checker-service     Line 2: cost=7076.16, sell=9352.58, margin=24.34%, threshold=15.00%
+    - INFO  cc-checker-service     Margin check passed for order ORD-6395: overall margin 34.27% exceeds threshold 15.00%
+    - INFO  cc-validator-service   Validating internal contracts for order lines.
+    - INFO  cc-validator-service   Validating line UDF fields
+    - DEBUG cc-validator-service   [AvalaraClient#resolveAddress] ---> POST https://rest.avatax.com/api/v2/addresses/resolve HTTP/1.1
+    - INFO  cc-validator-service   Ship-to address verified: 1401 Elm St, Dallas, TX 75202, resolution quality: Premises
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - INFO  cc-validator-service   POST /api/strategy/create-order-press-save-submit/run 200
+    - INFO  cc-order-engine        Published order ORD-6395 to queue order.outbound.queue for SAP submission
+    - INFO  cc-outbound-osw        Submitting order ORD-6395 to SAP (2 lines, total: 27966.64 USD)
+    - DEBUG cc-outbound-osw        Mapped order ORD-6395 to SAP document type ZOR
+    - INFO  cc-outbound-osw        Order ORD-6395 submitted to SAP successfully, SAP order number: 5568743
+    - INFO  cc-track-trace         Registered order ORD-6395 for tracking, SAP ref: 5558306
+
+journey_id : cde63416595444478e7a3a0c98fdbc42
+  status   : FAILED   outcome: MARGIN_CHECK_FAILED
+  ids      : event=evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a order=ORD-6156 cart=1840927365018226097
+  span     : 2026-07-20T13:12:19.473000Z -> 2026-07-20T13:12:36.814000Z
+  summary  : None
+  events (51):
+    - INFO  cc-inbound-service     Received inbound order event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a for account 70443218
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a, 1 line(s)
+    - DEBUG cc-inbound-service     Mapped product 4249751 to internal SKU SKU-DELL-P7680-I9
+    - INFO  cc-inbound-service     Published event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a
+    - INFO  cc-order-engine        Creating order from event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a for account 70443218
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018226097
+    - INFO  cc-order-engine        Generated order number ORD-6156 for cart header 1840927365018226097
+    - INFO  cc-order-engine        Published order creation response for event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-dbf41ddc-cfb4-42c5-9c1d-310078a73b6a: orderNumber=ORD-6156
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6156
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018226097
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018226097
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 8100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018226097
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/70443218 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 70443218
+    - DEBUG cc-spt-service         Resolved price list code PL-UK-TIER2 for account 70443218
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (6ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 48.53
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018226097
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [4249751]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/70443218/products/pvc?countryIdentifier=UK HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 70443218, 1 product(s), country UK
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (82ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018226097
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/70443218/products/oe?countryIdentifier=UK HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (117ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/UK/CC_UK/8100/70443218?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (110ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 8100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 8100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode UK
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018226097
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018226097
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018226097
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018226097
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/RFLORIA HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user RFLORIA
+    - INFO  cc-jam-service         User RFLORIA granted 14 privilege(s)
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 200 (361ms)
+    - DEBUG cc-order-engine        Generated jwt: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJRFLORIAIiwiZXhwIjoxNzUyNDg4ODAwfQ.mock-signature
+    - INFO  cc-checker-service     Running margin check for order ORD-6156, account 70443218
+    - DEBUG cc-checker-service     Line 1: cost=5786.26, sell=6087.60, margin=4.95%, threshold=15.00%
+    - ERROR cc-checker-service     Margin check FAILED for order ORD-6156: overall margin 4.95% below threshold 15.00%
+    - INFO  cc-checker-service     Order ORD-6156 blocked pending commercial approval
+    - WARN  cc-order-engine        Order ORD-6156 blocked by margin check; submission halted
+
+journey_id : 7916bb8029f445f5afbfb4356bfbaad5
+  status   : FAILED   outcome: SAP_SUBMISSION_FAILED
+  ids      : event=evt-41b54d75-e313-4038-9e51-f823d1fe87b9 order=ORD-6540 cart=1840927365018217249
+  span     : 2026-07-20T13:12:23.837000Z -> 2026-07-20T13:12:38.664000Z
+  summary  : None
+  events (67):
+    - INFO  cc-inbound-service     Received inbound order event evt-41b54d75-e313-4038-9e51-f823d1fe87b9 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-41b54d75-e313-4038-9e51-f823d1fe87b9, 2 line(s)
+    - DEBUG cc-inbound-service     Mapped product 4249751 to internal SKU SKU-DELL-P7680-I9
+    - DEBUG cc-inbound-service     Mapped product 5001914 to internal SKU SKU-GPU-H100-80GB
+    - INFO  cc-inbound-service     Published event evt-41b54d75-e313-4038-9e51-f823d1fe87b9 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-41b54d75-e313-4038-9e51-f823d1fe87b9
+    - INFO  cc-order-engine        Creating order from event evt-41b54d75-e313-4038-9e51-f823d1fe87b9 for account 81036533
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018217249
+    - INFO  cc-order-engine        Generated order number ORD-6540 for cart header 1840927365018217249
+    - INFO  cc-order-engine        Published order creation response for event evt-41b54d75-e313-4038-9e51-f823d1fe87b9 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-41b54d75-e313-4038-9e51-f823d1fe87b9: orderNumber=ORD-6540, cartHeaderId=1840927365018217249
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6540
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018217249
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018217249
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 8100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018217249
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/81036533 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 81036533
+    - DEBUG cc-spt-service         Resolved price list code PL-UK-TIER2 for account 81036533
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (14ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 38.64
+    - DEBUG cc-order-engine        Returning retained margin of: 19.69
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018217249
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [4249751, 5001914]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/pvc?countryIdentifier=UK HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 81036533, 2 product(s), country UK
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (120ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018217249
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/oe?countryIdentifier=UK HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (126ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/UK/CC_UK/8100/81036533?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (123ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 8100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 8100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode UK
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018217249
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018217249
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018217249
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018217249
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/RFLORIA HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user RFLORIA
+    - INFO  cc-jam-service         User RFLORIA granted 13 privilege(s)
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 200 (366ms)
+    - DEBUG cc-order-engine        Generated jwt: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJRFLORIAIiwiZXhwIjoxNzUyNDg4ODAwfQ.mock-signature
+    - INFO  cc-checker-service     Running margin check for order ORD-6540, account 81036533
+    - DEBUG cc-checker-service     Line 1: cost=4586.89, sell=6156.07, margin=25.49%, threshold=15.00%
+    - DEBUG cc-checker-service     Line 2: cost=2890.19, sell=4336.37, margin=33.35%, threshold=15.00%
+    - INFO  cc-checker-service     Margin check passed for order ORD-6540: overall margin 29.42% exceeds threshold 15.00%
+    - INFO  cc-validator-service   Validating internal contracts for order lines.
+    - INFO  cc-validator-service   Validating line UDF fields
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - INFO  cc-validator-service   POST /api/strategy/create-order-press-save-submit/run 200
+    - INFO  cc-order-engine        Published order ORD-6540 to queue order.outbound.queue for SAP submission
+    - INFO  cc-outbound-osw        Submitting order ORD-6540 to SAP (2 lines, total: 30272.59 GBP)
+    - DEBUG cc-outbound-osw        Mapped order ORD-6540 to SAP document type ZOR
+    - ERROR cc-outbound-osw        [SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner 'sapecc-prod.computacenter.com:3300' not reached
+    - WARN  cc-outbound-osw        Retrying SAP submission for order ORD-6540 (attempt 2/3)
+    - ERROR cc-outbound-osw        [SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner 'sapecc-prod.computacenter.com:3300' not reached
+    - WARN  cc-outbound-osw        Retrying SAP submission for order ORD-6540 (attempt 3/3)
+    - ERROR cc-outbound-osw        [SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner 'sapecc-prod.computacenter.com:3300' not reached
+    - ERROR cc-outbound-osw        Order ORD-6540 submission failed after 3 attempt(s); message moved to order.outbound.dlq for manual intervention
+
+journey_id : d7a7d4ad7dca49e18f9f95f30e46d733
+  status   : FAILED   outcome: INBOUND_TRANSFORM_FAILED
+  ids      : event=evt-04932916-2f72-4768-9c26-588e0351e6e8 order=None cart=None
+  span     : 2026-07-20T13:12:17.316000Z -> 2026-07-20T13:12:17.874000Z
+  summary  : None
+  events (8):
+    - INFO  cc-inbound-service     Received inbound order event evt-04932916-2f72-4768-9c26-588e0351e6e8 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-04932916-2f72-4768-9c26-588e0351e6e8, 1 line(s)
+    - ERROR cc-inbound-service     No internal SKU mapping found for product 9999999
+    - WARN  cc-inbound-service     Requeueing event evt-04932916-2f72-4768-9c26-588e0351e6e8 for redelivery (attempt 2/3)
+    - ERROR cc-inbound-service     No internal SKU mapping found for product 9999999
+    - WARN  cc-inbound-service     Requeueing event evt-04932916-2f72-4768-9c26-588e0351e6e8 for redelivery (attempt 3/3)
+    - ERROR cc-inbound-service     No internal SKU mapping found for product 9999999
+    - ERROR cc-inbound-service     Max redelivery attempts reached for event evt-04932916-2f72-4768-9c26-588e0351e6e8; routing message to order.inbound.dlq
+
+journey_id : 8456b03dfa064029adc7dac4222d7931
+  status   : FAILED   outcome: ORDER_CREATION_FAILED
+  ids      : event=evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 order=None cart=None
+  span     : 2026-07-20T13:12:18.407000Z -> 2026-07-20T13:12:20.196000Z
+  summary  : None
+  events (15):
+    - INFO  cc-inbound-service     Received inbound order event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121, 1 line(s)
+    - DEBUG cc-inbound-service     Mapped product 4249751 to internal SKU SKU-DELL-P7680-I9
+    - INFO  cc-inbound-service     Published event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121
+    - INFO  cc-order-engine        Creating order from event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 for account 81036533
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - ERROR cc-order-engine        Failed to persist cart header: java.sql.SQLTimeoutException: timeout after 30000ms acquiring connection to BM DB
+    - WARN  cc-order-engine        Retrying order creation for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 (attempt 2/3)
+    - ERROR cc-order-engine        Failed to persist cart header: java.sql.SQLTimeoutException: timeout after 30000ms acquiring connection to BM DB
+    - WARN  cc-order-engine        Retrying order creation for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 (attempt 3/3)
+    - ERROR cc-order-engine        Failed to persist cart header: java.sql.SQLTimeoutException: timeout after 30000ms acquiring connection to BM DB
+    - ERROR cc-order-engine        Order creation failed for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 after 3 attempt(s)
+    - INFO  cc-order-engine        Published order creation failure for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 to queue order.response.queue
+    - ERROR cc-inbound-service     Order creation failed for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121: DB_TIMEOUT — no order was created
+
+journey_id : 279fe4910f3943e5b9fc5e7482c4be22
+  status   : SUCCESS   outcome: SUCCESS
+  ids      : event=evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23 order=ORD-6552 cart=1840927365018256256
+  span     : 2026-07-20T13:12:14.033000Z -> 2026-07-20T13:12:34.740000Z
+  summary  : None
+  events (66):
+    - INFO  cc-inbound-service     Received inbound order event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23, 3 line(s)
+    - DEBUG cc-inbound-service     Mapped product 4788230 to internal SKU SKU-APC-UPS-3000VA
+    - DEBUG cc-inbound-service     Mapped product 4249751 to internal SKU SKU-DELL-P7680-I9
+    - DEBUG cc-inbound-service     Mapped product 5001914 to internal SKU SKU-GPU-H100-80GB
+    - INFO  cc-inbound-service     Published event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23
+    - INFO  cc-order-engine        Creating order from event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23 for account 81036533
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018256256
+    - INFO  cc-order-engine        Generated order number ORD-6552 for cart header 1840927365018256256
+    - INFO  cc-order-engine        Published order creation response for event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-cdc9fbe2-f010-4ec1-81b6-57eec9c11d23: orderNumber=ORD-6552, cartHeaderId=1840927365018256256
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6552
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018256256
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018256256
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 8100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018256256
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/81036533 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 81036533
+    - DEBUG cc-spt-service         Resolved price list code PL-UK-TIER2 for account 81036533
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (20ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 20.81
+    - DEBUG cc-order-engine        Returning retained margin of: 46.9
+    - DEBUG cc-order-engine        Returning retained margin of: 51.27
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018256256
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [4788230, 4249751, 5001914]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/pvc?countryIdentifier=UK HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 81036533, 3 product(s), country UK
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (70ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018256256
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/oe?countryIdentifier=UK HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (105ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/UK/CC_UK/8100/81036533?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (123ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 8100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 8100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode UK
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018256256
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018256256
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018256256
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018256256
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/RFLORIA HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user RFLORIA
+    - INFO  cc-jam-service         User RFLORIA granted 13 privilege(s)
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 200 (363ms)
+    - DEBUG cc-order-engine        Generated jwt: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJRFLORIAIiwiZXhwIjoxNzUyNDg4ODAwfQ.mock-signature
+    - INFO  cc-checker-service     Running margin check for order ORD-6552, account 81036533
+    - DEBUG cc-checker-service     Line 1: cost=7603.87, sell=16822.72, margin=54.80%, threshold=15.00%
+    - DEBUG cc-checker-service     Line 2: cost=826.69, sell=1748.87, margin=52.73%, threshold=15.00%
+    - DEBUG cc-checker-service     Line 3: cost=6640.91, sell=9866.16, margin=32.69%, threshold=15.00%
+    - INFO  cc-checker-service     Margin check passed for order ORD-6552: overall margin 46.74% exceeds threshold 15.00%
+    - INFO  cc-validator-service   Validating internal contracts for order lines.
+    - INFO  cc-validator-service   Validating line UDF fields
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - WARN  cc-validator-service   Not implemented
+    - INFO  cc-validator-service   POST /api/strategy/create-order-press-save-submit/run 200
+    - INFO  cc-order-engine        Published order ORD-6552 to queue order.outbound.queue for SAP submission
+    - INFO  cc-outbound-osw        Submitting order ORD-6552 to SAP (3 lines, total: 48591.35 GBP)
+    - DEBUG cc-outbound-osw        Mapped order ORD-6552 to SAP document type ZOR
+    - INFO  cc-outbound-osw        Order ORD-6552 submitted to SAP successfully, SAP order number: 5189838
+    - INFO  cc-track-trace         Registered order ORD-6552 for tracking, SAP ref: 5726460
+
+journey_id : 6c4f37f4f0f74e109ff75ad5547ef511
+  status   : FAILED   outcome: VALIDATION_FAILED
+  ids      : event=evt-b471e425-a8a3-4027-8614-de01f04ee274 order=ORD-6034 cart=1840927365018256695
+  span     : 2026-07-20T13:12:20.564000Z -> 2026-07-20T13:12:37.527000Z
+  summary  : None
+  events (54):
+    - INFO  cc-inbound-service     Received inbound order event evt-b471e425-a8a3-4027-8614-de01f04ee274 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-b471e425-a8a3-4027-8614-de01f04ee274, 1 line(s)
+    - DEBUG cc-inbound-service     Mapped product 5001914 to internal SKU SKU-GPU-H100-80GB
+    - INFO  cc-inbound-service     Published event evt-b471e425-a8a3-4027-8614-de01f04ee274 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-b471e425-a8a3-4027-8614-de01f04ee274
+    - INFO  cc-order-engine        Creating order from event evt-b471e425-a8a3-4027-8614-de01f04ee274 for account 81036533
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018256695
+    - INFO  cc-order-engine        Generated order number ORD-6034 for cart header 1840927365018256695
+    - INFO  cc-order-engine        Published order creation response for event evt-b471e425-a8a3-4027-8614-de01f04ee274 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-b471e425-a8a3-4027-8614-de01f04ee274: orderNumber=ORD-6034, cartHeaderId=1840927365018256695
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6034
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018256695
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018256695
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 8100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018256695
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/81036533 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 81036533
+    - DEBUG cc-spt-service         Resolved price list code PL-UK-TIER2 for account 81036533
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (10ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 18.3
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018256695
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [5001914]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/pvc?countryIdentifier=UK HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 81036533, 1 product(s), country UK
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (91ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018256695
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/oe?countryIdentifier=UK HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (126ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/UK/CC_UK/8100/81036533?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (99ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 8100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 8100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode UK
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018256695
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018256695
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018256695
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018256695
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/RFLORIA HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user RFLORIA
+    - INFO  cc-jam-service         User RFLORIA granted 13 privilege(s)
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 200 (348ms)
+    - DEBUG cc-order-engine        Generated jwt: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJRFLORIAIiwiZXhwIjoxNzUyNDg4ODAwfQ.mock-signature
+    - INFO  cc-checker-service     Running margin check for order ORD-6034, account 81036533
+    - DEBUG cc-checker-service     Line 1: cost=3926.38, sell=4922.13, margin=20.23%, threshold=15.00%
+    - INFO  cc-checker-service     Margin check passed for order ORD-6034: overall margin 20.23% exceeds threshold 15.00%
+    - INFO  cc-validator-service   Validating internal contracts for order lines.
+    - INFO  cc-validator-service   Validating line UDF fields
+    - ERROR cc-validator-service   Validation failed: mandatory UDF 'costCenter' missing on line 1
+    - INFO  cc-validator-service   POST /api/strategy/create-order-press-save-submit/run 422
+    - ERROR cc-order-engine        Order ORD-6034 validation failed with 1 error(s); submission aborted
+
+journey_id : 7a6e9c2a0422494393dc353e4eff651f
+  status   : FAILED   outcome: AUTH_FAILED
+  ids      : event=evt-0f988711-2129-40d6-95c8-76d47a06b9d0 order=ORD-6437 cart=1840927365018200249
+  span     : 2026-07-20T13:12:22.751000Z -> 2026-07-20T13:12:36.716000Z
+  summary  : None
+  events (46):
+    - INFO  cc-inbound-service     Received inbound order event evt-0f988711-2129-40d6-95c8-76d47a06b9d0 for account 81036533
+    - INFO  cc-inbound-service     Transforming inbound payload for event evt-0f988711-2129-40d6-95c8-76d47a06b9d0, 1 line(s)
+    - DEBUG cc-inbound-service     Mapped product 4788230 to internal SKU SKU-APC-UPS-3000VA
+    - INFO  cc-inbound-service     Published event evt-0f988711-2129-40d6-95c8-76d47a06b9d0 to queue order.inbound.queue
+    - INFO  cc-order-engine        Received order creation request for event evt-0f988711-2129-40d6-95c8-76d47a06b9d0
+    - INFO  cc-order-engine        Creating order from event evt-0f988711-2129-40d6-95c8-76d47a06b9d0 for account 81036533
+    - DEBUG cc-order-engine        Persisting cart header to BM DB
+    - INFO  cc-order-engine        Created cart header 1840927365018200249
+    - INFO  cc-order-engine        Generated order number ORD-6437 for cart header 1840927365018200249
+    - INFO  cc-order-engine        Published order creation response for event evt-0f988711-2129-40d6-95c8-76d47a06b9d0 to queue order.response.queue
+    - INFO  cc-inbound-service     Received order creation response for event evt-0f988711-2129-40d6-95c8-76d47a06b9d0: orderNumber=ORD-6437
+    - INFO  cc-order-engine        Get order by Order Number:ORD-6437
+    - INFO  cc-order-engine        Get Cart Header for id:1840927365018200249
+    - INFO  cc-order-engine        Extracting organization for cart header: 1840927365018200249
+    - DEBUG cc-order-engine        Getting parent organization with id: 9100
+    - DEBUG cc-order-engine        Getting parent organization with id: 8100
+    - DEBUG cc-order-engine        Getting parent organization with id: GLOBAL
+    - INFO  cc-order-engine        Get Object attributes for id: 1840927365018200249
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] ---> GET http://sptws-test.computacenter.com/api/v1/pricelist/81036533 HTTP/1.1
+    - INFO  cc-spt-service         Fetching price list for account 81036533
+    - DEBUG cc-spt-service         Resolved price list code PL-UK-TIER2 for account 81036533
+    - DEBUG cc-order-engine        [SptClient#getSptPriceListCode] <--- HTTP/1.1 200 (15ms)
+    - DEBUG cc-order-engine        Returning retained margin of: 49.65
+    - DEBUG cc-order-engine        Extracting product entities for card header 1840927365018200249
+    - DEBUG cc-order-engine        Extracting PVC rates for products: [4788230]
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/pvc?countryIdentifier=UK HTTP/1.1
+    - INFO  cc-rsm-service         Calculating rebates for account 81036533, 1 product(s), country UK
+    - DEBUG cc-order-engine        [RsmClient#getPvcRates] <--- HTTP/1.1 200 (123ms)
+    - INFO  cc-order-engine        Extracting cart items rebates for header id 1840927365018200249
+    - DEBUG cc-order-engine        [RsmClient#getRebates] ---> POST http://rsmws-uat.computacenter.com/api/v1/rebate-schemes/customers/81036533/products/oe?countryIdentifier=UK HTTP/1.1
+    - DEBUG cc-order-engine        [RsmClient#getRebates] <--- HTTP/1.1 200 (123ms)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] ---> GET http://settingsws-uat.computacenter.com/api/v1/settings/UK/CC_UK/8100/81036533?settingsIdentifier=marginThresholdPercentage&settingsIdentifier=marginThresholdValue HTTP/1.1
+    - DEBUG cc-settings-service    select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], ssv1_0.[settings_value] from [SF_SETTING_VALUE] ssv1_0 where ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and ssv1_0.[settings_identifier] in (?, ?)
+    - DEBUG cc-order-engine        [SettingsClient#getAccountSettingByOrganizationHierarchy] <--- HTTP/1.1 200 (113ms)
+    - DEBUG cc-order-engine        Attempting to retrieve internal contracts for sales org: 8100
+    - WARN  cc-order-engine        No internal contracts found for sales org: 8100
+    - DEBUG cc-order-engine        Extracting FeeConfigs by countryCode UK
+    - DEBUG cc-order-engine        Get cart blocking and grouping items for header id 1840927365018200249
+    - INFO  cc-order-engine        Extracting cart items universal attributes for line udfs by 1840927365018200249
+    - DEBUG cc-order-engine        Get cart fees for header id 1840927365018200249
+    - DEBUG cc-order-engine        Get cart sourcing items for cart header id 1840927365018200249
+    - DEBUG cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET http://jamws-uat.computacenter.com/api/user/oe/XDISABLED HTTP/1.1
+    - INFO  cc-jam-service         Authenticating user XDISABLED
+    - WARN  cc-jam-service         Authentication failed for user XDISABLED: account disabled in JAM
+    - ERROR cc-order-engine        [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 403 (246ms)
+    - ERROR cc-order-engine        Cannot process order ORD-6437: user XDISABLED not authorized (403 from JAM); submission aborted
+
+========================================================================
+ALERTS (32)
+========================================================================
+
+  [fallback] ERROR cc-outbound-osw — dept=None conf=None
+    message    : Order ORD-6540 submission failed after 3 attempt(s); message moved to order.outbound.dlq for manual intervention
+    explanation: None
+
+  [fallback] ERROR cc-outbound-osw — dept=None conf=None
+    message    : [SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner 'sapecc-prod.computacenter.com:3300' not reached
+    explanation: None
+
+  [fallback] WARN cc-outbound-osw — dept=None conf=None
+    message    : Retrying SAP submission for order ORD-6540 (attempt 3/3)
+    explanation: None
+
+  [fallback] ERROR cc-outbound-osw — dept=None conf=None
+    message    : [SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner 'sapecc-prod.computacenter.com:3300' not reached
+    explanation: None
+
+  [fallback] WARN cc-outbound-osw — dept=None conf=None
+    message    : Retrying SAP submission for order ORD-6540 (attempt 2/3)
+    explanation: None
+
+  [fallback] ERROR cc-outbound-osw — dept=None conf=None
+    message    : [SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner 'sapecc-prod.computacenter.com:3300' not reached
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Order ORD-6034 validation failed with 1 error(s); submission aborted
+    explanation: None
+
+  [fallback] ERROR cc-validator-service — dept=None conf=None
+    message    : Validation failed: mandatory UDF 'costCenter' missing on line 1
+    explanation: None
+
+  [fallback] WARN cc-order-engine — dept=None conf=None
+    message    : Order ORD-6156 blocked by margin check; submission halted
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Cannot process order ORD-6437: user XDISABLED not authorized (403 from JAM); submission aborted
+    explanation: None
+
+  [fallback] ERROR cc-checker-service — dept=None conf=None
+    message    : Margin check FAILED for order ORD-6156: overall margin 4.95% below threshold 15.00%
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : [JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- HTTP/1.1 403 (246ms)
+    explanation: None
+
+  [fallback] WARN cc-jam-service — dept=None conf=None
+    message    : Authentication failed for user XDISABLED: account disabled in JAM
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Order processing aborted for order ORD-6472: SPT price list service unavailable after 3 attempt(s)
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : [SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException: connect timed out (10014ms)
+    explanation: None
+
+  [fallback] WARN cc-order-engine — dept=None conf=None
+    message    : Retrying SPT price list call for account 81036533 (attempt 3/3)
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : [SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException: connect timed out (10014ms)
+    explanation: None
+
+  [fallback] WARN cc-order-engine — dept=None conf=None
+    message    : Retrying SPT price list call for account 81036533 (attempt 2/3)
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : [SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException: connect timed out (10014ms)
+    explanation: None
+
+  [fallback] ERROR cc-inbound-service — dept=None conf=None
+    message    : Order creation failed for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121: DB_TIMEOUT — no order was created
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Order creation failed for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 after 3 attempt(s)
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Failed to persist cart header: java.sql.SQLTimeoutException: timeout after 30000ms acquiring connection to BM DB
+    explanation: None
+
+  [fallback] WARN cc-order-engine — dept=None conf=None
+    message    : Retrying order creation for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 (attempt 3/3)
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Failed to persist cart header: java.sql.SQLTimeoutException: timeout after 30000ms acquiring connection to BM DB
+    explanation: None
+
+  [fallback] WARN cc-order-engine — dept=None conf=None
+    message    : Retrying order creation for event evt-b9c8cd31-f65c-4525-bbd3-6c6d5c940121 (attempt 2/3)
+    explanation: None
+
+  [fallback] ERROR cc-order-engine — dept=None conf=None
+    message    : Failed to persist cart header: java.sql.SQLTimeoutException: timeout after 30000ms acquiring connection to BM DB
+    explanation: None
+
+  [fallback] ERROR cc-inbound-service — dept=None conf=None
+    message    : Max redelivery attempts reached for event evt-04932916-2f72-4768-9c26-588e0351e6e8; routing message to order.inbound.dlq
+    explanation: None
+
+  [fallback] ERROR cc-inbound-service — dept=None conf=None
+    message    : No internal SKU mapping found for product 9999999
+    explanation: None
+
+  [fallback] WARN cc-inbound-service — dept=None conf=None
+    message    : Requeueing event evt-04932916-2f72-4768-9c26-588e0351e6e8 for redelivery (attempt 3/3)
+    explanation: None
+
+  [fallback] ERROR cc-inbound-service — dept=None conf=None
+    message    : No internal SKU mapping found for product 9999999
+    explanation: None
+
+  [fallback] WARN cc-inbound-service — dept=None conf=None
+    message    : Requeueing event evt-04932916-2f72-4768-9c26-588e0351e6e8 for redelivery (attempt 2/3)
+    explanation: None
+
+  [fallback] ERROR cc-inbound-service — dept=None conf=None
+    message    : No internal SKU mapping found for product 9999999
+    explanation: None

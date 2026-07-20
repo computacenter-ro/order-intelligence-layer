@@ -32,3 +32,6 @@ flow*.json
 
 # Docs (local specs / design notes, not shipped)
 docs/
+
+# Playwright MCP tool output (screenshots, snapshots, console logs)
+.playwright-mcp/

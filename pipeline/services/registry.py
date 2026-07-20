@@ -1,10 +1,11 @@
 """Shared ``(service, block)`` → handler registry for the mock services.
 
 Why this lives in its own module (not in ``runner.py``): the runner is launched
-with ``python -m services.runner <svc>``, which loads ``runner.py`` as the
-``__main__`` module. A service module doing ``from services.runner import
-register`` would then import ``runner.py`` **a second time** under the name
-``services.runner`` — a *different* module object with its own ``BLOCKS`` dict.
+with ``python -m pipeline.services.runner <svc>``, which loads ``runner.py`` as
+the ``__main__`` module. A service module doing ``from pipeline.services.runner
+import register`` would then import ``runner.py`` **a second time** under the
+name ``pipeline.services.runner`` — a *different* module object with its own
+``BLOCKS`` dict.
 Blocks would register into one copy while the running loop reads the other,
 so nothing ever dispatches.
 

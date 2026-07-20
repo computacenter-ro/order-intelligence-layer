@@ -100,7 +100,7 @@ def profile(service: str) -> ServiceProfile:
     except KeyError as exc:  # pragma: no cover - guards service/profile drift
         raise KeyError(
             f"no ServiceProfile for service {service!r} - add it to "
-            f"services/profiles.py PROFILES"
+            f"pipeline/services/profiles.py PROFILES"
         ) from exc
 
 

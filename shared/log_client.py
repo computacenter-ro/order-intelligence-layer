@@ -3,7 +3,7 @@
 Every mock service emits its logs through this module (CLAUDE.md [1]:
 "POSTs them to the Log Collector ... all services use this"). It is the thin
 seam between the services and the collector's ``POST /logs`` endpoint
-(``mock_es/app.py``, CLAUDE.md [2]).
+(``pipeline/mock_es/app.py``, CLAUDE.md [2]).
 
 Design notes
 ------------

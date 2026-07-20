@@ -28,7 +28,7 @@ from shared.scenarios import (
     compile_steps,
 )
 
-FIXTURE = Path(__file__).resolve().parent.parent / "data" / "mock-order-flows-v2.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v2.json"
 
 # CLAUDE.md canonical table: {id: (outcome, fail_at, bridge_ids)}
 CANONICAL = {

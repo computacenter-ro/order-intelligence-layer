@@ -1,8 +1,8 @@
-"""Tests for the mock service emitters (services/*.py).
+"""Tests for the mock service emitters (pipeline/services/*.py).
 
 These drive each scenario's compiled step chain **in-process** (no RabbitMQ, no
 collector) by calling the registered block handlers directly, exactly as
-``services/runner.py`` would, and assert:
+``pipeline/services/runner.py`` would, and assert:
 
   * the correlation-model invariants hold on the emitted LogLines
     (phase-1 = eventId only; bridge = eventId + >=1 order id; phase-2 = both
@@ -23,11 +23,11 @@ from pathlib import Path
 
 import pytest
 
-from services.registry import BLOCKS
+from pipeline.services.registry import BLOCKS
 from shared.models import Baton, BatonContext, LogLine
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
-FIXTURE = Path(__file__).resolve().parent.parent / "data" / "mock-order-flows-v2.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v2.json"
 
 # Importing the service modules registers their blocks (import side-effect).
 _SERVICE_MODULES = [
@@ -35,7 +35,7 @@ _SERVICE_MODULES = [
     "jam", "checker", "validator", "outbound_osw", "track_trace",
 ]
 for _m in _SERVICE_MODULES:
-    importlib.import_module(f"services.{_m}")
+    importlib.import_module(f"pipeline.services.{_m}")
 
 
 # --- in-process driver -------------------------------------------------------

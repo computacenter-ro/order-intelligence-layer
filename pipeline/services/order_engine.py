@@ -27,9 +27,9 @@ from __future__ import annotations
 
 import random
 
-from services.blocklib import emit_line, phase1_ids, phase2_ids
-from services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
-from services.registry import EmitFn, register
+from pipeline.services.blocklib import emit_line, phase1_ids, phase2_ids
+from pipeline.services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
+from pipeline.services.registry import EmitFn, register
 from shared.models import Baton, BatonContext
 
 _PROF = profile("order_engine")

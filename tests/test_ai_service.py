@@ -1,13 +1,21 @@
 """Tests for the AI service [3].
 
-No live LLM, RabbitMQ or Redis: the breaker's redis client and clock are fakes,
-so the whole state machine is exercised deterministically. (asyncio_mode=auto in
-pytest.ini means async test functions run without an explicit marker.)
+Unit tests use fakes (breaker redis+clock, chat model, publisher channel) so the
+default suite needs no LLM, RabbitMQ or Redis. (asyncio_mode=auto in pytest.ini
+means async test functions run without an explicit marker.)
+
+One live round-trip test against real RabbitMQ is gated behind the env flag
+``AI_LIVE_RABBITMQ=1`` (bring the broker up with ``docker compose up -d
+rabbitmq``); it is skipped by default.
 """
 from __future__ import annotations
 
+import json
+import os
+import uuid
 from datetime import datetime, timezone
 
+import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 
@@ -16,7 +24,8 @@ from ai_service.breaker import CLOSED, HALF_OPEN, OPEN, CircuitBreaker
 from ai_service.graph import PipelineDeps, process
 from ai_service.llm import LLMError
 from ai_service.nodes import route
-from shared.models import Department, LogLine
+from ai_service.publisher import Publisher
+from shared.models import Department, LogLine, ProcessedAlert
 
 
 # --- fakes -------------------------------------------------------------------
@@ -299,3 +308,132 @@ async def test_pipeline_records_breaker_failure_on_llm_error():
     await process(_log(), deps)
     _state, failures, _o = await b._read()
     assert failures >= 1  # the breaker counted the failure
+
+
+# =============================================================================
+# Publisher — unit tests with a fake channel (no broker)
+# =============================================================================
+class _FakeExchange:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes, object]] = []
+
+    async def publish(self, message, routing_key: str) -> None:
+        # record (routing_key, body, delivery_mode) for assertions
+        self.published.append((routing_key, message.body, message.delivery_mode))
+
+
+class _FakeChannel:
+    """Records declared queues and published messages; no I/O."""
+
+    def __init__(self) -> None:
+        self.declared: list[tuple[str, bool]] = []
+        self.default_exchange = _FakeExchange()
+
+    async def declare_queue(self, name: str, durable: bool = False):
+        self.declared.append((name, durable))
+        return object()
+
+
+def _alert(source: str = "fallback") -> ProcessedAlert:
+    return ProcessedAlert(
+        alert_id=str(uuid.uuid4()),
+        emitted_at=datetime(2026, 7, 14, 8, 0, 0, tzinfo=timezone.utc),
+        log=_log(),
+        explanation=None if source == "fallback" else "explained",
+        department=None if source == "fallback" else Department.backend,
+        confidence=None if source == "fallback" else 0.7,
+        source=source,
+    )
+
+
+async def test_connect_declares_both_queues_durable():
+    ch = _FakeChannel()
+    async with Publisher(channel=ch) as pub:
+        assert ("raw.events", True) in ch.declared
+        assert ("processed.alerts", True) in ch.declared
+
+
+async def test_publish_raw_routes_loglinejson_to_raw_events():
+    ch = _FakeChannel()
+    async with Publisher(channel=ch) as pub:
+        await pub.publish_raw(_log(message="hello"))
+    routing_key, body, delivery_mode = ch.default_exchange.published[0]
+    assert routing_key == "raw.events"
+    payload = json.loads(body)
+    assert payload["message"] == "hello" and payload["log_id"] == "log-1"
+    # persistent delivery (at-least-once)
+    from aio_pika import DeliveryMode
+
+    assert delivery_mode == DeliveryMode.PERSISTENT
+
+
+async def test_publish_alert_routes_processedalertjson_to_processed_alerts():
+    ch = _FakeChannel()
+    async with Publisher(channel=ch) as pub:
+        await pub.publish_alert(_alert("ai"))
+    routing_key, body, _dm = ch.default_exchange.published[0]
+    assert routing_key == "processed.alerts"
+    payload = json.loads(body)
+    assert payload["source"] == "ai" and payload["department"] == "backend"
+    # the full original log travels inside the alert
+    assert payload["log"]["log_id"] == "log-1"
+
+
+async def test_publish_uses_the_models_not_handbuilt_dicts():
+    # ProcessedAlert JSON must round-trip back into the model (exact field set).
+    ch = _FakeChannel()
+    async with Publisher(channel=ch) as pub:
+        await pub.publish_alert(_alert("fallback"))
+    _rk, body, _dm = ch.default_exchange.published[0]
+    restored = ProcessedAlert.model_validate_json(body)
+    assert restored.source == "fallback" and restored.explanation is None
+
+
+# =============================================================================
+# Publisher — LIVE round-trip against real RabbitMQ (opt-in)
+# =============================================================================
+@pytest.mark.skipif(
+    os.getenv("AI_LIVE_RABBITMQ") != "1",
+    reason="live RabbitMQ round-trip; set AI_LIVE_RABBITMQ=1 (docker compose up -d rabbitmq)",
+)
+async def test_live_roundtrip_publish_then_consume():
+    """Publish to both queues on a real broker, consume back, assert payloads.
+
+    Uses unique per-run queue names so it never collides with a running AI
+    service or a previous test run, and cleans them up afterward.
+    """
+    import aio_pika
+
+    suffix = uuid.uuid4().hex[:8]
+    raw_q = f"test.raw.events.{suffix}"
+    alerts_q = f"test.processed.alerts.{suffix}"
+
+    connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
+    try:
+        async with Publisher(
+            url=settings.RABBITMQ_URL, raw_queue=raw_q, alerts_queue=alerts_q
+        ) as pub:
+            await pub.publish_raw(_log(message="live-raw"))
+            await pub.publish_alert(_alert("ai"))
+
+            # consume one message back from each queue on a fresh channel
+            channel = await connection.channel()
+            raw_queue = await channel.declare_queue(raw_q, durable=True)
+            alerts_queue = await channel.declare_queue(alerts_q, durable=True)
+
+            raw_msg = await raw_queue.get(timeout=5)
+            alert_msg = await alerts_queue.get(timeout=5)
+            await raw_msg.ack()
+            await alert_msg.ack()
+
+            raw_payload = LogLine.model_validate_json(raw_msg.body)
+            alert_payload = ProcessedAlert.model_validate_json(alert_msg.body)
+            assert raw_payload.message == "live-raw"
+            assert alert_payload.source == "ai"
+            assert alert_payload.log.log_id == "log-1"
+
+            # cleanup
+            await raw_queue.delete(if_unused=False, if_empty=False)
+            await alerts_queue.delete(if_unused=False, if_empty=False)
+    finally:
+        await connection.close()

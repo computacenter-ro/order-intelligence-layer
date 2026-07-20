@@ -1,4 +1,4 @@
- """[5] Core Backend — read-only REST API (CLAUDE.md [5] "API").
+"""[5] Core Backend — read-only REST API (CLAUDE.md [5] "API").
 
 Async FastAPI routes over the three tables in ``backend/db.py`` (``Alert``,
 ``Journey``, ``JourneyEvent``), using the ``get_session`` dependency. The API is

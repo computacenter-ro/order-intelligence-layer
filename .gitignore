@@ -29,3 +29,6 @@ flow*.json
 
 # Local agent config
 .claude/
+
+# Docs (local specs / design notes, not shipped)
+docs/

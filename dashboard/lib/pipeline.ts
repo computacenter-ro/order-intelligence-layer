@@ -35,7 +35,8 @@ const AFTER_STATE: Record<JourneyStatus, PipelineStageState> = {
 };
 
 export function pipelineStages(journey: Journey): PipelineStage[] {
-  const lastEvent = journey.events[journey.events.length - 1];
+  const events = journey.events ?? [];
+  const lastEvent = events[events.length - 1];
   const lastAppName = lastEvent ? lastEvent.raw.app_name : CANONICAL_STAGES[0].appName;
   const rawIndex = CANONICAL_STAGES.findIndex((stage) => stage.appName === lastAppName);
   const stopIndex = rawIndex === -1 ? 0 : rawIndex;

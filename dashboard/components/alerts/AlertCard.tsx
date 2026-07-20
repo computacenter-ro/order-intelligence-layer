@@ -14,10 +14,10 @@ const FALLBACK_EXPLANATION =
 
 export function AlertCard({ alert, onOpen }: AlertCardProps) {
   const isFallback = alert.source === "fallback";
-  const levelStatus: BadgeStatus = alert.log.level === "ERROR" ? "error" : "warning";
+  const levelStatus: BadgeStatus = alert.level === "ERROR" ? "error" : "warning";
   const accentColor = isFallback
     ? "var(--cc-grey-four)"
-    : alert.log.level === "ERROR"
+    : alert.level === "ERROR"
       ? "var(--cc-united-red)"
       : "var(--cc-fibre-orange)";
 
@@ -39,9 +39,9 @@ export function AlertCard({ alert, onOpen }: AlertCardProps) {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
-          <Badge status={levelStatus}>{levelLabel(alert.log.level)}</Badge>
+          <Badge status={levelStatus}>{levelLabel(alert.level)}</Badge>
           <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: "12px", color: "var(--cc-grey-two)" }}>
-            {alert.log.app_name}
+            {alert.app_name}
           </span>
           <span style={{ marginLeft: "auto", fontSize: "12px", color: "var(--cc-grey-three)" }}>
             {formatTime(alert.emitted_at)}
@@ -79,7 +79,7 @@ export function AlertCard({ alert, onOpen }: AlertCardProps) {
               color: "var(--cc-grey-three)",
             }}
           >
-            order {alert.log.orderId ?? "—"} · evt {alert.log.eventId ?? "—"}
+            order {alert.order_id ?? "—"} · evt {alert.event_id ?? "—"}
           </span>
         </div>
       </Card>

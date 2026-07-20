@@ -16,6 +16,7 @@ export function formatTime(iso: string): string {
 }
 
 export function stoppedAt(journey: Journey): string {
-  const lastEvent = journey.events[journey.events.length - 1];
+  const events = journey.events ?? [];
+  const lastEvent = events[events.length - 1];
   return lastEvent ? lastEvent.raw.app_name : "—";
 }

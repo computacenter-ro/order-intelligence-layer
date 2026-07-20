@@ -414,6 +414,90 @@ def test_full_redelivery_is_idempotent(flow):
     assert completion.outcome == flow["outcome"]
 
 
+# =============================================================================
+# on_event emission from ingest() / sweep_stalled() (DB-free, fake session).
+# =============================================================================
+
+
+class _FakeSession:
+    """Minimal async session: swallows execute()/commit() (no real DB)."""
+
+    def __init__(self):
+        self.commits = 0
+
+    async def execute(self, stmt):
+        return None
+
+    async def commit(self):
+        self.commits += 1
+
+
+def _sink():
+    events: list[dict] = []
+
+    async def on_event(ev):
+        events.append(ev)
+
+    return events, on_event
+
+
+async def test_ingest_emits_journey_updated_for_in_progress_chunk():
+    a = JourneyAssembler()
+    events, on_event = _sink()
+    await a.ingest(
+        _FakeSession(),
+        [mk(0, "Received inbound order event evt-1", eventId="evt-1")],
+        now=BASE + timedelta(seconds=1),
+        on_event=on_event,
+    )
+    assert [e["type"] for e in events] == ["journey.updated"]
+    data = events[0]["data"]
+    assert data["status"] == "IN_PROGRESS"
+    assert data["event_id"] == "evt-1"
+
+
+async def test_ingest_emits_journey_completed_on_completion():
+    a = JourneyAssembler()
+    events, on_event = _sink()
+    logs = [
+        mk(0, "Received inbound order event evt-1", eventId="evt-1"),
+        mk(2, "Received order creation response for event evt-1",
+           eventId="evt-1", orderId="ORD-1", cartHeaderId="C1"),
+        mk(5, "Registered order ORD-1 for tracking",
+           app_name="cc-track-trace", orderId="ORD-1", cartHeaderId="C1"),
+    ]
+    await a.ingest(_FakeSession(), logs, now=BASE + timedelta(seconds=6), on_event=on_event)
+
+    types = [e["type"] for e in events]
+    # a journey that completes in this chunk gets completed, NOT updated
+    assert types == ["journey.completed"]
+    data = events[0]["data"]
+    assert data["status"] == "SUCCESS" and data["outcome"] == "SUCCESS"
+    assert "summary" in data  # summary field always present (null until AI fills it)
+    assert [ev["log_id"] for ev in data["events"]] == [l.log_id for l in logs]
+
+
+async def test_ingest_without_on_event_emits_nothing():
+    a = JourneyAssembler()
+    # no on_event -> pure persistence path, no error, returns completions
+    completions = await a.ingest(
+        _FakeSession(),
+        [mk(0, "Received inbound order event evt-1", eventId="evt-1")],
+        now=BASE + timedelta(seconds=1),
+    )
+    assert completions == []
+
+
+async def test_sweep_stalled_emits_journey_completed():
+    a = JourneyAssembler(stalled_timeout=90)
+    events, on_event = _sink()
+    a.add([mk(0, "Received inbound order event evt-1", eventId="evt-1")])
+    await a.sweep_stalled(_FakeSession(), now=BASE + timedelta(seconds=120), on_event=on_event)
+
+    assert [e["type"] for e in events] == ["journey.completed"]
+    assert events[0]["data"]["status"] == "TIMED_OUT"
+
+
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_overlapping_polls_do_not_duplicate(flow):
     # The AI poller uses overlapping sliding windows, so consecutive polls

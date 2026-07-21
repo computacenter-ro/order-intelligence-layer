@@ -52,7 +52,12 @@ export default function AlertFeedPage() {
       <div>
         <NewAlertsBanner count={pending.length} onReveal={handleReveal} />
         {sorted.map((alert) => (
-          <AlertCard key={alert.alert_id} alert={alert} onOpen={setSelected} />
+          <AlertCard
+            key={alert.alert_id}
+            alert={alert}
+            onOpen={setSelected}
+            isSelected={selected?.alert_id === alert.alert_id}
+          />
         ))}
       </div>
       <AlertDetailDrawer alert={selected} onClose={() => setSelected(null)} />

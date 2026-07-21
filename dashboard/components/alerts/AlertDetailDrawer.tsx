@@ -172,7 +172,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
 
         <SectionLabel>Related</SectionLabel>
         <Link
-          href="/journeys"
+          href={alert.journey_id ? `/journeys?highlight=${alert.journey_id}` : "/journeys"}
           onClick={onClose}
           style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
         >

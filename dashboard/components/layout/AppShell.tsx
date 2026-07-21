@@ -2,9 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
+import Image from "next/image";
 import { SideNav } from "@computacenter-ro/style-guide/components";
 import type { BaseNavItem, SideNavItem } from "@computacenter-ro/style-guide/components";
 import { BellIcon, MapTrifoldIcon } from "@phosphor-icons/react";
+import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
+import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-mark.png";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
 
@@ -50,11 +53,14 @@ export function AppShell({ children }: AppShellProps) {
     <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
       <SideNav
         logo={
-          <span style={{ color: "var(--cc-cloud-white)", fontSize: "14px", fontWeight: 600 }}>
-            IT Support Dashboard
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <Image src={ccLogoWhite} alt="Computacenter" height={22} width={43} />
+            <span style={{ color: "var(--cc-cloud-white)", fontSize: "14px", fontWeight: 600 }}>
+              IT Support Dashboard
+            </span>
+          </div>
         }
-        logoMark={<span style={{ color: "var(--cc-cloud-white)", fontSize: "18px", fontWeight: 700 }}>IT</span>}
+        logoMark={<Image src={ccLogoWhiteMark} alt="Computacenter" height={24} width={32} />}
         items={items}
         collapsed={collapsed}
         onCollapse={handleCollapse}

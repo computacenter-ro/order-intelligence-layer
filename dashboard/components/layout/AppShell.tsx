@@ -59,11 +59,6 @@ export function AppShell({ children }: AppShellProps) {
         collapsed={collapsed}
         onCollapse={handleCollapse}
         onItemClick={handleItemClick}
-        footer={
-          <div style={{ padding: "12px 16px", fontSize: "12px", color: "var(--cc-grey-four)" }}>
-            Sample data · backend not connected
-          </div>
-        }
       />
       <main
         style={{

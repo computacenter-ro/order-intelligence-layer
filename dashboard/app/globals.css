@@ -66,3 +66,14 @@ body {
 .oil-pipeline-current {
   animation: cc-pulse 2s infinite;
 }
+
+/* New-alerts banner hover — box-shadow only, no new colour (guidelines:
+   never introduce a hex outside the palette; the Info badge tone already
+   covers the resting state). */
+.oil-new-alerts-banner {
+  transition: box-shadow 120ms ease;
+}
+
+.oil-new-alerts-banner:hover {
+  box-shadow: var(--shadow-cc-md);
+}

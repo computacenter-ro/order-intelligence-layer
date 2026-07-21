@@ -131,20 +131,54 @@ services:
       rabbitmq:
         condition: service_healthy
 
-  # --- Uncomment for prod-like/demo runs once the frontend is built ---------
-  # dashboard:
-  #   profiles: ["app"]
-  #   build:
-  #     context: ./dashboard
-  #     args:
-  #       NPM_TOKEN: ${NPM_TOKEN}
-  #   ports:
-  #     - "3000:3000"
-  #   environment:
-  #     NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
-  #     NEXT_PUBLIC_BACKEND_WS_URL: ws://localhost:8000/ws
+  dashboard:
+    profiles: ["app"]
+    build:
+      context: ./dashboard
+      # NPM_TOKEN is passed as a build SECRET (not an arg), so it never appears
+      # in the build log or `docker history`. Sourced from the NPM_TOKEN env var
+      # via the top-level `secrets:` block below. Put NPM_TOKEN in .env
+      # (gitignored) — it's a GitHub PAT with read:packages for @computacenter-ro.
+      secrets:
+        - npm_token
+    ports:
+      - "3000:3000"
+    environment:
+      # These are BROWSER-side vars (the Next app runs in the user's browser),
+      # so they must point at the host-published backend port, not the compose
+      # service name. Names must match what the code reads (dashboard/lib).
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
+    depends_on:
+      backend:
+        condition: service_started
+
+  # One-shot: fire the 10 scenarios once the app is already running. Separate
+  # profile so `--profile app up` starts the system WITHOUT auto-firing; fire on
+  # demand with:  docker compose --profile fire run --rm injector
+  #
+  # No `depends_on` here on purpose: the app services live in the `app` profile,
+  # and a `depends_on` pointing at them makes `--profile fire run` fail with
+  # "depends on undefined service" (those services aren't in scope when only the
+  # `fire` profile is active). The injector is always run manually AFTER the
+  # stack is up, so the ordering guarantee isn't needed — it publishes a baton
+  # to RabbitMQ (already healthy) which the running mock services then consume.
+  injector:
+    profiles: ["fire"]
+    image: oil-app
+    command: python -m pipeline.injector.inject --all
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
 
 volumes:
   rabbitmq_data:
   redis_data:
   postgres_data:
+
+secrets:
+  # The dashboard build reads this (GitHub Packages PAT) as a mounted secret,
+  # never as a printed build arg. `environment:` sources it from the NPM_TOKEN
+  # env var (set it in your shell or .env). Requires BuildKit (default in modern
+  # Docker); Compose passes build secrets through automatically.
+  npm_token:
+    environment: NPM_TOKEN

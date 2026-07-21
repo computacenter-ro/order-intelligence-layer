@@ -296,25 +296,43 @@ Only the AI service's poller reads from it at runtime.
 ## [3] AI Service (LangGraph, :8100)
 
 ### Poller (`poller.py`)
-Every `POLL_INTERVAL` (default 10s) query the collector with the sliding
-window **`[now - 25s, now - 5s]`** (the 5s tail is the ingestion-lag guard;
-consecutive windows overlap — that's intentional and safe because of dedup):
+Every `POLL_INTERVAL` (default 10s) query the collector for a
+**watermark-anchored** window **`[last_to, now - 5s]`** (the 5s tail is the
+ingestion-lag guard). `last_to` is the previous window's `to`, persisted in
+Redis (`ai:last_to`), so **consecutive windows are contiguous and no wall-clock
+time is ever skipped** — a slow cycle can't drop logs. Cold start (no watermark)
+falls back to `now - 25s`; after a long stall the look-back is capped at
+`MAX_WINDOW_SPAN` (120s) so one catch-up read stays bounded. Overlapping
+re-reads are still safe because of dedup.
 
 ```python
-for log in es.range(now - 25, now - 5):                    # sorted asc
+last_to = redis.get("ai:last_to")                          # contiguous windows
+frm, to = window_from_watermark(last_to, now)              # [last_to, now-5s]
+alertable = []
+for log in es.range(frm, to):                              # sorted asc
     if not redis.set(f"dedup:{log['log_id']}", 1, nx=True, ex=3600):
         continue                                            # SETNX dedup
-    publish("raw.events", log)                              # ALL logs, unprocessed
+    publish("raw.events", log)                              # raw FIRST — never waits on LLM
     if log["level"] in ("WARN", "ERROR") and not suppressed(log):
-        input_queue.put(log)                                # → LangGraph
+        alertable.append(log)
+redis.set("ai:last_to", to)                                # advance watermark
+await gather(process(l) for l in alertable)                # LLM off the fetch path, bounded
 ```
 
-- **Every deduped log** is duplicated onto **`raw.events`** (journey material
-  for the backend).
-- Only **WARN + ERROR** enter the LangGraph pipeline.
+- **Every deduped log** is published to **`raw.events`** *before* any LLM call
+  (journey material for the backend must never block on the explainer/router).
+- Only **WARN + ERROR** enter the LangGraph pipeline; they are processed
+  **concurrently** off the fetch path, bounded by `ALERT_CONCURRENCY` (default
+  4), so a burst of alerts can't serialize the poll loop.
 - **Suppression list** (config, data-driven): benign WARNs that must not
   become alerts — `"Not implemented"` (validator strategies),
   `"No internal contracts found"`. They still go to `raw.events`.
+
+> The watermark + off-critical-path processing are load-bearing: with the LLM
+> live, inline per-alert calls used to block the loop long enough that the
+> wall-clock window skipped logs, silently starving the journey assembler
+> (journeys then `TIMED_OUT`). Do not reintroduce a `now`-anchored window or
+> inline LLM calls on the fetch path.
 
 ### LangGraph pipeline (`graph.py`, `nodes.py`)
 ```
@@ -480,7 +498,7 @@ Connects to backend WS + REST. Feature contract:
 | Key | Type | TTL | Purpose |
 |---|---|---|---|
 | `dedup:{log_id}` | string | 1h | AI-service poller SETNX dedup |
-| `ai:last_to` | string | — | poller watermark (optional; window is time-anchored) |
+| `ai:last_to` | string | — | poller watermark — `to` of the last fetched window; makes windows contiguous (see [3]). **Load-bearing, not optional.** |
 | `ai:breaker:state` | hash | — | circuit breaker state |
 
 Journey state lives in Postgres — the backend owns journeys.
@@ -504,9 +522,10 @@ Env defaults: `ES_URL=http://localhost:9200`,
 `REDIS_URL=redis://localhost:6379/0`,
 `RABBITMQ_URL=amqp://guest:guest@localhost:5672/`,
 `DATABASE_URL=postgresql://...`, `POLL_INTERVAL=10`, `WINDOW_START_OFFSET=25`,
-`WINDOW_END_OFFSET=5`, `STALLED_TIMEOUT=90`, `STALLED_SWEEP_INTERVAL=15`,
-`DASHBOARD_URL` (dashboard base for journey links), plus Azure AI Foundry vars
-and the `TEAMS_WEBHOOK_*` webhooks above.
+`WINDOW_END_OFFSET=5`, `MAX_WINDOW_SPAN=120` (poller catch-up cap),
+`ALERT_CONCURRENCY=4` (concurrent alert LLM calls), `STALLED_TIMEOUT=90`,
+`STALLED_SWEEP_INTERVAL=15`, `DASHBOARD_URL` (dashboard base for journey links),
+plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 
 ---
 

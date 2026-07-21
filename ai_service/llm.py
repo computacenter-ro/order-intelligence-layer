@@ -41,8 +41,9 @@ def _build(deployment: str) -> BaseChatModel | None:
     from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
 
     return AzureAIChatCompletionsModel(
-        endpoint=settings.AZURE_AI_FOUNDRY_ENDPOINT,
+        endpoint=settings.service_endpoint(),
         credential=AzureKeyCredential(settings.AZURE_AI_FOUNDRY_API_KEY),
+        api_version=settings.AZURE_AI_FOUNDRY_API_VERSION,
         model_name=deployment,
     )
 

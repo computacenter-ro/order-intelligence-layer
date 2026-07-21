@@ -10,6 +10,7 @@ rabbitmq``); it is skipped by default.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -61,6 +62,13 @@ class FakeRedis:
             return None
         self.keys[key] = value
         return True
+
+    async def get(self, key: str):
+        """Return the stored value (bytes, like real redis) or None."""
+        value = self.keys.get(key)
+        if value is None:
+            return None
+        return value if isinstance(value, bytes) else str(value).encode()
 
 
 class FakeClock:
@@ -592,6 +600,144 @@ def test_poll_window_spans_the_configured_offsets():
     frm, to = poll_window(now, start_offset=25, end_offset=5)
     assert frm == "2026-07-14T08:00:05.000Z"  # now - 25s
     assert to == "2026-07-14T08:00:25.000Z"   # now - 5s
+
+
+# =============================================================================
+# Poller — watermark: windows are contiguous, never skip wall-clock time
+# =============================================================================
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+
+def _wm_poller(window_logs: list[dict]):
+    """A watermark-enabled poller with a fake redis we can inspect."""
+    redis = FakeRedis()
+    pub = FakePublisher()
+    deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+    poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+    calls: list[tuple[str, str]] = []
+
+    async def _fetch(f, t):
+        calls.append((f, t))
+        return window_logs
+
+    poller.fetch_logs = _fetch  # type: ignore[method-assign]
+    return poller, pub, redis, calls
+
+
+async def test_first_poll_uses_start_offset_when_no_watermark():
+    """With no stored watermark, the first window falls back to now-start_offset
+    (so we never replay all of history on a cold start)."""
+    poller, pub, redis, calls = _wm_poller([])
+    now = _dt(2026, 7, 14, 8, 0, 30, tzinfo=_tz.utc)
+    await poller.poll_once(now=now)
+    frm, to = calls[0]
+    assert frm == "2026-07-14T08:00:05.000Z"   # now - 25s (start_offset)
+    assert to == "2026-07-14T08:00:25.000Z"    # now - 5s  (end_offset)
+
+
+async def test_watermark_makes_consecutive_windows_contiguous():
+    """A slow cycle must not leave a gap: the next window starts exactly where
+    the previous one ended, regardless of how much wall-clock elapsed."""
+    poller, pub, redis, calls = _wm_poller([])
+    t0 = _dt(2026, 7, 14, 8, 0, 30, tzinfo=_tz.utc)
+    await poller.poll_once(now=t0)
+    first_to = calls[0][1]
+
+    # 40s later (far longer than any window overlap) — old code would skip the
+    # 08:00:25 .. 08:01:05 span entirely; watermark must cover it.
+    t1 = t0 + _td(seconds=40)
+    await poller.poll_once(now=t1)
+    second_from, second_to = calls[1]
+    assert second_from == first_to             # contiguous — no gap
+    assert second_to == "2026-07-14T08:01:05.000Z"  # t1 - 5s
+
+
+async def test_watermark_persisted_across_poller_instances():
+    """The watermark lives in Redis so a restart resumes where it left off."""
+    logs = []
+    redis = FakeRedis()
+    pub = FakePublisher()
+    deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+
+    p1 = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+    seen1: list[tuple[str, str]] = []
+    p1.fetch_logs = lambda f, t: _record(seen1, f, t, logs)  # type: ignore[method-assign]
+    t0 = _dt(2026, 7, 14, 8, 0, 30, tzinfo=_tz.utc)
+    await p1.poll_once(now=t0)
+
+    # a fresh poller (restart) sharing the same redis picks up the watermark
+    p2 = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+    seen2: list[tuple[str, str]] = []
+    p2.fetch_logs = lambda f, t: _record(seen2, f, t, logs)  # type: ignore[method-assign]
+    t1 = t0 + _td(seconds=30)
+    await p2.poll_once(now=t1)
+    assert seen2[0][0] == seen1[0][1]  # p2's window starts at p1's window end
+
+
+async def _record(sink, f, t, value):
+    sink.append((f, t))
+    return value
+
+
+async def test_watermark_caps_lookback_after_long_stall():
+    """After a very long stall, the window must not span an unbounded range;
+    it is capped so we don't fetch hours of logs at once."""
+    poller, pub, redis, calls = _wm_poller([])
+    t0 = _dt(2026, 7, 14, 8, 0, 30, tzinfo=_tz.utc)
+    await poller.poll_once(now=t0)
+    # 1 hour later
+    t1 = t0 + _td(hours=1)
+    await poller.poll_once(now=t1)
+    frm, to = calls[1]
+    # span is capped (MAX_WINDOW_SPAN); not the full hour
+    span = _dt.fromisoformat(to.replace("Z", "+00:00")) - _dt.fromisoformat(frm.replace("Z", "+00:00"))
+    assert span <= _td(seconds=settings.MAX_WINDOW_SPAN)
+
+
+# =============================================================================
+# Poller — LLM off the critical path: raw.events published before/independent
+# of the (slow) alert LLM processing
+# =============================================================================
+async def test_raw_events_published_before_alert_llm_runs():
+    """raw.events for ALL logs must be published without waiting on the LLM.
+
+    We make the alert pipeline block on an event; raw must already be published
+    while the alert processing is still pending."""
+    logs = [_raw_dict("INFO", "a", "L1"), _raw_dict("ERROR", "boom", "L2"),
+            _raw_dict("INFO", "c", "L3")]
+    redis = FakeRedis()
+    pub = FakePublisher()
+
+    gate = asyncio.Event()
+
+    # a deps whose explainer blocks until we release the gate
+    class _BlockingModel:
+        async def ainvoke(self, messages):
+            await gate.wait()
+            from langchain_core.messages import AIMessage
+            return AIMessage(content="explained")
+
+    deps = PipelineDeps(
+        breaker=_breaker(redis, FakeClock()),
+        explainer=_BlockingModel(),
+        router=_fake('{"department": "backend", "confidence": 0.5}'),
+    )
+    poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+    poller.fetch_logs = lambda f, t: _async(logs)  # type: ignore[method-assign]
+
+    task = asyncio.create_task(poller.poll_once())
+    # give the loop a moment to publish raw + kick off alert processing
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if len(pub.raw) == 3:
+            break
+    # all raw events are out even though the alert LLM is still blocked
+    assert {l.log_id for l in pub.raw} == {"L1", "L2", "L3"}
+    assert pub.alerts == []  # alert still pending on the gate
+
+    gate.set()  # release the LLM
+    await task
+    assert len(pub.alerts) == 1 and pub.alerts[0].log.log_id == "L2"
 
 
 # =============================================================================

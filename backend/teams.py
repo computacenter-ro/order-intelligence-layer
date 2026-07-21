@@ -73,56 +73,90 @@ def _dashboard_link(data: dict) -> str | None:
 
 
 def build_card(event: dict) -> dict:
-    """Build a simple card ``dict`` (title + fields + link) for an event.
+    """Build the exact Teams payload: a ``message`` envelope wrapping an
+    Adaptive Card (confirmed working against the Teams workflow with ``curl``).
 
-    Deliberately minimal and structural (no Teams/Adaptive-Card markup) so it
-    can be mapped onto either an Incoming Webhook or a Power Automate payload.
+    Shape::
+
+        {"type": "message",
+         "attachments": [{
+           "contentType": "application/vnd.microsoft.card.adaptive",
+           "content": { <AdaptiveCard 1.4> }
+         }]}
+
+    Works for both ``alert.new`` and ``journey.completed`` events — it reads the
+    fields that exist in ``data`` and skips the ones that don't.
     """
     type_ = event.get("type", "")
     data = event.get("data") or {}
     is_fallback = data.get("source") == "fallback"
-    badge = "fallback" if is_fallback else "AI"
 
-    # Headline: outcome for a completed journey, level for an alert.
-    if type_ == "journey.completed":
-        headline = data.get("outcome") or data.get("status") or "journey"
-        title = f"Journey {headline}"
-    else:
-        headline = data.get("level") or type_
-        service = data.get("app_name") or ""
-        title = f"{headline} · {service}".strip(" ·") or type_
+    # Title: event type + service, e.g. "alert.new · cc-spt-service".
+    service = data.get("app_name")
+    title = f"{type_} · {service}" if service else type_
 
-    # Explanation: the AI text, the fallback placeholder, or a journey summary.
+    # Badge.
+    badge = "AI-analyzed" if data.get("source") == "ai" else "fallback"
+
+    # Body text: fallback placeholder, else the explanation (or journey summary).
     if is_fallback:
-        explanation = "unprocessed — LLM unavailable"
+        text = "unprocessed — LLM unavailable"
     else:
-        explanation = data.get("explanation") or data.get("summary")
+        text = data.get("explanation") or data.get("summary") or ""
 
-    fields: list[dict] = []
-    if data.get("app_name"):
-        fields.append({"name": "Service", "value": data["app_name"]})
-    if explanation:
-        fields.append({"name": "Explanation", "value": explanation})
+    body: list[dict] = [
+        {
+            "type": "TextBlock",
+            "text": title,
+            "weight": "Bolder",
+            "size": "Medium",
+            "wrap": True,
+        },
+        {"type": "TextBlock", "text": badge, "isSubtle": True, "spacing": "None"},
+    ]
+    if text:
+        body.append({"type": "TextBlock", "text": text, "wrap": True})
+
+    # FactSet: level|outcome, department, confidence, order/event/cart ids.
+    facts: list[dict] = []
+    status = data.get("level") or data.get("outcome")
+    if status:
+        facts.append({"title": "Level", "value": str(status)})
+    if data.get("department"):
+        facts.append({"title": "Department", "value": str(data["department"])})
+    if data.get("confidence") is not None:
+        facts.append({"title": "Confidence", "value": f"{data['confidence']:.2f}"})
     for label, key in (
-        ("Event", "event_id"),
         ("Order", "order_id"),
+        ("Event", "event_id"),
         ("Cart", "cart_header_id"),
-        ("Journey", "journey_id"),
     ):
         if data.get(key):
-            fields.append({"name": label, "value": data[key]})
-    if data.get("confidence") is not None:
-        fields.append({"name": "Confidence", "value": f"{data['confidence']:.2f}"})
-    if data.get("message"):
-        fields.append({"name": "Message", "value": data["message"]})
-    fields.append({"name": "Analyzed by", "value": badge})
+            facts.append({"title": label, "value": str(data[key])})
+    if facts:
+        body.append({"type": "FactSet", "facts": facts})
+
+    card: dict = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": body,
+    }
+
+    link = _dashboard_link(data)
+    if link:
+        card["actions"] = [
+            {"type": "Action.OpenUrl", "title": "View journey", "url": link}
+        ]
 
     return {
-        "title": title,
-        "badge": badge,
-        "text": explanation or "",
-        "fields": fields,
-        "link": _dashboard_link(data),
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card,
+            }
+        ],
     }
 
 
@@ -156,8 +190,13 @@ async def notify(event: dict, *, client: httpx.AsyncClient | None = None) -> Non
         )
         return
 
-    if client is not None:
-        await client.post(url, json=card)
-    else:
-        async with httpx.AsyncClient(timeout=10.0) as http:
-            await http.post(url, json=card)
+    try:
+        if client is not None:
+            resp = await client.post(url, json=card)
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                resp = await http.post(url, json=card)
+        print(f"[teams:{channel}] POST -> {resp.status_code}", flush=True)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 — surface the failure, never crash the loop
+        print(f"[teams:{channel}] POST FAILED: {exc}", flush=True)

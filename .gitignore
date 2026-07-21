@@ -35,3 +35,5 @@ docs/
 
 # Playwright MCP tool output (screenshots, snapshots, console logs)
 .playwright-mcp/
+
+run.sh

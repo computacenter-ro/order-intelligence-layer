@@ -21,6 +21,10 @@ and the consumer task is created (not awaited) so startup never blocks.
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv(override=False)  # .env → os.getenv (TEAMS_WEBHOOK_* / DASHBOARD_URL)
+
 import asyncio
 from contextlib import asynccontextmanager
 

@@ -2,6 +2,7 @@ import { Card } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { levelLabel, formatTime } from "@/lib/format";
+import { renderInlineMarkdown } from "@/lib/richText";
 import type { BadgeStatus, ProcessedAlert } from "@/lib/types";
 
 interface AlertCardProps {
@@ -56,7 +57,7 @@ export function AlertCard({ alert, onOpen }: AlertCardProps) {
             margin: "0 0 12px",
           }}
         >
-          {alert.explanation ?? FALLBACK_EXPLANATION}
+          {alert.explanation ? renderInlineMarkdown(alert.explanation) : FALLBACK_EXPLANATION}
         </p>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           {alert.source === "ai" ? (

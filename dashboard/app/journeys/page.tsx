@@ -10,7 +10,7 @@ import { fetchJourneys } from "@/lib/api";
 import { useWebSocket } from "@/lib/useWebSocket";
 import type { Journey, WsEvent } from "@/lib/types";
 
-const COLUMN_HEADINGS = ["Status", "Order ID", "Event ID", "Outcome", "Last Seen"];
+const COLUMN_HEADINGS = ["Status", "Order ID", "Cart Header ID", "Event ID", "Outcome", "Last Seen"];
 
 function upsertJourney(prev: Journey[], next: Journey): Journey[] {
   const index = prev.findIndex((j) => j.journey_id === next.journey_id);
@@ -75,6 +75,7 @@ export default function JourneysPage() {
                   </Badge>
                 </td>
                 <td className="oil-mono">{journey.order_id ?? "—"}</td>
+                <td className="oil-mono">{journey.cart_header_id ?? "—"}</td>
                 <td className="oil-mono">{journey.event_id ?? "—"}</td>
                 <td>{journey.outcome ?? "—"}</td>
                 <td className="oil-mono">{formatTime(journey.last_ts)}</td>

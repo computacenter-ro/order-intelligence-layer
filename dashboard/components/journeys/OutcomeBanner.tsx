@@ -7,10 +7,20 @@ interface OutcomeBannerProps {
   journey: Journey;
 }
 
+const ID_MONO: React.CSSProperties = { fontFamily: "ui-monospace, Menlo, monospace" };
+
 export function OutcomeBanner({ journey }: OutcomeBannerProps) {
   const tone = badgeColors[JOURNEY_STATUS_BADGE[journey.status]];
   const orderLabel = journey.order_id ?? journey.event_id ?? "—";
   const locationLabel = journey.status === "SUCCESS" ? "completed" : `stopped at ${stoppedAt(journey)}`;
+
+  // All three correlation ids, each independently nullable (a pre-creation
+  // failure has only event id; the bridge may expose only one order id).
+  const ids: { label: string; value: string | null }[] = [
+    { label: "Order", value: journey.order_id },
+    { label: "Cart header", value: journey.cart_header_id },
+    { label: "Event", value: journey.event_id },
+  ];
 
   return (
     <div
@@ -34,6 +44,22 @@ export function OutcomeBanner({ journey }: OutcomeBannerProps) {
       </div>
       <div style={{ fontSize: "14px", color: "var(--cc-grey-two)", marginTop: "4px" }}>
         Order {orderLabel} · {locationLabel}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "16px",
+          fontSize: "13px",
+          color: "var(--cc-grey-three)",
+          marginTop: "8px",
+        }}
+      >
+        {ids.map(({ label, value }) => (
+          <span key={label}>
+            {label}: <span style={ID_MONO}>{value ?? "—"}</span>
+          </span>
+        ))}
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { formatTime } from "@/lib/format";
+import { renderInlineMarkdown } from "@/lib/richText";
 import type { Journey, LogLevel, ProcessedAlert } from "@/lib/types";
 
 interface JourneyTimelineProps {
@@ -60,7 +61,7 @@ export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
                     marginTop: "6px",
                   }}
                 >
-                  {alert.explanation ?? "Unprocessed — LLM unavailable."}
+                  {alert.explanation ? renderInlineMarkdown(alert.explanation) : "Unprocessed — LLM unavailable."}
                 </div>
               )}
             </div>

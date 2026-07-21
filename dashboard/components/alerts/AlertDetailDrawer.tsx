@@ -4,6 +4,7 @@ import { XIcon } from "@phosphor-icons/react";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { levelLabel, formatTime } from "@/lib/format";
+import { renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
 interface AlertDetailDrawerProps {
@@ -116,8 +117,9 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
             fontStyle: isFallback ? "italic" : "normal",
           }}
         >
-          {alert.explanation ??
-            "Unprocessed — LLM unavailable. This alert was passed straight through as a fallback and needs manual triage."}
+          {alert.explanation
+            ? renderInlineMarkdown(alert.explanation)
+            : "Unprocessed — LLM unavailable. This alert was passed straight through as a fallback and needs manual triage."}
         </p>
         <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
           {alert.source === "ai" ? (

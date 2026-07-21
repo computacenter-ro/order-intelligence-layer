@@ -1,4 +1,5 @@
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
+import { renderInlineMarkdown } from "@/lib/richText";
 
 interface AiSummaryPanelProps {
   summary: string | null;
@@ -47,7 +48,9 @@ export function AiSummaryPanel({ summary }: AiSummaryPanelProps) {
       >
         AI journey summary
       </div>
-      <p style={{ fontSize: "16px", lineHeight: "22px", color: "var(--cc-grey-one)", margin: 0 }}>{summary}</p>
+      <p style={{ fontSize: "16px", lineHeight: "22px", color: "var(--cc-grey-one)", margin: 0 }}>
+        {renderInlineMarkdown(summary)}
+      </p>
     </div>
   );
 }

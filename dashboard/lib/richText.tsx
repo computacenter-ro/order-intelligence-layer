@@ -1,32 +1,73 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 /**
- * Render LLM-authored text with minimal inline markdown: `**bold**` → <strong>.
+ * Render LLM-authored text with the minimal inline markdown the AI service
+ * actually emits: `**bold**` → <strong>, and `` `code` `` → inline <code>.
  *
- * The AI service (explainer / journey summary) emits plain prose that sometimes
- * includes `**emphasis**`. Rendered as a raw string those asterisks show
- * literally. This does the ONE transform those outputs actually use — nothing
- * more — deliberately avoiding a full markdown dependency and its HTML/XSS
- * surface: the input is split on `**` pairs and emitted as plain React text
- * nodes plus <strong> wrappers, so no markup is ever interpreted.
+ * The explainer / journey summary write plain prose that sometimes includes
+ * `**emphasis**` and `` `identifiers` `` (service names, order ids, log fields).
+ * Rendered as a raw string those markers show literally; this turns them into
+ * styled spans. It deliberately supports ONLY those two — no links, lists, or
+ * block markup — avoiding a full markdown dependency and, crucially, any HTML
+ * interpretation: output is plain React text nodes plus <strong>/<code>
+ * wrappers, so there is no `dangerouslySetInnerHTML` and no XSS surface.
  *
- * An unpaired trailing `**` (odd count) is left as literal text, so partial or
- * malformed model output degrades gracefully rather than bolding the rest.
+ * A single left-to-right scan handles both markers in any order. An unmatched
+ * opener (no closing `**` / `` ` ``) is emitted as literal text, so partial or
+ * malformed model output degrades gracefully instead of swallowing the rest.
  */
+
+const CODE_STYLE: CSSProperties = {
+  fontFamily: "ui-monospace, Menlo, monospace",
+  fontSize: "0.9em",
+  background: "var(--cc-grey-six)",
+  color: "var(--cc-grey-one)",
+  padding: "1px 5px",
+  borderRadius: "4px",
+};
+
+const MARKERS: { open: string; render: (inner: string, key: number) => ReactNode }[] = [
+  { open: "**", render: (inner, key) => <strong key={key}>{inner}</strong> },
+  { open: "`", render: (inner, key) => (
+      <code key={key} style={CODE_STYLE}>{inner}</code>
+    ) },
+];
+
 export function renderInlineMarkdown(text: string): ReactNode {
-  if (!text.includes("**")) return text; // fast path — most lines have no markup
+  if (!text.includes("**") && !text.includes("`")) return text; // fast path
 
-  const parts = text.split("**");
-  // split on "**": even indices are outside bold, odd indices are inside.
-  // With an unbalanced count the final segment is odd-indexed but has no closing
-  // "**"; treat it as plain text (re-prepend the "**" that split removed).
-  const balanced = parts.length % 2 === 1;
+  const nodes: ReactNode[] = [];
+  let buffer = ""; // accumulates plain text between spans
+  let i = 0;
+  let key = 0;
 
-  return parts.map((part, i) => {
-    if (i % 2 === 1) {
-      if (!balanced && i === parts.length - 1) return `**${part}`; // dangling open
-      return <strong key={i}>{part}</strong>;
+  const flush = () => {
+    if (buffer) {
+      nodes.push(buffer);
+      buffer = "";
     }
-    return part;
-  });
+  };
+
+  while (i < text.length) {
+    // Which marker (if any) starts here? Check "**" before "`" so it wins.
+    const marker = MARKERS.find((m) => text.startsWith(m.open, i));
+    if (marker) {
+      const close = text.indexOf(marker.open, i + marker.open.length);
+      if (close !== -1) {
+        const inner = text.slice(i + marker.open.length, close);
+        flush();
+        nodes.push(marker.render(inner, key++));
+        i = close + marker.open.length;
+        continue;
+      }
+      // No closing marker — treat this opener as literal text and move past it.
+      buffer += marker.open;
+      i += marker.open.length;
+      continue;
+    }
+    buffer += text[i];
+    i += 1;
+  }
+  flush();
+  return nodes;
 }

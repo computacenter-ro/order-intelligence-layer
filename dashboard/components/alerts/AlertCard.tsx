@@ -1,4 +1,5 @@
 import { Card } from "@computacenter-ro/style-guide/components";
+import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { levelLabel, formatTime } from "@/lib/format";
@@ -8,12 +9,13 @@ import type { BadgeStatus, ProcessedAlert } from "@/lib/types";
 interface AlertCardProps {
   alert: ProcessedAlert;
   onOpen: (alert: ProcessedAlert) => void;
+  isSelected?: boolean;
 }
 
 const FALLBACK_EXPLANATION =
   "Unprocessed — LLM unavailable. Raw log passed straight through; no explanation or routing.";
 
-export function AlertCard({ alert, onOpen }: AlertCardProps) {
+export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps) {
   const isFallback = alert.source === "fallback";
   const levelStatus: BadgeStatus = alert.level === "ERROR" ? "error" : "warning";
   const accentColor = isFallback
@@ -37,6 +39,9 @@ export function AlertCard({ alert, onOpen }: AlertCardProps) {
           cursor: "pointer",
           borderLeft: `3px solid ${accentColor}`,
           ...(isFallback ? { border: "1px dashed var(--cc-grey-four)", opacity: 0.85 } : {}),
+          ...(isSelected
+            ? { boxShadow: `0 0 0 2px ${badgeColors.primary.border}`, background: badgeColors.primary.bg }
+            : {}),
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>

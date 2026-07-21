@@ -78,6 +78,10 @@ services:
   mock-services:
     profiles: ["app"]
     image: oil-app
+    # Auto-restart if it loses the RabbitMQ startup race (the initial AMQP
+    # connection doesn't retry; depends_on:service_healthy narrows but doesn't
+    # eliminate the window). on-failure => restarts on non-zero exit only.
+    restart: on-failure
     command: python -m pipeline.services.run_all
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
@@ -91,6 +95,7 @@ services:
   ai-service:
     profiles: ["app"]
     image: oil-app
+    restart: on-failure          # same RabbitMQ startup-race guard as mock-services
     command: python -m ai_service.main
     environment:
       ES_URL: http://collector:9200
@@ -115,6 +120,7 @@ services:
   backend:
     profiles: ["app"]
     image: oil-app
+    restart: on-failure          # same RabbitMQ startup-race guard as mock-services
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"

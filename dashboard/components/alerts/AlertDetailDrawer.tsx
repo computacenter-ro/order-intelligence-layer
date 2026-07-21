@@ -101,10 +101,10 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
           <XIcon size={20} />
         </button>
         <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
-          {alert.log.app_name}
+          {alert.app_name}
         </div>
         <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginBottom: "8px" }}>
-          {levelLabel(alert.log.level)} · {formatTime(alert.emitted_at)}
+          {levelLabel(alert.level)} · {formatTime(alert.emitted_at)}
         </div>
 
         <SectionLabel>Explanation</SectionLabel>
@@ -132,10 +132,10 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
         </div>
 
         <SectionLabel>Correlation ids</SectionLabel>
-        <KeyValueRow label="orderId" value={alert.log.orderId ?? "—"} />
-        <KeyValueRow label="eventId" value={alert.log.eventId ?? "—"} />
-        <KeyValueRow label="cartHeaderId" value={alert.log.cartHeaderId ?? "—"} />
-        <KeyValueRow label="accountNumber" value={alert.log.accountNumber ?? "—"} />
+        <KeyValueRow label="orderId" value={alert.order_id ?? "—"} />
+        <KeyValueRow label="eventId" value={alert.event_id ?? "—"} />
+        <KeyValueRow label="cartHeaderId" value={alert.cart_header_id ?? "—"} />
+        <KeyValueRow label="accountNumber" value={alert.account_number ?? "—"} />
         <KeyValueRow label="source" value={alert.source} />
 
         <SectionLabel>Raw log line</SectionLabel>
@@ -151,7 +151,21 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
             overflowX: "auto",
           }}
         >
-          {JSON.stringify(alert.log, null, 2)}
+          {JSON.stringify(
+            {
+              log_id: alert.log_id,
+              level: alert.level,
+              app_name: alert.app_name,
+              logger: alert.logger,
+              message: alert.message,
+              event_id: alert.event_id,
+              order_id: alert.order_id,
+              cart_header_id: alert.cart_header_id,
+              account_number: alert.account_number,
+            },
+            null,
+            2
+          )}
         </pre>
 
         <SectionLabel>Related</SectionLabel>

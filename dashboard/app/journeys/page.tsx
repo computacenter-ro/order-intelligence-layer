@@ -1,16 +1,42 @@
 "use client";
 
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Card } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
-import { formatTime, stoppedAt } from "@/lib/format";
+import { formatTime } from "@/lib/format";
 import { JOURNEY_STATUS_BADGE, JOURNEY_STATUS_LABEL } from "@/lib/journeyStatus";
-import { journeys } from "@/lib/fixtures";
+import { fetchJourneys } from "@/lib/api";
+import { useWebSocket } from "@/lib/useWebSocket";
+import type { Journey, WsEvent } from "@/lib/types";
 
-const COLUMN_HEADINGS = ["Status", "Order ID", "Event ID", "Outcome", "Stopped At", "Last Seen"];
+const COLUMN_HEADINGS = ["Status", "Order ID", "Event ID", "Outcome", "Last Seen"];
+
+function upsertJourney(prev: Journey[], next: Journey): Journey[] {
+  const index = prev.findIndex((j) => j.journey_id === next.journey_id);
+  if (index === -1) return [next, ...prev];
+  const copy = [...prev];
+  copy[index] = next;
+  return copy;
+}
 
 export default function JourneysPage() {
   const router = useRouter();
+  const [journeys, setJourneys] = useState<Journey[]>([]);
+
+  useEffect(() => {
+    fetchJourneys()
+      .then(setJourneys)
+      .catch((err) => console.error("Failed to load journeys:", err));
+  }, []);
+
+  const handleEvent = useCallback((event: WsEvent) => {
+    if (event.type !== "journey.updated" && event.type !== "journey.completed") return;
+    setJourneys((prev) => upsertJourney(prev, event.data));
+  }, []);
+
+  useWebSocket(handleEvent);
+
   const sorted = [...journeys].sort(
     (a, b) => new Date(b.last_ts).getTime() - new Date(a.last_ts).getTime()
   );
@@ -51,7 +77,6 @@ export default function JourneysPage() {
                 <td className="oil-mono">{journey.order_id ?? "—"}</td>
                 <td className="oil-mono">{journey.event_id ?? "—"}</td>
                 <td>{journey.outcome ?? "—"}</td>
-                <td className="oil-mono">{stoppedAt(journey)}</td>
                 <td className="oil-mono">{formatTime(journey.last_ts)}</td>
               </tr>
             ))}

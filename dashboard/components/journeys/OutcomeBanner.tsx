@@ -10,7 +10,7 @@ interface OutcomeBannerProps {
 export function OutcomeBanner({ journey }: OutcomeBannerProps) {
   const tone = badgeColors[JOURNEY_STATUS_BADGE[journey.status]];
   const orderLabel = journey.order_id ?? journey.event_id ?? "—";
-  const locationLabel = journey.status === "success" ? "completed" : `stopped at ${stoppedAt(journey)}`;
+  const locationLabel = journey.status === "SUCCESS" ? "completed" : `stopped at ${stoppedAt(journey)}`;
 
   return (
     <div

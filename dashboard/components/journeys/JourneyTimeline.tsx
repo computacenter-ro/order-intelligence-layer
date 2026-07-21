@@ -1,10 +1,10 @@
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
-import { alerts } from "@/lib/fixtures";
 import { formatTime } from "@/lib/format";
-import type { Journey, LogLevel } from "@/lib/types";
+import type { Journey, LogLevel, ProcessedAlert } from "@/lib/types";
 
 interface JourneyTimelineProps {
   journey: Journey;
+  alerts: ProcessedAlert[];
 }
 
 const DOT_COLOR: Record<LogLevel, string> = {
@@ -14,11 +14,11 @@ const DOT_COLOR: Record<LogLevel, string> = {
   ERROR: "var(--cc-united-red)",
 };
 
-export function JourneyTimeline({ journey }: JourneyTimelineProps) {
+export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-      {journey.events.map((event) => {
-        const alert = alerts.find((a) => a.log.log_id === event.raw.log_id);
+      {(journey.events ?? []).map((event) => {
+        const alert = alerts.find((a) => a.log_id === event.raw.log_id);
         const tone = alert ? (alert.source === "ai" ? badgeColors.other : badgeColors.inactive) : null;
 
         return (

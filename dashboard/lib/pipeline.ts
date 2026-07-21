@@ -21,21 +21,22 @@ export interface PipelineStage {
 }
 
 const STOP_STATE: Record<JourneyStatus, PipelineStageState> = {
-  success: "done",
-  failed: "stopped",
-  timed_out: "stalled",
-  in_progress: "current",
+  SUCCESS: "done",
+  FAILED: "stopped",
+  TIMED_OUT: "stalled",
+  IN_PROGRESS: "current",
 };
 
 const AFTER_STATE: Record<JourneyStatus, PipelineStageState> = {
-  success: "skipped",
-  failed: "skipped",
-  timed_out: "skipped",
-  in_progress: "pending",
+  SUCCESS: "skipped",
+  FAILED: "skipped",
+  TIMED_OUT: "skipped",
+  IN_PROGRESS: "pending",
 };
 
 export function pipelineStages(journey: Journey): PipelineStage[] {
-  const lastEvent = journey.events[journey.events.length - 1];
+  const events = journey.events ?? [];
+  const lastEvent = events[events.length - 1];
   const lastAppName = lastEvent ? lastEvent.raw.app_name : CANONICAL_STAGES[0].appName;
   const rawIndex = CANONICAL_STAGES.findIndex((stage) => stage.appName === lastAppName);
   const stopIndex = rawIndex === -1 ? 0 : rawIndex;

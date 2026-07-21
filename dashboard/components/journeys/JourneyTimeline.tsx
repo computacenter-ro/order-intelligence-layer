@@ -16,9 +16,11 @@ const DOT_COLOR: Record<LogLevel, string> = {
 };
 
 export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
+  const events = [...(journey.events ?? [])].reverse();
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-      {(journey.events ?? []).map((event) => {
+      {events.map((event) => {
         const alert = alerts.find((a) => a.log_id === event.raw.log_id);
         const tone = alert ? (alert.source === "ai" ? badgeColors.other : badgeColors.inactive) : null;
 

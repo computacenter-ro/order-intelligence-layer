@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 load_dotenv(override=False)  # .env → os.getenv (TEAMS_WEBHOOK_* / DASHBOARD_URL)
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -67,18 +68,38 @@ async def _fan_out(event: dict) -> None:
             )
 
 
-async def _run_consumers_guarded() -> None:
-    """Run the consumers, wired to the fan-out sink, containing any failure.
+CONSUMERS_RETRY_DELAY = int(os.getenv("CONSUMERS_RETRY_DELAY", "5"))
 
-    Cancellation (on shutdown) propagates cleanly; any other error (e.g. the
-    broker is unreachable) is logged so it can't take the whole app down.
+
+async def _run_consumers_guarded() -> None:
+    """Run the consumers, wired to the fan-out sink, retrying on any failure.
+
+    Cancellation (on shutdown) propagates cleanly. Any other error (e.g. the
+    broker is unreachable) is logged and retried after a short delay — it must
+    never crash the app, and it must never permanently give up.
+
+    The retry is what makes a slow/unavailable broker survivable. ``aio_pika``'s
+    ``connect_robust`` only re-establishes a connection that was already open and
+    then dropped; it does NOT retry the *initial* connect, so a broker that isn't
+    accepting AMQP connections yet at startup (the docker-compose boot race:
+    ``service_healthy`` fires on the diagnostics ping, a beat before the listener
+    accepts) raises here. Without this loop that first failure would kill the
+    consumer task for the life of the process while uvicorn stayed up — the API
+    and WebSocket keep working but nothing drains ``raw.events`` /
+    ``processed.alerts``, so the dashboard goes silent. The loop also covers a
+    broker that disappears mid-run.
     """
-    try:
-        await run_consumers(on_event=_fan_out)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — a broker outage must not crash the app
-        print(f"[backend] consumers stopped: {exc}", flush=True)
+    while True:
+        try:
+            await run_consumers(on_event=_fan_out)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a broker outage must not crash the app
+            print(
+                f"[backend] consumers error, retrying in {CONSUMERS_RETRY_DELAY}s: {exc}",
+                flush=True,
+            )
+            await asyncio.sleep(CONSUMERS_RETRY_DELAY)
 
 
 @asynccontextmanager

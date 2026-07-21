@@ -3,7 +3,7 @@ import Link from "next/link";
 import { XIcon } from "@phosphor-icons/react";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
-import { levelLabel, formatTime } from "@/lib/format";
+import { levelLabel, formatTime, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
@@ -125,7 +125,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
           {alert.source === "ai" ? (
             <>
               <Badge status="other">AI-analyzed</Badge>
-              {alert.department && <Badge status="info">{alert.department}</Badge>}
+              {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
               {alert.confidence != null && <ConfidenceBar confidence={alert.confidence} />}
             </>
           ) : (

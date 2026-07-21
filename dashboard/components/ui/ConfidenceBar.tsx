@@ -12,7 +12,7 @@ export function ConfidenceBar({ confidence }: ConfidenceBarProps) {
   const pct = Math.round(confidence * 100);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", color: "var(--cc-grey-three)" }}>
-      <span>conf</span>
+      <span>Conf</span>
       <div style={{ width: "46px", height: "5px", borderRadius: "3px", backgroundColor: "var(--cc-grey-six)", overflow: "hidden" }}>
         <div
           data-testid="confidence-fill"

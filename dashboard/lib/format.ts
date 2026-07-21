@@ -12,7 +12,16 @@ export function levelLabel(level: LogLevel): string {
 }
 
 export function formatTime(iso: string): string {
-  return new Date(iso).toISOString().slice(11, 19);
+  // Backend timestamps are UTC; render in the VIEWER's local timezone (the
+  // browser's) rather than UTC, so a user in Europe/Bucharest sees local wall
+  // time. Using toLocaleTimeString (not toISOString, which forces UTC) keeps
+  // this correct for any viewer's timezone, not just one hardcoded offset.
+  return new Date(iso).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 export function stoppedAt(journey: Journey): string {

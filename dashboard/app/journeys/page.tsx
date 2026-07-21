@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Card } from "@computacenter-ro/style-guide/components";
+import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { Badge } from "@/components/ui/Badge";
 import { formatTime } from "@/lib/format";
 import { JOURNEY_STATUS_BADGE, JOURNEY_STATUS_LABEL } from "@/lib/journeyStatus";
@@ -21,7 +22,18 @@ function upsertJourney(prev: Journey[], next: Journey): Journey[] {
 }
 
 export default function JourneysPage() {
+  return (
+    <Suspense fallback={null}>
+      <JourneysPageContent />
+    </Suspense>
+  );
+}
+
+function JourneysPageContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const highlightId = searchParams.get("highlight");
+  const highlightRef = useRef<HTMLTableRowElement | null>(null);
   const [journeys, setJourneys] = useState<Journey[]>([]);
 
   useEffect(() => {
@@ -29,6 +41,10 @@ export default function JourneysPage() {
       .then(setJourneys)
       .catch((err) => console.error("Failed to load journeys:", err));
   }, []);
+
+  useEffect(() => {
+    if (highlightId) highlightRef.current?.scrollIntoView({ block: "center" });
+  }, [highlightId, journeys]);
 
   const handleEvent = useCallback((event: WsEvent) => {
     if (event.type !== "journey.updated" && event.type !== "journey.completed") return;
@@ -59,15 +75,23 @@ export default function JourneysPage() {
             </tr>
           </thead>
           <tbody>
-            {sorted.map((journey) => (
+            {sorted.map((journey) => {
+              const isHighlighted = journey.journey_id === highlightId;
+              return (
               <tr
                 key={journey.journey_id}
+                ref={isHighlighted ? highlightRef : undefined}
                 role="link"
                 tabIndex={0}
                 onClick={() => router.push(`/journeys/${journey.journey_id}`)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") router.push(`/journeys/${journey.journey_id}`);
                 }}
+                style={
+                  isHighlighted
+                    ? { boxShadow: `inset 0 0 0 2px ${badgeColors.primary.border}`, background: badgeColors.primary.bg }
+                    : undefined
+                }
               >
                 <td>
                   <Badge status={JOURNEY_STATUS_BADGE[journey.status]}>
@@ -80,7 +104,8 @@ export default function JourneysPage() {
                 <td>{journey.outcome ?? "—"}</td>
                 <td className="oil-mono">{formatTime(journey.last_ts)}</td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </Card>

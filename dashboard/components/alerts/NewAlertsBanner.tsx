@@ -8,7 +8,7 @@ interface NewAlertsBannerProps {
 export function NewAlertsBanner({ count, onReveal }: NewAlertsBannerProps) {
   if (count === 0) return null;
 
-  const tone = badgeColors.info;
+  const tone = badgeColors.pending;
   const label = count === 1 ? "1 new alert" : `${count} new alerts`;
 
   return (

@@ -14,7 +14,9 @@ export default function AlertFeedPage() {
   const [selected, setSelected] = useState<ProcessedAlert | null>(null);
 
   useEffect(() => {
-    fetchAlerts()
+    // Resolved alerts live in History (see /history) — the feed only ever
+    // shows active (unresolved) alerts.
+    fetchAlerts({ resolved: false })
       .then(setAlerts)
       .catch((err) => console.error("Failed to load alerts:", err));
   }, []);
@@ -40,7 +42,8 @@ export default function AlertFeedPage() {
   const handleResolve = useCallback((alert: ProcessedAlert) => {
     resolveAlert(alert.alert_id)
       .then((updated) => {
-        setAlerts((prev) => prev.map((a) => (a.alert_id === updated.alert_id ? updated : a)));
+        // Resolved alerts move to History — drop it from the live feed.
+        setAlerts((prev) => prev.filter((a) => a.alert_id !== updated.alert_id));
       })
       .catch((err) => console.error("Failed to resolve alert:", err));
   }, []);

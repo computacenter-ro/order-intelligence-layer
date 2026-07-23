@@ -34,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend import teams
 from backend.api import router as api_router
+from backend.auth import router as auth_router
 from backend.consumers import run_consumers
 from backend.ws import manager as hub
 from backend.ws import router as ws_router
@@ -126,9 +127,14 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
-    allow_methods=["GET"],
+    # POST for /auth/login + /auth/logout; OPTIONS for the preflight. Reads stay GET.
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    # Required so the browser sends/receives the httpOnly session cookie
+    # cross-origin (dashboard :3000 → backend :8000).
+    allow_credentials=True,
 )
+app.include_router(auth_router)
 app.include_router(api_router)
 app.include_router(ws_router)
 

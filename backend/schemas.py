@@ -56,7 +56,7 @@ class AlertOut(BaseModel):
     confidence: float | None = None
     source: str
     journey_id: str | None = None
-    is_resolved: bool
+    is_resolved: bool = False
     resolved_at: UtcDatetime | None = None
     severity_score: int | None = None
 

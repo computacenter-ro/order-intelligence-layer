@@ -59,6 +59,17 @@ export interface AlertsFilter {
   source?: string;
 }
 
+/** Mark an alert resolved; returns the updated alert. */
+export async function resolveAlert(alertId: string): Promise<ProcessedAlert> {
+  const res = await fetch(`${API_URL}/alerts/${encodeURIComponent(alertId)}/resolve`, {
+    method: "PATCH",
+    credentials: "include",
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`resolveAlert failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<ProcessedAlert>;
+}
+
 export function fetchAlerts(filter: AlertsFilter = {}): Promise<ProcessedAlert[]> {
   const params = new URLSearchParams();
   if (filter.since) params.set("since", filter.since);

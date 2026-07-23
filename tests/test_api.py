@@ -64,6 +64,9 @@ class _FakeSession:
         self.statements.append(stmt)
         return self._results.pop(0)
 
+    async def commit(self):
+        pass
+
 
 @pytest.fixture(autouse=True)
 def _authenticated():
@@ -106,6 +109,7 @@ def _alert(**over) -> Alert:
         source="ai",
         explanation="explained",
         department="backend",
+        is_resolved=False,
         confidence=0.8,
     )
     base.update(over)
@@ -147,6 +151,13 @@ def test_requires_auth(path):
     """Without a valid session, every read route is 401 — no cookie, no data."""
     app.dependency_overrides.clear()  # drop the autouse stub user for this test
     r = TestClient(app).get(path)
+    assert r.status_code == 401
+
+
+def test_resolve_alert_requires_auth():
+    """The write route sits on the same auth-guarded router as the reads."""
+    app.dependency_overrides.clear()  # drop the autouse stub user for this test
+    r = TestClient(app).patch("/alerts/a1/resolve")
     assert r.status_code == 401
 
 
@@ -199,6 +210,30 @@ def test_get_alerts_passes_query_params_into_the_filter():
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
     assert "emitted_at >=" in sql and "department =" in sql and "source =" in sql
+
+
+# --- PATCH /alerts/{id}/resolve -----------------------------------------------
+
+
+def test_resolve_alert_marks_resolved_and_returns_updated_alert():
+    session = _use([_FakeResult(one=_alert(
+        alert_id="a1",
+        is_resolved=True,
+        resolved_at=datetime(2026, 7, 23, 9, 0, 0, tzinfo=UTC),
+    ))])
+    r = TestClient(app).patch("/alerts/a1/resolve")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_resolved"] is True
+    assert body["resolved_at"] is not None
+    sql = _compiled(session.statements[0])
+    assert "UPDATE alerts" in sql and "is_resolved" in sql
+
+
+def test_resolve_alert_404_when_missing():
+    _use([_FakeResult(one=None)])
+    r = TestClient(app).patch("/alerts/missing/resolve")
+    assert r.status_code == 404
 
 
 # --- GET /journeys -----------------------------------------------------------

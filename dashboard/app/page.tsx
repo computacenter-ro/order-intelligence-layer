@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { fetchAlerts } from "@/lib/api";
+import { fetchAlerts, resolveAlert } from "@/lib/api";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
@@ -37,6 +37,14 @@ export default function AlertFeedPage() {
     setPending([]);
   }, [pending]);
 
+  const handleResolve = useCallback((alert: ProcessedAlert) => {
+    resolveAlert(alert.alert_id)
+      .then((updated) => {
+        setAlerts((prev) => prev.map((a) => (a.alert_id === updated.alert_id ? updated : a)));
+      })
+      .catch((err) => console.error("Failed to resolve alert:", err));
+  }, []);
+
   const sorted = [...alerts].sort(
     (a, b) => new Date(b.emitted_at).getTime() - new Date(a.emitted_at).getTime()
   );
@@ -56,6 +64,7 @@ export default function AlertFeedPage() {
             key={alert.alert_id}
             alert={alert}
             onOpen={setSelected}
+            onResolve={handleResolve}
             isSelected={selected?.alert_id === alert.alert_id}
           />
         ))}

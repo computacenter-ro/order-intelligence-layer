@@ -120,26 +120,27 @@ Every log line is one JSON object:
 | `host` | string | **yes** | e.g. `CCECMEWEBT001` |
 | `process_id` | string | **yes** | |
 | `thread` | string | **yes** | `rabbit-listener-1`, `pool-3-thread-2`, `http-nio-8080-exec-3` |
-| `eventId` | string | phase-1 + bridge only | `evt-<uuid>` |
-| `orderId` | string | bridge (maybe) + phase 2 | `ORD-NNNN` |
-| `cartHeaderId` | string | bridge (maybe) + phase 2 | 19-digit numeric string |
+| `eventId` | string | phase-1 field only | `evt-<uuid>` |
+| `orderId` | string | phase-2 field; ALSO in creation-log *text* | `ORD-NNNN` |
+| `cartHeaderId` | string | phase-2 field; ALSO in creation-log *text* | 19-digit numeric string |
 | `accountNumber` | string | all phases | **Never use for correlation** — not unique per journey. |
-| `message` | string | **yes** | Free text. Terminal detection matches on it — treat as an API. |
+| `message` | string | **yes** | Free text. Terminal detection AND id mining match on it — treat as an API. |
 
-Example of a real sequence (phase 1 → bridge → phase 2) — note exactly which
-id fields appear on each line:
+Example of a real sequence (phase 1 → creation join → bridge ack → phase 2) —
+note exactly which id **fields** appear on each line, and that the join lives in
+the creation-log **text**, not on any single line's fields:
 
 ```json
 {"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.OrderListener",
  "eventId":"evt-372656a7-...","accountNumber":"81036533",
  "message":"Received inbound order event evt-372656a7-... for account 81036533"}
-   ... transform + SKU-mapping logs, eventId only ...
+   ... transform + SKU-mapping logs, eventId field only ...
 {"app_name":"cc-order-engine","logger":"c.c.orderengine.service.OrderCreationService",
  "eventId":"evt-372656a7-...",
- "message":"Generated order number ORD-6001 for cart header 1840927365018240001"}
+ "message":"Generated order number ORD-6001 for cart header 1840927365018240001"}   ← THE JOIN (eventId field + order ids MINED from text)
 {"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.ResponseListener",
- "eventId":"evt-372656a7-...","orderId":"ORD-6001","cartHeaderId":"1840927365018240001",
- "message":"Received order creation response for event evt-372656a7-...: orderNumber=ORD-6001, cartHeaderId=1840927365018240001"}   ← BRIDGE
+ "eventId":"evt-372656a7-...",
+ "message":"Received order creation response for event evt-372656a7-...: status=CREATED"}   ← BRIDGE ACK (eventId ONLY — links nothing)
 {"app_name":"cc-order-engine","logger":"c.c.orderengine.service.OrderService",
  "orderId":"ORD-6001","cartHeaderId":"1840927365018240001",
  "message":"Get order by Order Number:ORD-6001"}                                ← phase 2, no eventId
@@ -153,35 +154,66 @@ An order's logs form a **journey**. There is **no single id present on every
 log of a journey** — the identifier *changes over the journey's lifetime*:
 
 - **Phase 1 — pre-creation.** Inbound receive → transform → publish →
-  order-engine consume/create: logs carry **ONLY `eventId`**
+  order-engine consume/create: logs carry **ONLY `eventId`** as a field
   (plus `accountNumber`). No `orderId`, no `cartHeaderId` — they don't exist yet.
+  **Exception (the join, see below):** the order-engine `create` block's own
+  logs carry `eventId` as a field **and expose the freshly minted order ids in
+  their message *text*** (`"Created cart header <19-digit>"`, `"Generated order
+  number ORD-N for cart header <19-digit>"`).
 - **Bridge event.** Order-engine publishes the creation response to
   `order.response.queue`; inbound logs it (logger
-  `c.c.inbound.listener.ResponseListener`, message starts
-  `"Received order creation response for event ..."`). That single log carries
-  `eventId` **AND** `orderId` and/or `cartHeaderId` — **usually only ONE of
-  the two (randomly); sometimes both**. It is the only log where `eventId`
-  coexists with the order ids.
+  `c.c.inbound.listener.ResponseListener`, message
+  `"Received order creation response for event evt-...: status=CREATED"`). This
+  log carries **`eventId` ONLY** — no `orderId`/`cartHeaderId`, neither as
+  fields nor in its text. **It no longer links the id families** (historically
+  it did; that convenience was removed deliberately). It is kept as a realistic
+  ack line, not a correlation hinge.
 - **Phase 2 — post-creation.** `eventId` disappears. All downstream logs
   (enrichment, checker, validator, outbound, track-trace) carry **both
-  `orderId` and `cartHeaderId`**.
+  `orderId` and `cartHeaderId`** as fields.
+
+**The join — id mining.** Because no single line carries both id families as
+*fields*, the `eventId`→order-id join is recovered by **mining ids from
+`log.message` text** with strict word-boundary patterns and treating them
+exactly like structured-field ids (registering them in the same alias map):
+
+| family | pattern |
+|---|---|
+| `eventId` | `evt-[0-9a-f-]{8,}` |
+| `orderId` | `\bORD-\d+\b` |
+| `cartHeaderId` | `\b\d{19}\b` |
+
+The order-engine `create` logs (eventId field + order ids in text) close the
+join **before** the bridge line even appears. Those creation-log texts are
+therefore **load-bearing for correlation** — exactly like the terminal messages
+are load-bearing for journey completion. Changing them requires updating the
+mining patterns and their tests together. Mining is scoped to the three id
+families only; `accountNumber` is never mined, and a stray 19-digit number in
+unrelated prose only ever aliases the journey of the line it appears on (it
+never crosses journeys, because that line already belongs to exactly one).
 
 ### Invariants (code and tests must respect these)
 1. A journey = internal `journey_id` + an **alias set** of ids accumulated
-   over time. Correlating by any single field is impossible.
-2. Every log that introduces a *new* id also carries an *already-known* id:
-   bridge = known `eventId` + new order id(s); first phase-2 log = BOTH order
-   ids, at least one known from the bridge. Single-pass stitching in timestamp
-   order therefore always works, whichever id the bridge exposed.
-   **Test all three bridge variants: both / orderId-only / cartHeaderId-only.**
+   over time (from fields **and** mined text). Correlating by any single field
+   is impossible.
+2. **No single log line links the two id families as structured fields.** The
+   join lives only in the order-engine creation logs' message text (mined). A
+   single pass in timestamp order still correlates every log: those creation
+   logs tie `eventId` to the order ids, and every later phase-2 log shares an
+   order id already known. **Test: the honest corpus where no line links both
+   families as fields still yields exactly one journey per flow.**
 3. Journeys failing before creation (transform failure, creation DB failure)
    **never get order ids** — complete, valid journeys identified only by
    `eventId`. Correct behavior, not a data gap.
 4. Logs of one journey can be split across polls — assembly must be
    incremental ("lazy"): a journey grows as future polls deliver more of it.
+   The alias map (including mined ids) persists across polls, so a split
+   between the creation logs and phase 2 still joins.
 
 Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
-NOT stitch — it processes individual logs.
+NOT stitch — it processes individual logs. The reference fixture reflecting the
+honest bridge is **`pipeline/data/mock-order-flows-v3.json`** (v2 retained for
+history).
 
 ---
 
@@ -229,11 +261,14 @@ tells the next service "your turn to emit", carrying the flow context.
 - **Id rules (this is what keeps the Correlation Model honest):**
   - `ctx.orderId`/`ctx.cartHeaderId` start null; **only order_engine's
     `create` block fills them**.
-  - A service must only put into its logs the ids present in `ctx` *at that
-    moment* — phase-1 blocks therefore physically cannot log order ids.
-  - The `inbound.bridge` block logs `eventId` + the ids selected by
-    `bridge_ids` (`both|order|cart|random`).
-  - Phase-2 blocks log `orderId` + `cartHeaderId`, **never** `eventId`.
+  - A service must only put into its logs the id **fields** present in `ctx`
+    *at that moment* — phase-1 blocks therefore physically cannot log order-id
+    fields. (The `create` block's messages still *print* the minted ids in
+    their text — that text is the correlation join; see the Correlation Model.)
+  - The `inbound.bridge` block logs **`eventId` only** (message ends
+    `": status=CREATED"`). `ctx.bridge_ids` is now **inert** — retained on the
+    baton/scenario for schema stability but ignored by the emitter.
+  - Phase-2 blocks log `orderId` + `cartHeaderId` fields, **never** `eventId`.
 - **Failures:** `ctx.fail_at` names the block that must emit its failure
   variant (ERROR/WARN lines, retries, DLQ message) and **stop the chain** —
   the baton is not forwarded past a fatal failure.
@@ -242,7 +277,7 @@ tells the next service "your turn to emit", carrying the flow context.
 
 | Service | app_name | host | Blocks / notable logs |
 |---|---|---|---|
-| inbound | cc-inbound-service | CCECMETLT001 | `receive` (transform + SKU mapping, publish log), `bridge` (**the bridge log**). Fail `transform`: unknown product → 3 redeliveries → `"routing message to order.inbound.queue_error"`. |
+| inbound | cc-inbound-service | CCECMETLT001 | `receive` (transform + SKU mapping, publish log), `bridge` (creation-response ack — **`eventId` only**, `": status=CREATED"`; no longer links the id families). Fail `transform`: unknown product → 3 redeliveries → `"routing message to order.inbound.queue_error"`. |
 | order_engine | cc-order-engine | CCECMEWEBT001 | `create` (fills ids; creation-response publish log), `enrich` (client `--->`/`<---` Feign-style logs around each satellite), `dispatch` (publish to order.outbound.queue log). Fail `create`: BM-DB timeout ×3 → failure response (still eventId-only). |
 | spt | cc-spt-service | CCECMSRVT001 | price list lookup logs. Fail `spt`: OE logs timeouts ×3 → `"Order processing aborted"`. |
 | rsm | cc-rsm-service | CCECMSRVT001 | rebates / PVC rates logs. |
@@ -570,12 +605,14 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 
 ## Testing
 
-- **Correlation invariants**: phase-1 logs never contain order ids; the bridge
-  always has `eventId` + ≥1 order id; phase-2 logs never contain `eventId`;
-  stitching succeeds for all three bridge variants; pre-creation failures
-  produce eventId-only journeys.
+- **Correlation invariants**: phase-1 logs never contain order-id *fields*; the
+  bridge ack carries `eventId` only; phase-2 logs never contain `eventId`; **no
+  single line links both id families as fields**; the eventId→order-id join is
+  mined from the order-engine creation logs' text; pre-creation failures produce
+  eventId-only journeys; a stray 19-digit number in prose never merges journeys.
 - **Cross-poll assembly**: split one flow's logs across ≥3 polls (including a
-  split right at the bridge) → exactly one journey, correct outcome.
+  split between the creation logs and phase 2) → exactly one journey, correct
+  outcome.
 - **Dedup / idempotency**: overlapping windows re-deliver logs → no duplicate
   raw.events processing, no duplicate alerts; re-delivered queue messages
   change nothing.
@@ -593,11 +630,15 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 - **Never** correlate by `accountNumber`.
 - **Never** assume `orderId` exists at the start of a journey — pre-creation
   failures live and die with only `eventId`.
-- The bridge may expose only one order id — both stitching directions must
-  work and be tested.
-- Message texts are load-bearing: journey terminal detection matches on them.
-  Changing a log message in a service block requires updating the detection
-  rules and tests together.
+- The bridge ack carries `eventId` only and links nothing — do NOT reintroduce
+  order-id fields on it. The eventId→order-id join comes from mining the
+  order-engine creation logs' message text (`backend/stitching.py`).
+- Message texts are load-bearing in **two** ways: journey terminal detection
+  matches on them (`backend/journeys.py`) AND id mining extracts eventId/orderId/
+  cartHeaderId from them (`backend/stitching.py`). Changing a service block's
+  message — especially the order-engine `create` logs or any terminal line —
+  requires updating the detection rules, the mining patterns, and their tests
+  together.
 - Mock services stay hollow: they emit logs and forward the baton — nothing
   else. The baton `ctx` id rules are what keep the Correlation Model honest;
   never bypass them.

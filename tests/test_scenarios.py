@@ -28,7 +28,7 @@ from shared.scenarios import (
     compile_steps,
 )
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v2.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v3.json"
 
 # CLAUDE.md canonical table: {id: (outcome, fail_at, bridge_ids)}
 CANONICAL = {
@@ -96,12 +96,15 @@ def test_pre_creation_failures_are_event_id_only(sid):
     assert (INBOUND, BLOCKS.BRIDGE) not in steps
 
 
-def test_all_three_bridge_variants_are_represented():
-    # Only creation-reaching scenarios have a meaningful bridge_ids.
-    variants = {
-        s.bridge_ids for s in all_scenarios() if s.reaches_creation
-    }
-    assert {"both", "order", "cart"} <= variants
+def test_bridge_ids_knob_is_inert_but_preserved():
+    # The bridge no longer exposes order ids, so ``bridge_ids`` is now INERT —
+    # the emitter ignores it (see pipeline/services/inbound.py). We keep the
+    # field on the scenarios (and its historical values) so the baton/scenario
+    # schema is unchanged; this test documents that it is retained, not that it
+    # drives emission anymore. (Emission behavior is asserted in test_emitters:
+    # the bridge carries eventId only, regardless of bridge_ids.)
+    variants = {s.bridge_ids for s in all_scenarios() if s.reaches_creation}
+    assert {"both", "order", "cart"} <= variants  # values preserved, just unused
 
 
 def test_avalara_is_not_a_standalone_enrich_satellite():

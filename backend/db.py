@@ -26,11 +26,9 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy import (
     Boolean,
-    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
-    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -162,16 +160,8 @@ class Alert(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    severity_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     journey: Mapped["Journey | None"] = relationship(back_populates="alerts")
-
-    __table_args__ = (
-        CheckConstraint(
-            "severity_score IS NULL OR severity_score BETWEEN 1 AND 5",
-            name="ck_alerts_severity_score_range",
-        ),
-    )
 
 
 class JourneyEvent(Base):

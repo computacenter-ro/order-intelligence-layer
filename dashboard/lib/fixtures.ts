@@ -31,9 +31,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: "journey-6042",
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 4,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-2",
     emitted_at: "2026-07-14T07:59:41.150Z",
@@ -54,9 +52,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: "journey-6039",
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 4,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-3",
     emitted_at: "2026-07-14T07:59:12.500Z",
@@ -76,9 +72,7 @@ export const alerts: ProcessedAlert[] = [
     source: "fallback",
     journey_id: "journey-55dd90f2",
     is_resolved: false,
-    resolved_at: null,
-    severity_score: null,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-4",
     emitted_at: "2026-07-14T07:58:55.700Z",
@@ -99,9 +93,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: "journey-6042",
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 2,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-5",
     emitted_at: "2026-07-14T07:58:30.150Z",
@@ -122,9 +114,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: null,
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 4,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-6",
     emitted_at: "2026-07-14T07:57:47.200Z",
@@ -145,9 +135,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: null,
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 4,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-7",
     emitted_at: "2026-07-14T07:57:02.150Z",
@@ -168,9 +156,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: "journey-aa3391bd",
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 4,
-  },
+    resolved_at: null,  },
   {
     alert_id: "alert-8",
     emitted_at: "2026-07-14T07:56:20.130Z",
@@ -191,9 +177,7 @@ export const alerts: ProcessedAlert[] = [
     source: "ai",
     journey_id: null,
     is_resolved: false,
-    resolved_at: null,
-    severity_score: 4,
-  },
+    resolved_at: null,  },
 ];
 
 // ---------------------------------------------------------------------------

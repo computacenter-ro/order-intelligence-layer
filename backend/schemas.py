@@ -59,7 +59,6 @@ class AlertOut(BaseModel):
     journey_id: str | None = None
     is_resolved: bool = False
     resolved_at: UtcDatetime | None = None
-    severity_score: int | None = None
 
 
 class JourneyOut(BaseModel):

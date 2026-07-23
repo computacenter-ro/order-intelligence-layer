@@ -178,6 +178,12 @@ def test_alerts_query_no_filters_still_orders_desc():
     assert "ORDER BY alerts.emitted_at DESC" in sql
 
 
+def test_alerts_query_filters_by_resolved():
+    sql = _compiled(build_alerts_query(None, None, None, resolved=True))
+    assert "is_resolved" in sql
+    assert "WHERE" not in _compiled(build_alerts_query(None, None, None, resolved=None))
+
+
 def test_journeys_query_status_filter():
     assert "status =" in _compiled(build_journeys_query("SUCCESS"))
     assert "WHERE" not in _compiled(build_journeys_query(None))
@@ -210,6 +216,15 @@ def test_get_alerts_passes_query_params_into_the_filter():
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
     assert "emitted_at >=" in sql and "department =" in sql and "source =" in sql
+
+
+def test_get_alerts_resolved_filter_for_the_history_page():
+    session = _use([_FakeResult(items=[_alert(alert_id="a1", is_resolved=True,
+                                               resolved_at=datetime(2026, 7, 23, 9, 0, 0, tzinfo=UTC))])])
+    r = TestClient(app).get("/alerts", params={"resolved": "true"})
+    assert r.status_code == 200
+    assert r.json()[0]["is_resolved"] is True
+    assert "is_resolved" in _compiled(session.statements[0])
 
 
 # --- PATCH /alerts/{id}/resolve -----------------------------------------------

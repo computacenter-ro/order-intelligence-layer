@@ -66,7 +66,7 @@ function JourneysPageContent() {
         Each order&apos;s full path through the pipeline — where it went, where it stopped
       </p>
       <Card style={{ padding: 0 }}>
-        <table className="oil-journeys-table">
+        <table className="oil-table">
           <thead>
             <tr>
               {COLUMN_HEADINGS.map((heading) => (

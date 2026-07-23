@@ -11,8 +11,9 @@ so the wire contract is explicit and decoupled from the DB layer.
 
 Endpoints:
 
-* ``GET /alerts?since=&department=&source=`` — alerts filtered by
-  ``emitted_at >= since`` / ``department`` / ``source``, newest first.
+* ``GET /alerts?since=&department=&source=&resolved=`` — alerts filtered by
+  ``emitted_at >= since`` / ``department`` / ``source`` / ``is_resolved``,
+  newest first.
 * ``PATCH /alerts/{alert_id}/resolve`` — mark an alert resolved (dashboard
   action); sets ``is_resolved=True`` + ``resolved_at=now()``; 404 if missing.
 * ``GET /journeys?status=`` — journeys filtered by ``status``.
@@ -41,6 +42,7 @@ def build_alerts_query(
     since: datetime | None,
     department: str | None,
     source: str | None,
+    resolved: bool | None = None,
 ) -> Select:
     """Select alerts filtered by the given criteria, newest ``emitted_at`` first."""
     stmt = select(Alert)
@@ -50,6 +52,8 @@ def build_alerts_query(
         stmt = stmt.where(Alert.department == department)
     if source is not None:
         stmt = stmt.where(Alert.source == source)
+    if resolved is not None:
+        stmt = stmt.where(Alert.is_resolved == resolved)
     return stmt.order_by(Alert.emitted_at.desc())
 
 
@@ -75,9 +79,10 @@ async def list_alerts(
     since: Annotated[datetime | None, Query()] = None,
     department: Annotated[str | None, Query()] = None,
     source: Annotated[str | None, Query()] = None,
+    resolved: Annotated[bool | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[Alert]:
-    result = await session.execute(build_alerts_query(since, department, source))
+    result = await session.execute(build_alerts_query(since, department, source, resolved))
     return result.scalars().all()
 
 

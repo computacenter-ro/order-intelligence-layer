@@ -26,6 +26,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "Order ORD-6042 was blocked by the margin check — one line fell below the configured margin threshold. The order will not be fulfilled.",
     department: "backend",
+    severity: "high",
     confidence: 0.88,
     source: "ai",
     journey_id: "journey-6042",
@@ -48,6 +49,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "SAP fulfilment submission failed after 3 RFC retries and was moved to the dead-letter queue. The order was created but never submitted downstream.",
     department: "backend",
+    severity: "critical",
     confidence: 0.91,
     source: "ai",
     journey_id: "journey-6039",
@@ -69,6 +71,7 @@ export const alerts: ProcessedAlert[] = [
     message: "routing message to order.inbound.queue_error",
     explanation: null,
     department: null,
+    severity: null,
     confidence: null,
     source: "fallback",
     journey_id: "journey-55dd90f2",
@@ -91,6 +94,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "No PVC rebate rate was found for this SKU, so a default rate was applied. Not fatal, but it lowers the order margin.",
     department: "backend",
+    severity: "low",
     confidence: 0.72,
     source: "ai",
     journey_id: "journey-6042",
@@ -113,6 +117,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "Authentication failed with a 403 — the user account is disabled. The order was aborted before enrichment completed.",
     department: "networking",
+    severity: "high",
     confidence: 0.84,
     source: "ai",
     journey_id: null,
@@ -135,6 +140,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "Validation failed with a 422 — the order is missing the required costCenter UDF. It was rejected before fulfilment.",
     department: "backend",
+    severity: "high",
     confidence: 0.79,
     source: "ai",
     journey_id: null,
@@ -157,6 +163,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "Order creation failed — the BM database timed out 3 times while persisting the cart header. No order number was ever generated.",
     department: "database",
+    severity: "critical",
     confidence: 0.93,
     source: "ai",
     journey_id: "journey-aa3391bd",
@@ -179,6 +186,7 @@ export const alerts: ProcessedAlert[] = [
     explanation:
       "Pricing service (SPT) was unreachable; the order engine timed out 3 times and aborted enrichment. Order processing stopped.",
     department: "devops",
+    severity: "critical",
     confidence: 0.87,
     source: "ai",
     journey_id: null,

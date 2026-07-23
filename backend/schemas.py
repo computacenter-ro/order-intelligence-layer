@@ -53,6 +53,7 @@ class AlertOut(BaseModel):
     account_number: str | None = None
     explanation: str | None = None
     department: str | None = None
+    severity: str | None = None
     confidence: float | None = None
     source: str
     journey_id: str | None = None

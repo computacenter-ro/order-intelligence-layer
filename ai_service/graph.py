@@ -27,7 +27,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ai_service import nodes
 from ai_service.breaker import CircuitBreaker
-from shared.models import Department, LogLine, ProcessedAlert
+from shared.models import Department, LogLine, ProcessedAlert, Severity
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,7 @@ class _State(TypedDict, total=False):
     log: LogLine
     explanation: str | None
     department: Department | None
+    severity: Severity | None
     confidence: float | None
     failed: bool          # set once any LLM step fails / is skipped → fallback
 
@@ -63,15 +64,15 @@ def build_pipeline(deps: PipelineDeps):
     async def router_node(state: _State) -> _State:
         # If the explainer already failed, don't route — go straight to fallback.
         if state.get("failed"):
-            return {"department": None, "confidence": None}
+            return {"department": None, "severity": None, "confidence": None}
         log, explanation = state["log"], state["explanation"]
         result = await deps.breaker.call(
             lambda: nodes.route(log, explanation, deps.router), fallback=None
         )
         if result is None:
-            return {"failed": True, "department": None, "confidence": None}
-        department, confidence = result
-        return {"department": department, "confidence": confidence}
+            return {"failed": True, "department": None, "severity": None, "confidence": None}
+        department, severity, confidence = result
+        return {"department": department, "severity": severity, "confidence": confidence}
 
     graph = StateGraph(_State)
     graph.add_node("explainer", explainer_node)
@@ -100,6 +101,7 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
     """
     explanation = state.get("explanation")
     department = state.get("department")
+    severity = state.get("severity")
     confidence = state.get("confidence")
     is_ai = not state.get("failed") and explanation is not None and department is not None
 
@@ -110,6 +112,7 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
             log=log,
             explanation=explanation,
             department=department,
+            severity=severity,
             confidence=confidence,
             source="ai",
         )
@@ -119,6 +122,7 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
         log=log,
         explanation=None,
         department=None,
+        severity=None,
         confidence=None,
         source="fallback",
     )

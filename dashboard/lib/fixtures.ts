@@ -29,6 +29,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.88,
     source: "ai",
     journey_id: "journey-6042",
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 4,
   },
   {
     alert_id: "alert-2",
@@ -48,6 +51,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.91,
     source: "ai",
     journey_id: "journey-6039",
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 4,
   },
   {
     alert_id: "alert-3",
@@ -66,6 +72,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: null,
     source: "fallback",
     journey_id: "journey-55dd90f2",
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: null,
   },
   {
     alert_id: "alert-4",
@@ -85,6 +94,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.72,
     source: "ai",
     journey_id: "journey-6042",
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 2,
   },
   {
     alert_id: "alert-5",
@@ -104,6 +116,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.84,
     source: "ai",
     journey_id: null,
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 4,
   },
   {
     alert_id: "alert-6",
@@ -123,6 +138,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.79,
     source: "ai",
     journey_id: null,
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 4,
   },
   {
     alert_id: "alert-7",
@@ -142,6 +160,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.93,
     source: "ai",
     journey_id: "journey-aa3391bd",
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 4,
   },
   {
     alert_id: "alert-8",
@@ -161,6 +182,9 @@ export const alerts: ProcessedAlert[] = [
     confidence: 0.87,
     source: "ai",
     journey_id: null,
+    is_resolved: false,
+    resolved_at: null,
+    severity_score: 4,
   },
 ];
 

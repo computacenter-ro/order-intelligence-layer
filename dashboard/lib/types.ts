@@ -37,6 +37,9 @@ export interface ProcessedAlert {
   confidence: number | null;
   source: "ai" | "fallback";
   journey_id: string | null;
+  is_resolved: boolean;
+  resolved_at: string | null;
+  severity_score: number | null;
 }
 
 export type JourneyStatus = "IN_PROGRESS" | "SUCCESS" | "FAILED" | "TIMED_OUT";

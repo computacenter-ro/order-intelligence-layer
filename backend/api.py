@@ -10,8 +10,13 @@ so the wire contract is explicit and decoupled from the DB layer.
 
 Endpoints:
 
-* ``GET /alerts?since=&department=&source=`` — alerts filtered by
-  ``emitted_at >= since`` / ``department`` / ``source``, newest first.
+* ``GET /alerts?since=&department=&source=&level=&app_name=`` — alerts filtered
+  by ``emitted_at >= since`` / ``department`` / ``source`` / ``level`` /
+  ``app_name``, newest first. ``department`` must be one of the five
+  ``Department`` values, ``source`` one of ``ai`` / ``fallback``, and ``level``
+  one of ``WARN`` / ``ERROR``; any other value is a 422 (validated at the route,
+  so ``build_alerts_query`` stays pure). ``app_name`` is a free string (the set
+  of services can grow) — an unknown value simply matches nothing.
 * ``GET /journeys?status=`` — journeys filtered by ``status``.
 * ``GET /journeys/{journey_id}`` — one journey + its events (ordered by ``ts``)
   + summary; 404 if the journey does not exist.
@@ -20,7 +25,7 @@ Endpoints:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Select, select
@@ -29,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.auth import get_current_user
 from backend.db import Alert, Journey, JourneyEvent, get_session
 from backend.schemas import AlertOut, JourneyDetailOut, JourneyEventOut, JourneyOut
+from shared.models import Department
 
 
 # --- query builders (pure, unit-testable) ------------------------------------
@@ -38,6 +44,9 @@ def build_alerts_query(
     since: datetime | None,
     department: str | None,
     source: str | None,
+    level: str | None = None,
+    app_name: str | None = None,
+    severity: str | None = None,
 ) -> Select:
     """Select alerts filtered by the given criteria, newest ``emitted_at`` first."""
     stmt = select(Alert)
@@ -47,6 +56,12 @@ def build_alerts_query(
         stmt = stmt.where(Alert.department == department)
     if source is not None:
         stmt = stmt.where(Alert.source == source)
+    if level is not None:
+        stmt = stmt.where(Alert.level == level)
+    if app_name is not None:
+        stmt = stmt.where(Alert.app_name == app_name)
+    if severity is not None:
+        stmt = stmt.where(Alert.severity == severity)
     return stmt.order_by(Alert.emitted_at.desc())
 
 
@@ -70,11 +85,35 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 @router.get("/alerts", response_model=list[AlertOut])
 async def list_alerts(
     since: Annotated[datetime | None, Query()] = None,
-    department: Annotated[str | None, Query()] = None,
-    source: Annotated[str | None, Query()] = None,
+    # Typing these as the Department enum / a source Literal makes FastAPI reject
+    # out-of-domain values with a 422 (listing the allowed options) before the
+    # query runs. build_alerts_query stays pure and str-typed — we pass the
+    # validated value straight through.
+    department: Annotated[Department | None, Query()] = None,
+    source: Annotated[Literal["ai", "fallback"] | None, Query()] = None,
+    # Alerts are only ever WARN/ERROR, so the Literal rejects anything else with
+    # a 422. app_name stays a free str — the set of services can grow, so an
+    # unknown value should just match nothing, not be a validation error.
+    level: Annotated[Literal["WARN", "ERROR"] | None, Query()] = None,
+    app_name: Annotated[str | None, Query()] = None,
+    # Router LLM severity (critical/high/medium/low); Literal → 422 on anything
+    # else. Null for fallback / not-yet-rated alerts, so a severity filter
+    # excludes those — exactly as ``Alert.severity == severity`` does server-side.
+    severity: Annotated[
+        Literal["critical", "high", "medium", "low"] | None, Query()
+    ] = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[Alert]:
-    result = await session.execute(build_alerts_query(since, department, source))
+    result = await session.execute(
+        build_alerts_query(
+            since,
+            department.value if department is not None else None,
+            source,
+            level,
+            app_name,
+            severity,
+        )
+    )
     return result.scalars().all()
 
 

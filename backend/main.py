@@ -127,8 +127,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
-    # POST for /auth/login + /auth/logout; OPTIONS for the preflight. Reads stay GET.
-    allow_methods=["GET", "POST", "OPTIONS"],
+    # POST for /auth/login + /auth/logout; PATCH for marking an alert resolved;
+    # OPTIONS for the preflight.
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
     # Required so the browser sends/receives the httpOnly session cookie
     # cross-origin (dashboard :3000 → backend :8000).

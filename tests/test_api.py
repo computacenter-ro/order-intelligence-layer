@@ -64,6 +64,9 @@ class _FakeSession:
         self.statements.append(stmt)
         return self._results.pop(0)
 
+    async def commit(self):
+        pass
+
 
 @pytest.fixture(autouse=True)
 def _authenticated():
@@ -106,10 +109,8 @@ def _alert(**over) -> Alert:
         source="ai",
         explanation="explained",
         department="backend",
-        confidence=0.8,
-        # DB has server_default false / nullable, but transient instances don't
-        # trigger server defaults — set it so the fixture mirrors a persisted row.
         is_resolved=False,
+        confidence=0.8,
     )
     base.update(over)
     return Alert(**base)
@@ -150,6 +151,13 @@ def test_requires_auth(path):
     """Without a valid session, every read route is 401 — no cookie, no data."""
     app.dependency_overrides.clear()  # drop the autouse stub user for this test
     r = TestClient(app).get(path)
+    assert r.status_code == 401
+
+
+def test_resolve_alert_requires_auth():
+    """The write route sits on the same auth-guarded router as the reads."""
+    app.dependency_overrides.clear()  # drop the autouse stub user for this test
+    r = TestClient(app).patch("/alerts/a1/resolve")
     assert r.status_code == 401
 
 

@@ -1,8 +1,9 @@
-"""[5] Core Backend — read-only REST API (CLAUDE.md [5] "API").
+"""[5] Core Backend — REST API (CLAUDE.md [5] "API").
 
 Async FastAPI routes over the three tables in ``backend/db.py`` (``Alert``,
-``Journey``, ``JourneyEvent``), using the ``get_session`` dependency. The API is
-**read-only** — it never writes; journeys/alerts are produced by the consumers.
+``Journey``, ``JourneyEvent``), using the ``get_session`` dependency. Mostly
+read-only — journeys/alerts are produced by the consumers — except for the one
+manual-triage write below.
 
 Responses are Pydantic schemas (``AlertOut`` / ``JourneyOut`` /
 ``JourneyDetailOut``, defined in ``backend/schemas.py``), never the ORM models,
@@ -24,11 +25,11 @@ Endpoints:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user
@@ -47,6 +48,7 @@ def build_alerts_query(
     level: str | None = None,
     app_name: str | None = None,
     severity: str | None = None,
+    resolved: bool | None = None,
 ) -> Select:
     """Select alerts filtered by the given criteria, newest ``emitted_at`` first."""
     stmt = select(Alert)
@@ -56,6 +58,8 @@ def build_alerts_query(
         stmt = stmt.where(Alert.department == department)
     if source is not None:
         stmt = stmt.where(Alert.source == source)
+    if resolved is not None:
+        stmt = stmt.where(Alert.is_resolved == resolved)
     if level is not None:
         stmt = stmt.where(Alert.level == level)
     if app_name is not None:
@@ -91,6 +95,7 @@ async def list_alerts(
     # validated value straight through.
     department: Annotated[Department | None, Query()] = None,
     source: Annotated[Literal["ai", "fallback"] | None, Query()] = None,
+    resolved: Annotated[bool | None, Query()] = None,
     # Alerts are only ever WARN/ERROR, so the Literal rejects anything else with
     # a 422. app_name stays a free str — the set of services can grow, so an
     # unknown value should just match nothing, not be a validation error.
@@ -109,12 +114,32 @@ async def list_alerts(
             since,
             department.value if department is not None else None,
             source,
-            level,
-            app_name,
-            severity,
+            level=level,
+            app_name=app_name,
+            severity=severity,
+            resolved=resolved,
         )
     )
     return result.scalars().all()
+
+
+@router.patch("/alerts/{alert_id}/resolve", response_model=AlertOut)
+async def resolve_alert(
+    alert_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Alert:
+    stmt = (
+        update(Alert)
+        .where(Alert.alert_id == alert_id)
+        .values(is_resolved=True, resolved_at=datetime.now(timezone.utc))
+        .returning(Alert)
+    )
+    result = await session.execute(stmt)
+    alert = result.scalar_one_or_none()
+    if alert is None:
+        raise HTTPException(status_code=404, detail=f"alert {alert_id!r} not found")
+    await session.commit()
+    return alert
 
 
 @router.get("/journeys", response_model=list[JourneyOut])

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { fetchAlerts } from "@/lib/api";
+import { fetchAlerts, resolveAlert } from "@/lib/api";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
@@ -57,12 +57,16 @@ export default function AlertFeedPage() {
   useEffect(() => {
     if (!filtersReady) return;
     let stale = false;
+    // The feed only ever shows active (unresolved) alerts; resolved ones live
+    // in History (see /history). So resolved:false is always sent, alongside
+    // the active filter selection.
     fetchAlerts({
       department: filters.department === "all" ? undefined : filters.department,
       source: filters.source === "all" ? undefined : filters.source,
       level: filters.level === "all" ? undefined : filters.level,
       app_name: filters.app_name === "all" ? undefined : filters.app_name,
       severity: filters.severity === "all" ? undefined : filters.severity,
+      resolved: false,
     })
       .then((next) => {
         if (!stale) setAlerts(next);
@@ -101,6 +105,15 @@ export default function AlertFeedPage() {
     setPending([]);
   }, [pending]);
 
+  const handleResolve = useCallback((alert: ProcessedAlert) => {
+    resolveAlert(alert.alert_id)
+      .then((updated) => {
+        // Resolved alerts move to History — drop it from the live feed.
+        setAlerts((prev) => prev.filter((a) => a.alert_id !== updated.alert_id));
+      })
+      .catch((err) => console.error("Failed to resolve alert:", err));
+  }, []);
+
   const sorted = [...alerts].sort(
     (a, b) => new Date(b.emitted_at).getTime() - new Date(a.emitted_at).getTime()
   );
@@ -121,6 +134,7 @@ export default function AlertFeedPage() {
             key={alert.alert_id}
             alert={alert}
             onOpen={setSelected}
+            onResolve={handleResolve}
             isSelected={selected?.alert_id === alert.alert_id}
           />
         ))}

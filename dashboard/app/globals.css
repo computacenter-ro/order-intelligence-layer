@@ -78,3 +78,19 @@ body {
 .oil-new-alerts-banner:hover {
   box-shadow: var(--shadow-cc-md);
 }
+
+/* Filter-bar selects — hover/focus per the Forms spec (2px Heritage Blue focus
+   simulated with border + 1px ring so the control doesn't shift on focus). */
+.oil-filter-select {
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.oil-filter-select:hover {
+  border-color: var(--cc-grey-three);
+}
+
+.oil-filter-select:focus {
+  outline: none;
+  border-color: var(--cc-heritage-blue);
+  box-shadow: 0 0 0 1px var(--cc-heritage-blue);
+}

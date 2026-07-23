@@ -57,6 +57,9 @@ export interface AlertsFilter {
   since?: string;
   department?: string;
   source?: string;
+  level?: string;
+  app_name?: string;
+  severity?: string;
   resolved?: boolean;
 }
 
@@ -76,6 +79,9 @@ export function fetchAlerts(filter: AlertsFilter = {}): Promise<ProcessedAlert[]
   if (filter.since) params.set("since", filter.since);
   if (filter.department) params.set("department", filter.department);
   if (filter.source) params.set("source", filter.source);
+  if (filter.level) params.set("level", filter.level);
+  if (filter.app_name) params.set("app_name", filter.app_name);
+  if (filter.severity) params.set("severity", filter.severity);
   if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
   const query = params.toString();
   return getJson<ProcessedAlert[]>(`/alerts${query ? `?${query}` : ""}`);

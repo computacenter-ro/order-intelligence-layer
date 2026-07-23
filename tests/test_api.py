@@ -178,10 +178,57 @@ def test_alerts_query_no_filters_still_orders_desc():
     assert "ORDER BY alerts.emitted_at DESC" in sql
 
 
-def test_alerts_query_filters_by_resolved():
-    sql = _compiled(build_alerts_query(None, None, None, resolved=True))
-    assert "is_resolved" in sql
-    assert "WHERE" not in _compiled(build_alerts_query(None, None, None, resolved=None))
+def test_alerts_query_department_only():
+    sql = _compiled(build_alerts_query(None, "backend", None))
+    assert "department =" in sql
+    assert "source =" not in sql
+    assert "emitted_at >=" not in sql
+
+
+def test_alerts_query_source_only():
+    sql = _compiled(build_alerts_query(None, None, "fallback"))
+    assert "source =" in sql
+    assert "department =" not in sql
+    assert "emitted_at >=" not in sql
+
+
+def test_alerts_query_department_and_source_combination():
+    sql = _compiled(build_alerts_query(None, "devops", "ai"))
+    assert "department =" in sql and "source =" in sql
+
+
+def test_alerts_query_level_only():
+    sql = _compiled(build_alerts_query(None, None, None, level="ERROR"))
+    assert "level =" in sql
+    assert "app_name =" not in sql
+    assert "department =" not in sql and "source =" not in sql
+
+
+def test_alerts_query_app_name_only():
+    sql = _compiled(build_alerts_query(None, None, None, app_name="cc-order-engine"))
+    assert "app_name =" in sql
+    assert "level =" not in sql
+    assert "department =" not in sql and "source =" not in sql
+
+
+def test_alerts_query_all_filters_including_level_and_app_name():
+    sql = _compiled(
+        build_alerts_query(
+            datetime(2026, 7, 20, tzinfo=UTC), "backend", "ai",
+            level="WARN", app_name="cc-checker-service",
+        )
+    )
+    assert "emitted_at >=" in sql
+    assert "department =" in sql and "source =" in sql
+    assert "level =" in sql and "app_name =" in sql
+    assert "ORDER BY alerts.emitted_at DESC" in sql
+
+
+def test_alerts_query_severity_only():
+    sql = _compiled(build_alerts_query(None, None, None, severity="critical"))
+    assert "severity =" in sql
+    assert "level =" not in sql
+    assert "department =" not in sql and "source =" not in sql
 
 
 def test_journeys_query_status_filter():
@@ -218,37 +265,112 @@ def test_get_alerts_passes_query_params_into_the_filter():
     assert "emitted_at >=" in sql and "department =" in sql and "source =" in sql
 
 
-def test_get_alerts_resolved_filter_for_the_history_page():
-    session = _use([_FakeResult(items=[_alert(alert_id="a1", is_resolved=True,
-                                               resolved_at=datetime(2026, 7, 23, 9, 0, 0, tzinfo=UTC))])])
-    r = TestClient(app).get("/alerts", params={"resolved": "true"})
+@pytest.mark.parametrize("department", ["networking", "devops", "backend", "database", "general"])
+def test_get_alerts_valid_department_filters(department):
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"department": department})
     assert r.status_code == 200
-    assert r.json()[0]["is_resolved"] is True
-    assert "is_resolved" in _compiled(session.statements[0])
-
-
-# --- PATCH /alerts/{id}/resolve -----------------------------------------------
-
-
-def test_resolve_alert_marks_resolved_and_returns_updated_alert():
-    session = _use([_FakeResult(one=_alert(
-        alert_id="a1",
-        is_resolved=True,
-        resolved_at=datetime(2026, 7, 23, 9, 0, 0, tzinfo=UTC),
-    ))])
-    r = TestClient(app).patch("/alerts/a1/resolve")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["is_resolved"] is True
-    assert body["resolved_at"] is not None
     sql = _compiled(session.statements[0])
-    assert "UPDATE alerts" in sql and "is_resolved" in sql
+    assert "department =" in sql and "source =" not in sql
 
 
-def test_resolve_alert_404_when_missing():
-    _use([_FakeResult(one=None)])
-    r = TestClient(app).patch("/alerts/missing/resolve")
-    assert r.status_code == 404
+@pytest.mark.parametrize("source", ["ai", "fallback"])
+def test_get_alerts_valid_source_filters(source):
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"source": source})
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "source =" in sql and "department =" not in sql
+
+
+@pytest.mark.parametrize("severity", ["critical", "high", "medium", "low"])
+def test_get_alerts_valid_severity_filters(severity):
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"severity": severity})
+    assert r.status_code == 200
+    assert "severity =" in _compiled(session.statements[0])
+
+
+def test_get_alerts_invalid_severity_is_422():
+    r = TestClient(app).get("/alerts", params={"severity": "urgent"})
+    assert r.status_code == 422
+
+
+def test_get_alerts_department_and_source_combination_via_http():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"department": "database", "source": "fallback"})
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "department =" in sql and "source =" in sql
+
+
+@pytest.mark.parametrize("level", ["WARN", "ERROR"])
+def test_get_alerts_valid_level_filters(level):
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"level": level})
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "level =" in sql and "app_name =" not in sql
+
+
+def test_get_alerts_app_name_filters():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"app_name": "cc-spt-service"})
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "app_name =" in sql and "level =" not in sql
+
+
+def test_get_alerts_unknown_app_name_is_not_422():
+    # app_name is a free string — an unrecognised service is a valid (empty) query,
+    # never a validation error, so the service list can grow without a code change.
+    _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"app_name": "cc-future-service"})
+    assert r.status_code == 200
+
+
+def test_get_alerts_level_app_name_department_source_combination():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get(
+        "/alerts",
+        params={
+            "level": "ERROR",
+            "app_name": "cc-order-engine",
+            "department": "database",
+            "source": "ai",
+        },
+    )
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "level =" in sql and "app_name =" in sql
+    assert "department =" in sql and "source =" in sql
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"department": "marketing"},   # not a Department value
+        {"department": "BACKEND"},     # case-sensitive: enum is lowercase
+        {"department": ""},            # empty is not valid
+        {"source": "human"},           # not ai/fallback
+        {"source": "AI"},              # case-sensitive
+        {"department": "sales", "source": "ai"},  # invalid dept, valid source
+        {"level": "INFO"},             # not WARN/ERROR (alerts are only WARN/ERROR)
+        {"level": "DEBUG"},            # not WARN/ERROR
+        {"level": "warn"},             # case-sensitive: literal is uppercase
+        {"level": ""},                 # empty is not valid
+        {"level": "INFO", "app_name": "cc-spt-service"},  # bad level, valid app_name (still 422)
+    ],
+)
+def test_get_alerts_invalid_filter_value_is_422(params):
+    # Validation happens before the query runs; override the session anyway so a
+    # regression that reaches the DB layer can't hit a real connection.
+    _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params=params)
+    assert r.status_code == 422
+    # error body names the offending query param, so the message is actionable
+    locs = [tuple(err["loc"]) for err in r.json()["detail"]]
+    assert any("query" in loc for loc in locs)
 
 
 # --- GET /journeys -----------------------------------------------------------

@@ -49,8 +49,20 @@ def _journey_completed_event(**over) -> dict:
     return {"type": "journey.completed", "data": data}
 
 
-def _fields(card: dict) -> dict:
-    return {f["name"]: f["value"] for f in card["fields"]}
+def _content(card: dict) -> dict:
+    """The AdaptiveCard content out of the ``message`` envelope."""
+    return card["attachments"][0]["content"]
+
+
+def _facts(card: dict) -> dict:
+    for block in _content(card)["body"]:
+        if block.get("type") == "FactSet":
+            return {f["title"]: f["value"] for f in block["facts"]}
+    return {}
+
+
+def _text_blocks(card: dict) -> list[str]:
+    return [b["text"] for b in _content(card)["body"] if b.get("type") == "TextBlock"]
 
 
 # --- channel_for (pure routing) ----------------------------------------------
@@ -83,46 +95,78 @@ def test_channel_for_unknown_type_is_none():
 # --- build_card (pure) -------------------------------------------------------
 
 
+def test_build_card_is_message_envelope_with_adaptive_card():
+    card = build_card(_alert_event())
+    assert card["type"] == "message"
+    attachment = card["attachments"][0]
+    assert attachment["contentType"] == "application/vnd.microsoft.card.adaptive"
+    assert attachment["content"]["type"] == "AdaptiveCard"
+    assert attachment["content"]["version"] == "1.4"
+
+
 def test_build_card_ai_alert(monkeypatch):
     monkeypatch.setenv("DASHBOARD_URL", "https://dash.example.com")
     card = build_card(_alert_event())
-    assert card["badge"] == "AI"
-    assert "ERROR" in card["title"]
-    fields = _fields(card)
-    assert fields["Service"] == "cc-spt-service"
-    assert fields["Explanation"] == "SPT pricing service was unreachable"
-    assert fields["Confidence"] == "0.82"
-    assert fields["Order"] == "ORD-1"
-    assert card["link"].endswith("J1")  # journey link preferred
+    texts = _text_blocks(card)
+    # title = event type + service
+    assert "alert.new · cc-spt-service" in texts
+    assert "AI-analyzed" in texts  # badge
+    assert "SPT pricing service was unreachable" in texts  # explanation
+    facts = _facts(card)
+    assert facts["Level"] == "ERROR"
+    assert facts["Department"] == "backend"
+    assert facts["Confidence"] == "0.82"
+    assert facts["Order"] == "ORD-1"
+    assert facts["Event"] == "evt-1"
+    assert facts["Cart"] == "C1"
+    # journey link preferred
+    action = _content(card)["actions"][0]
+    assert action["type"] == "Action.OpenUrl"
+    assert action["title"] == "View journey"
+    assert action["url"].endswith("J1")
+
+
+def test_build_card_badge_and_text_differ_between_ai_and_fallback():
+    ai = build_card(_alert_event(source="ai"))
+    fb = build_card(_alert_event(source="fallback", explanation=None,
+                                 department=None, confidence=None))
+    # badge differs
+    assert "AI-analyzed" in _text_blocks(ai)
+    assert "AI-analyzed" not in _text_blocks(fb)
+    assert "fallback" in _text_blocks(fb)
+    # text differs
+    assert "SPT pricing service was unreachable" in _text_blocks(ai)
+    assert "unprocessed — LLM unavailable" in _text_blocks(fb)
 
 
 def test_build_card_fallback_alert_uses_placeholder_explanation():
     card = build_card(_alert_event(source="fallback", explanation=None,
                                    department=None, confidence=None))
-    assert card["badge"] == "fallback"
-    assert _fields(card)["Explanation"] == "unprocessed — LLM unavailable"
-    # no confidence field when it is null
-    assert "Confidence" not in _fields(card)
+    assert "fallback" in _text_blocks(card)
+    assert "unprocessed — LLM unavailable" in _text_blocks(card)
+    # no confidence fact when it is null
+    assert "Confidence" not in _facts(card)
 
 
 def test_build_card_journey_completed(monkeypatch):
     monkeypatch.setenv("DASHBOARD_URL", "https://dash.example.com/")
     card = build_card(_journey_completed_event())
-    assert "SUCCESS" in card["title"]
-    fields = _fields(card)
-    assert fields["Explanation"] == "Order flowed end to end."  # summary
-    assert card["link"] == "https://dash.example.com/journeys/J1"
+    texts = _text_blocks(card)
+    assert "journey.completed" in texts[0]  # title
+    assert "Order flowed end to end." in texts  # summary as body text
+    assert _facts(card)["Level"] == "SUCCESS"  # outcome
+    assert _content(card)["actions"][0]["url"] == "https://dash.example.com/journeys/J1"
 
 
-def test_build_card_link_none_without_dashboard_url(monkeypatch):
+def test_build_card_no_action_without_dashboard_url(monkeypatch):
     monkeypatch.delenv("DASHBOARD_URL", raising=False)
-    assert build_card(_alert_event())["link"] is None
+    assert "actions" not in _content(build_card(_alert_event()))
 
 
 def test_build_card_link_falls_back_to_order_id(monkeypatch):
     monkeypatch.setenv("DASHBOARD_URL", "https://d")
     card = build_card(_journey_completed_event(journey_id=None, order_id="ORD-9"))
-    assert card["link"].endswith("ORD-9")
+    assert _content(card)["actions"][0]["url"].endswith("ORD-9")
 
 
 # --- notify (I/O, faked) -----------------------------------------------------

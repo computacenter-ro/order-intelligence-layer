@@ -122,6 +122,9 @@ services:
     image: oil-app
     restart: on-failure          # same RabbitMQ startup-race guard as mock-services
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - path: .env          # TEAMS_WEBHOOK_* / DASHBOARD_URL for Teams notifications
+        required: false     # optional: stdout fallback when absent (e.g. CI/teammates)
     ports:
       - "8000:8000"
     environment:

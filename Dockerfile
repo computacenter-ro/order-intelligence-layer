@@ -17,7 +17,7 @@ WORKDIR /app
 
 # Install deps first so the layer caches across code-only changes.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=120 --retries 10 -r requirements.txt
 
 # Then the source (everything not excluded by .dockerignore).
 COPY . .

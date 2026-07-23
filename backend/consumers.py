@@ -30,6 +30,10 @@ fakes — no broker and no database required.
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv(override=False)  # .env → os.getenv (TEAMS_WEBHOOK_* / DASHBOARD_URL)
+
 import os
 
 import aio_pika

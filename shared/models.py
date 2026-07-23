@@ -84,6 +84,20 @@ class Department(str, Enum):
     general = "general"
 
 
+class Severity(str, Enum):
+    """Per-log technical severity, judged by the router LLM from the log alone.
+
+    A relative ranking of how urgent this single WARN/ERROR is for an IT-support
+    engineer — NOT business impact (the log doesn't carry that). ``None`` on a
+    ``ProcessedAlert`` means fallback (LLM down), exactly like department.
+    """
+
+    critical = "critical"
+    high = "high"
+    medium = "medium"
+    low = "low"
+
+
 class ProcessedAlert(BaseModel):
     """Contract on the `processed.alerts` queue."""
 
@@ -94,5 +108,6 @@ class ProcessedAlert(BaseModel):
     log: LogLine
     explanation: str | None
     department: Department | None
+    severity: Severity | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     source: Literal["ai", "fallback"]

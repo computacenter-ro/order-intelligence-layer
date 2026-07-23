@@ -81,6 +81,7 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
         "account_number": log.accountNumber,
         "explanation": alert.explanation,
         "department": alert.department.value if alert.department is not None else None,
+        "severity": alert.severity.value if alert.severity is not None else None,
         "confidence": alert.confidence,
         "source": alert.source,
     }

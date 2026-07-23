@@ -2,9 +2,10 @@ import { Card } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
-import { levelLabel, formatTime, capitalize } from "@/lib/format";
+import { SeverityPill } from "@/components/ui/SeverityPill";
+import { formatTime, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
-import type { BadgeStatus, ProcessedAlert } from "@/lib/types";
+import type { ProcessedAlert } from "@/lib/types";
 
 interface AlertCardProps {
   alert: ProcessedAlert;
@@ -17,7 +18,7 @@ const FALLBACK_EXPLANATION =
 
 export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps) {
   const isFallback = alert.source === "fallback";
-  const levelStatus: BadgeStatus = alert.level === "ERROR" ? "error" : "warning";
+
   const accentColor = isFallback
     ? "var(--cc-grey-four)"
     : alert.level === "ERROR"
@@ -45,7 +46,7 @@ export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps)
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
-          <Badge status={levelStatus}>{levelLabel(alert.level)}</Badge>
+          <SeverityPill level={alert.level} severity={alert.severity} />
           <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: "12px", color: "var(--cc-grey-two)" }}>
             {alert.app_name}
           </span>

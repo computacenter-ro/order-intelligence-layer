@@ -26,7 +26,7 @@ from ai_service.graph import PipelineDeps, process
 from ai_service.llm import LLMError
 from ai_service.nodes import route
 from ai_service.publisher import Publisher
-from shared.models import Department, LogLine, ProcessedAlert
+from shared.models import Department, LogLine, ProcessedAlert, Severity
 
 
 # Manual wide/live test of the whole top-of-stack (real infra, LLM in fallback),
@@ -250,7 +250,7 @@ def _healthy_deps() -> PipelineDeps:
     return PipelineDeps(
         breaker=_breaker(FakeRedis(), FakeClock()),
         explainer=_fake("SPT pricing service was unreachable; the order engine could not price the order."),
-        router=_fake('{"department": "backend", "confidence": 0.82}'),
+        router=_fake('{"department": "backend", "severity": "high", "confidence": 0.82}'),
     )
 
 
@@ -260,6 +260,7 @@ async def test_pipeline_ai_alert_on_healthy_llm():
     assert alert.source == "ai"
     assert alert.explanation and "SPT" in alert.explanation
     assert alert.department == Department.backend
+    assert alert.severity == Severity.high
     assert alert.confidence == 0.82
     assert alert.log.log_id == "log-1"
     assert alert.emitted_at.tzinfo is not None  # tz-aware UTC
@@ -277,26 +278,54 @@ async def test_router_rejects_unknown_department():
     import pytest
 
     with pytest.raises(LLMError):
-        await route(_log(), "explained", _fake('{"department": "frontend", "confidence": 0.9}'))
+        await route(
+            _log(), "explained",
+            _fake('{"department": "frontend", "severity": "high", "confidence": 0.9}'),
+        )
 
 
 async def test_router_accepts_all_five_departments():
     for dept in Department:
-        d, c = await route(_log(), "x", _fake(f'{{"department": "{dept.value}", "confidence": 0.5}}'))
+        d, s, c = await route(
+            _log(), "x",
+            _fake(f'{{"department": "{dept.value}", "severity": "medium", "confidence": 0.5}}'),
+        )
         assert d == dept
 
 
 async def test_router_tolerates_code_fence_and_prose():
-    d, c = await route(
+    d, s, c = await route(
         _log(), "x",
-        _fake('Here you go:\n```json\n{"department": "database", "confidence": 0.7}\n```'),
+        _fake('Here you go:\n```json\n{"department": "database", "severity": "low", "confidence": 0.7}\n```'),
     )
     assert d == Department.database and c == 0.7
 
 
 async def test_router_clamps_out_of_range_confidence():
-    d, c = await route(_log(), "x", _fake('{"department": "devops", "confidence": 5}'))
+    d, s, c = await route(
+        _log(), "x", _fake('{"department": "devops", "severity": "high", "confidence": 5}')
+    )
     assert c == 1.0
+
+
+# --- severity: validated against the enum, threaded onto the alert -----------
+async def test_router_accepts_all_severities():
+    for sev in Severity:
+        d, s, c = await route(
+            _log(), "x",
+            _fake(f'{{"department": "backend", "severity": "{sev.value}", "confidence": 0.5}}'),
+        )
+        assert s == sev
+
+
+async def test_router_rejects_unknown_severity():
+    import pytest
+
+    with pytest.raises(LLMError):
+        await route(
+            _log(), "x",
+            _fake('{"department": "backend", "severity": "apocalyptic", "confidence": 0.9}'),
+        )
 
 
 # --- fallback paths: source="fallback", all null -----------------------------
@@ -304,6 +333,7 @@ def _assert_fallback(alert):
     assert alert.source == "fallback"
     assert alert.explanation is None
     assert alert.department is None
+    assert alert.severity is None
     assert alert.confidence is None
 
 
@@ -316,7 +346,7 @@ async def test_pipeline_fallback_when_breaker_open():
     b = _breaker(FakeRedis(), FakeClock())
     for _ in range(3):
         await b.record_failure()  # force open
-    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","confidence":0.5}'))
+    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","severity":"low","confidence":0.5}'))
     _assert_fallback(await process(_log(), deps))
 
 
@@ -369,6 +399,7 @@ def _alert(source: str = "fallback") -> ProcessedAlert:
         log=_log(),
         explanation=None if source == "fallback" else "explained",
         department=None if source == "fallback" else Department.backend,
+        severity=None if source == "fallback" else Severity.high,
         confidence=None if source == "fallback" else 0.7,
         source=source,
     )
@@ -403,6 +434,7 @@ async def test_publish_alert_routes_processedalertjson_to_processed_alerts():
     assert routing_key == "processed.alerts"
     payload = json.loads(body)
     assert payload["source"] == "ai" and payload["department"] == "backend"
+    assert payload["severity"] == "high"
     # the full original log travels inside the alert
     assert payload["log"]["log_id"] == "log-1"
 
@@ -720,7 +752,7 @@ async def test_raw_events_published_before_alert_llm_runs():
     deps = PipelineDeps(
         breaker=_breaker(redis, FakeClock()),
         explainer=_BlockingModel(),
-        router=_fake('{"department": "backend", "confidence": 0.5}'),
+        router=_fake('{"department": "backend", "severity": "medium", "confidence": 0.5}'),
     )
     poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
     poller.fetch_logs = lambda f, t: _async(logs)  # type: ignore[method-assign]

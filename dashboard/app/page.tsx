@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { fetchAlerts } from "@/lib/api";
+import { fetchAlerts, resolveAlert } from "@/lib/api";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
@@ -14,7 +14,9 @@ export default function AlertFeedPage() {
   const [selected, setSelected] = useState<ProcessedAlert | null>(null);
 
   useEffect(() => {
-    fetchAlerts()
+    // Resolved alerts live in History (see /history) — the feed only ever
+    // shows active (unresolved) alerts.
+    fetchAlerts({ resolved: false })
       .then(setAlerts)
       .catch((err) => console.error("Failed to load alerts:", err));
   }, []);
@@ -37,6 +39,15 @@ export default function AlertFeedPage() {
     setPending([]);
   }, [pending]);
 
+  const handleResolve = useCallback((alert: ProcessedAlert) => {
+    resolveAlert(alert.alert_id)
+      .then((updated) => {
+        // Resolved alerts move to History — drop it from the live feed.
+        setAlerts((prev) => prev.filter((a) => a.alert_id !== updated.alert_id));
+      })
+      .catch((err) => console.error("Failed to resolve alert:", err));
+  }, []);
+
   const sorted = [...alerts].sort(
     (a, b) => new Date(b.emitted_at).getTime() - new Date(a.emitted_at).getTime()
   );
@@ -56,6 +67,7 @@ export default function AlertFeedPage() {
             key={alert.alert_id}
             alert={alert}
             onOpen={setSelected}
+            onResolve={handleResolve}
             isSelected={selected?.alert_id === alert.alert_id}
           />
         ))}

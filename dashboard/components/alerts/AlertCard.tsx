@@ -1,5 +1,6 @@
 import { Card } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
+import { AlertActionsMenu } from "@/components/alerts/AlertActionsMenu";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
@@ -10,13 +11,14 @@ import type { ProcessedAlert } from "@/lib/types";
 interface AlertCardProps {
   alert: ProcessedAlert;
   onOpen: (alert: ProcessedAlert) => void;
+  onResolve: (alert: ProcessedAlert) => void;
   isSelected?: boolean;
 }
 
 const FALLBACK_EXPLANATION =
   "Unprocessed — LLM unavailable. Raw log passed straight through; no explanation or routing.";
 
-export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps) {
+export function AlertCard({ alert, onOpen, onResolve, isSelected = false }: AlertCardProps) {
   const isFallback = alert.source === "fallback";
 
   const accentColor = isFallback
@@ -53,6 +55,10 @@ export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps)
           <span style={{ marginLeft: "auto", fontSize: "12px", color: "var(--cc-grey-three)" }}>
             {formatTime(alert.emitted_at)}
           </span>
+          <AlertActionsMenu
+            isResolved={alert.is_resolved}
+            onResolve={() => onResolve(alert)}
+          />
         </div>
         <p
           style={{

@@ -57,6 +57,18 @@ export interface AlertsFilter {
   since?: string;
   department?: string;
   source?: string;
+  resolved?: boolean;
+}
+
+/** Mark an alert resolved; returns the updated alert. */
+export async function resolveAlert(alertId: string): Promise<ProcessedAlert> {
+  const res = await fetch(`${API_URL}/alerts/${encodeURIComponent(alertId)}/resolve`, {
+    method: "PATCH",
+    credentials: "include",
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`resolveAlert failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<ProcessedAlert>;
 }
 
 export function fetchAlerts(filter: AlertsFilter = {}): Promise<ProcessedAlert[]> {
@@ -64,6 +76,7 @@ export function fetchAlerts(filter: AlertsFilter = {}): Promise<ProcessedAlert[]
   if (filter.since) params.set("since", filter.since);
   if (filter.department) params.set("department", filter.department);
   if (filter.source) params.set("source", filter.source);
+  if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
   const query = params.toString();
   return getJson<ProcessedAlert[]>(`/alerts${query ? `?${query}` : ""}`);
 }

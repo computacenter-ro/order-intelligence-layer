@@ -18,6 +18,8 @@ export interface LogLine {
 
 export type Department = "networking" | "devops" | "backend" | "database" | "general";
 
+export type Severity = "critical" | "high" | "medium" | "low";
+
 // Mirrors backend/schemas.py AlertOut exactly — flat, snake_case ids, no
 // host/process_id/thread/timestamp (the alerts table never stores them).
 export interface ProcessedAlert {
@@ -34,12 +36,12 @@ export interface ProcessedAlert {
   account_number: string | null;
   explanation: string | null;
   department: Department | null;
+  severity: Severity | null;
   confidence: number | null;
   source: "ai" | "fallback";
   journey_id: string | null;
   is_resolved: boolean;
   resolved_at: string | null;
-  severity_score: number | null;
 }
 
 export type JourneyStatus = "IN_PROGRESS" | "SUCCESS" | "FAILED" | "TIMED_OUT";

@@ -3,7 +3,8 @@ import Link from "next/link";
 import { XIcon } from "@phosphor-icons/react";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
-import { levelLabel, formatTime, capitalize } from "@/lib/format";
+import { SeverityPill } from "@/components/ui/SeverityPill";
+import { formatTime, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
@@ -104,8 +105,11 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
         <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
           {alert.app_name}
         </div>
-        <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginBottom: "8px" }}>
-          {levelLabel(alert.level)} · {formatTime(alert.emitted_at)}
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+          <SeverityPill level={alert.level} severity={alert.severity} />
+          <span style={{ fontSize: "14px", color: "var(--cc-grey-three)" }}>
+            {formatTime(alert.emitted_at)}
+          </span>
         </div>
 
         <SectionLabel>Explanation</SectionLabel>

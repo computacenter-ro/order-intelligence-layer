@@ -22,9 +22,10 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai_service.llm import LLMError
-from shared.models import Department, LogLine
+from shared.models import Department, LogLine, Severity
 
 _DEPARTMENTS = ", ".join(d.value for d in Department)
+_SEVERITIES = ", ".join(s.value for s in Severity)
 
 _EXPLAIN_SYSTEM = (
     "You are an assistant for an IT-support engineer triaging logs from an "
@@ -35,9 +36,16 @@ _EXPLAIN_SYSTEM = (
 )
 
 _ROUTE_SYSTEM = (
-    "You route an IT-support alert to exactly one team. Choose from these "
-    f"departments ONLY: {_DEPARTMENTS}. Reply with a single JSON object: "
-    '{"department": "<one of the list>", "confidence": <0..1>}. '
+    "You triage an IT-support alert for an order-management pipeline. Do two "
+    "things for the single WARN/ERROR log line:\n"
+    f"1. Route it to exactly one team. Choose from these departments ONLY: "
+    f"{_DEPARTMENTS}.\n"
+    f"2. Rate its technical severity as one of: {_SEVERITIES}. Judge how urgent "
+    "THIS log is on its own (an ERROR that aborts or dead-letters an order is "
+    "more severe than a benign/retryable WARN). Base it on the log only; do not "
+    "consider business impact you cannot see.\n"
+    'Reply with a single JSON object: {"department": "<one of the list>", '
+    '"severity": "<one of the list>", "confidence": <0..1>}. '
     "No prose, no code fence."
 )
 
@@ -77,11 +85,12 @@ async def explain(log: LogLine, model: BaseChatModel | None) -> str:
 
 async def route(
     log: LogLine, explanation: str, model: BaseChatModel | None
-) -> tuple[Department, float]:
-    """LLM call 2. Returns (department, confidence); raises LLMError otherwise.
+) -> tuple[Department, Severity, float]:
+    """LLM call 2. Returns (department, severity, confidence); raises LLMError otherwise.
 
-    The department is validated against the :class:`Department` enum — an answer
-    outside the five values is an LLMError, never a silent wrong route.
+    Both the department and the severity are validated against their enums — an
+    answer outside the allowed values is an LLMError, never a silent wrong
+    route/rating.
     """
     if model is None:
         raise LLMError("no router model configured")
@@ -121,11 +130,12 @@ async def summarize_journey(
     return text
 
 
-def _parse_route(text: str) -> tuple[Department, float]:
-    """Parse the router's JSON reply into a valid (Department, confidence).
+def _parse_route(text: str) -> tuple[Department, Severity, float]:
+    """Parse the router's JSON reply into a valid (Department, Severity, confidence).
 
     Tolerant of a stray code fence / surrounding prose (grabs the first {...}).
-    Raises LLMError if the department isn't one of the five or JSON is unusable.
+    Raises LLMError if the department or severity isn't one of the allowed values
+    or the JSON is unusable.
     """
     raw = text.strip()
     start, end = raw.find("{"), raw.rfind("}")
@@ -142,8 +152,14 @@ def _parse_route(text: str) -> tuple[Department, float]:
     except ValueError as exc:
         raise LLMError(f"router chose an unknown department: {dept_str!r}") from exc
 
+    sev_str = str(data.get("severity", "")).strip().lower()
+    try:
+        severity = Severity(sev_str)
+    except ValueError as exc:
+        raise LLMError(f"router chose an unknown severity: {sev_str!r}") from exc
+
     confidence = _clamp_confidence(data.get("confidence"))
-    return department, confidence
+    return department, severity, confidence
 
 
 def _clamp_confidence(value: object) -> float:

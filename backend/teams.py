@@ -117,11 +117,13 @@ def build_card(event: dict) -> dict:
     if text:
         body.append({"type": "TextBlock", "text": text, "wrap": True})
 
-    # FactSet: level|outcome, department, confidence, order/event/cart ids.
+    # FactSet: level|outcome, severity, department, confidence, order/event/cart ids.
     facts: list[dict] = []
     status = data.get("level") or data.get("outcome")
     if status:
         facts.append({"title": "Level", "value": str(status)})
+    if data.get("severity"):
+        facts.append({"title": "Severity", "value": str(data["severity"]).capitalize()})
     if data.get("department"):
         facts.append({"title": "Department", "value": str(data["department"])})
     if data.get("confidence") is not None:

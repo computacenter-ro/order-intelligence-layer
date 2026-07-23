@@ -5,9 +5,10 @@ import { useRouter, usePathname } from "next/navigation";
 import Image from "next/image";
 import { SideNav } from "@computacenter-ro/style-guide/components";
 import type { BaseNavItem, SideNavItem } from "@computacenter-ro/style-guide/components";
-import { BellIcon, MapTrifoldIcon } from "@phosphor-icons/react";
+import { BellIcon, MapTrifoldIcon, SignOutIcon } from "@phosphor-icons/react";
 import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
 import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-mark.png";
+import { useAuth } from "@/lib/auth";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
 
@@ -18,6 +19,7 @@ interface AppShellProps {
 export function AppShell({ children }: AppShellProps) {
   const router = useRouter();
   const pathname = usePathname();
+  const { user, logout } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
@@ -49,6 +51,59 @@ export function AppShell({ children }: AppShellProps) {
     router.push(item.href);
   };
 
+  // Bottom user + logout row. Logout is destructive-ish (ends the session) but
+  // not data-destructive, so it uses the standard interactive treatment; the
+  // sign-out icon carries the meaning per the icon rules (never decorative).
+  const footer = (
+    <button
+      type="button"
+      onClick={() => {
+        void logout();
+      }}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        width: "100%",
+        padding: "8px 12px",
+        background: "transparent",
+        border: "none",
+        borderRadius: "8px",
+        color: "var(--cc-cloud-white)",
+        fontSize: "14px",
+        fontWeight: 500,
+        cursor: "pointer",
+      }}
+      aria-label={`Sign out${user ? ` (${user.username})` : ""}`}
+    >
+      <SignOutIcon size={20} />
+      <span>Sign Out{user ? ` · ${user.username}` : ""}</span>
+    </button>
+  );
+
+  const collapsedFooter = (
+    <button
+      type="button"
+      onClick={() => {
+        void logout();
+      }}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: "100%",
+        padding: "12px",
+        background: "transparent",
+        border: "none",
+        color: "var(--cc-cloud-white)",
+        cursor: "pointer",
+      }}
+      aria-label="Sign out"
+    >
+      <SignOutIcon size={20} />
+    </button>
+  );
+
   return (
     <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
       <SideNav
@@ -65,6 +120,8 @@ export function AppShell({ children }: AppShellProps) {
         collapsed={collapsed}
         onCollapse={handleCollapse}
         onItemClick={handleItemClick}
+        footer={footer}
+        collapsedFooter={collapsedFooter}
       />
       <main
         style={{

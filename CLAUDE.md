@@ -447,11 +447,41 @@ journey_events(journey_id FK, log_id UNIQUE, ts, raw JSONB)
 
 ### API
 ```
-GET  /alerts?since=&department=&source=
-GET  /journeys?status=
-GET  /journeys/{id}                     # journey + its events + summary
-WS   /ws                                # alert.new | journey.updated | journey.completed
+POST /auth/login                        # {username,password} -> sets httpOnly session cookie
+POST /auth/logout                       # clears the cookie
+GET  /auth/me                           # current user (401 if no valid session) — the frontend guard
+GET  /alerts?since=&department=&source= # 🔒 requires session
+GET  /journeys?status=                  # 🔒 requires session
+GET  /journeys/{id}                     # 🔒 journey + its events + summary
+WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
 ```
+
+### Auth (`auth.py`) — Phase 1: single hardcoded admin
+Two deliberately separated layers so later auth methods are cheap:
+- **Verification** (swappable): `authenticate()` matches ONE env-configured admin
+  (`ADMIN_USERNAME` + bcrypt `ADMIN_PASSWORD_HASH`; dev default `admin`/`admin`).
+- **Session** (stable seam): `issue_token()` mints a signed JWT carried in an
+  **httpOnly `oil_session` cookie**; `get_current_user` (a FastAPI dependency)
+  verifies it and guards every read route (declared once at the `api.py` router
+  level). The `/ws` handshake authenticates with the same cookie (browsers can't
+  set WS headers) — `?token=` fallback for non-browser clients; a bad/absent
+  token closes with code 1008 before the client is registered.
+
+Magic-link / SSO later = new login endpoints that mint the *same* JWT via
+`issue_token` and set the *same* cookie via `set_auth_cookie` — `get_current_user`,
+every guarded route, the WS check, and the frontend guard stay untouched. Don't
+put auth-method specifics in the JWT payload; keep it identity + expiry.
+
+Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `JWT_SECRET` (≥32 bytes in
+deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS).
+The dev-run scripts (injector, replay) POST to the collector/RabbitMQ — NOT this
+API — so they are unaffected by auth. `passlib` needs `bcrypt<4.1` (pinned).
+
+Dashboard: `lib/auth.tsx` (`AuthProvider` calls `/auth/me` on load) +
+`components/auth/AuthGate.tsx` (renders `LoginScreen` when anonymous, the app
+when authenticated) + a logout control in the side-nav footer. All API/WS calls
+use `credentials:"include"` so the cookie flows cross-origin (:3000 → :8000);
+backend CORS sets `allow_credentials=True` and allows `POST`/`OPTIONS`.
 
 ### Teams (`teams.py`)
 > **Deliberate deviation from the original spec.** The original design called for

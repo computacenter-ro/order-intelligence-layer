@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import get_current_user
 from backend.db import Alert, Journey, JourneyEvent, get_session
 from backend.schemas import AlertOut, JourneyDetailOut, JourneyEventOut, JourneyOut
 
@@ -59,7 +60,11 @@ def build_journeys_query(status: str | None) -> Select:
 
 # --- routes ------------------------------------------------------------------
 
-router = APIRouter()
+# Router-level auth: every read route requires a valid session (get_current_user
+# raises 401 otherwise). Declared once here so no endpoint can be added
+# unguarded by accident. The scripts/injector paths don't hit this API, so dev
+# flow replay is unaffected.
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 @router.get("/alerts", response_model=list[AlertOut])

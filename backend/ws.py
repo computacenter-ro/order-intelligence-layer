@@ -16,7 +16,9 @@ with ``type`` one of ``alert.new`` / ``journey.updated`` / ``journey.completed``
 
 from __future__ import annotations
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+
+from backend.auth import COOKIE_NAME, decode_token
 
 # --- event envelope ----------------------------------------------------------
 
@@ -76,13 +78,34 @@ manager = ConnectionManager()
 router = APIRouter()
 
 
+def _ws_session_token(websocket: WebSocket) -> str | None:
+    """Extract the session token from the handshake.
+
+    Browsers can't set custom headers on a WS upgrade, so the httpOnly session
+    cookie (sent automatically) is the primary source; ``?token=`` is a fallback
+    for non-browser clients. Returns None when neither is present.
+    """
+    cookie = websocket.cookies.get(COOKIE_NAME)
+    if cookie:
+        return cookie
+    return websocket.query_params.get("token")
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    """Register the client, then keep the socket open until it disconnects.
+    """Authenticate, register the client, then keep the socket open until it
+    disconnects.
 
-    The server only pushes (via :meth:`ConnectionManager.broadcast`); inbound
-    frames are read solely to detect the disconnect, then discarded.
+    The WS carries the same alert/journey data as the REST API, so it enforces
+    the same session: a missing/invalid token closes the handshake with policy
+    code 1008 before the client is registered. The server only pushes (via
+    :meth:`ConnectionManager.broadcast`); inbound frames are read solely to
+    detect the disconnect, then discarded.
     """
+    token = _ws_session_token(websocket)
+    if token is None or decode_token(token) is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     await manager.connect(websocket)
     try:
         while True:

@@ -25,6 +25,11 @@ alembic>=1.13                    # DB migrations
 # --- HTTP client ---
 httpx>=0.27                      # log_client (services → collector), poller, Slack webhooks
 
+# --- Auth (backend) ---
+pyjwt>=2.8                       # sign/verify the session JWT (login → cookie → get_current_user)
+passlib[bcrypt]>=1.7             # bcrypt password hashing for the hardcoded admin user
+bcrypt<4.1                       # pinned: passlib 1.7.x is incompatible with bcrypt 4.1+/5.x
+
 # --- Testing ---
 pytest>=8.2
 pytest-asyncio>=0.23

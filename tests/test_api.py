@@ -25,6 +25,7 @@ from sqlalchemy.dialects import postgresql
 from backend.main import app
 from backend.db import get_session, Alert, Journey, JourneyEvent
 from backend.api import build_alerts_query, build_journeys_query
+from backend.auth import get_current_user
 
 UTC = timezone.utc
 
@@ -65,7 +66,13 @@ class _FakeSession:
 
 
 @pytest.fixture(autouse=True)
-def _clear_overrides():
+def _authenticated():
+    """Every read route requires a session (get_current_user). These tests
+    assert the *query/serialization* contract, not auth, so we satisfy the
+    dependency with a stub user. The "auth is actually enforced" contract is
+    covered separately in test_requires_auth below (which clears this override).
+    """
+    app.dependency_overrides[get_current_user] = lambda: "test-user"
     yield
     app.dependency_overrides.clear()
 
@@ -130,6 +137,17 @@ def _event(**over) -> JourneyEvent:
     )
     base.update(over)
     return JourneyEvent(**base)
+
+
+# --- auth enforcement --------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/alerts", "/journeys", "/journeys/J1"])
+def test_requires_auth(path):
+    """Without a valid session, every read route is 401 — no cookie, no data."""
+    app.dependency_overrides.clear()  # drop the autouse stub user for this test
+    r = TestClient(app).get(path)
+    assert r.status_code == 401
 
 
 # --- query builders (pure; asserted via compiled SQL) ------------------------

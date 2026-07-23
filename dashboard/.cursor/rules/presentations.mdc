@@ -1,0 +1,95 @@
+---
+description: Computacenter brand rules for slide decks / presentations. Auto-applied when editing presentation HTML. Self-contained interactive deck, CC application palette, Albert Sans, fluid slide type scale, vote-then-reveal activities, keyboard nav.
+globs:
+  - "**/*presentation*.html"
+  - "**/*deck*.html"
+  - "**/*slides*.html"
+  - "**/*course*.html"
+alwaysApply: false
+---
+
+# Computacenter Presentation Guidelines
+
+For full rules read `.claude/skills/cc-presentations/SKILL.md` and start from
+`docs/presentation-template.html` (or `node_modules/@computacenter-ro/style-guide/docs/presentation-template.html`).
+Duplicate the template — never start a CC deck from a blank file. These notes are a quick reference only.
+
+## Absolute rules
+
+- **Output:** one self-contained `.html` — fonts embedded (base64), CSS/JS inline, no external requests, opens full-screen with no build.
+- **No raw hex in slide markup.** Every colour is a `var(--cc-*)` token. Never pure white (`#fff`) — use Cloud White `#FAFAFF`.
+- **Albert Sans only** for text; **JetBrains Mono only** for code. No other fonts, no Google Fonts CDN.
+
+## Palette (application palette — exact)
+
+| Token | Hex | Use |
+|---|---|---|
+| Heritage Blue | `#0D21A0` | Headings on light, links, stat numbers, emphasis |
+| Foundation Blue | `#011749` | Dark slide background |
+| Horizon Blue | `#49ABEB` | Kickers, heading accents, progress bar — never body text |
+| Cloud White | `#FAFAFF` | Light background, text on dark |
+| United Red `#F12938` · Circuit Green `#54C664` · Fibre Orange `#FF7900` · Neural Purple `#8459E2` · Voltage Yellow `#EABE42` | accents — small highlights & badges only |
+
+Greys: `#2A2A2B` `#494B4D` `#8C8D8F` `#C3C7CC` `#D6DCE3` `#EDF2F8`.
+
+- Heritage Blue never on Foundation Blue (invisible). On dark slides accent with Horizon Blue / Cloud White.
+- Accent colours stay small. Decorative blue gradients allowed on title/section/takeaway slides only.
+
+## Fixed-canvas layout (the deck scales as a whole)
+
+Slides are authored on a **fixed 1280×720 stage**; a `fit()` helper scales the whole stage uniformly
+to fit the viewport and centres it (letterbox bars in Foundation Blue). The deck renders identically —
+just larger — on a laptop, projector, or 4K TV. Keep each slide's content inside the 1280×720 frame;
+if it overflows, trim content rather than shrinking type. Slide padding `60px 96px`.
+
+## Type scale (fixed px on the 1280×720 canvas — larger than the app UI scale; do not use the app scale on slides)
+
+Display `84px` 700 · H1 `58px` 700 · H2 `40px` 700 · H3 `26px` 600 · Body `21px` 400 · Kicker 14px 600 uppercase.
+
+Never use `vw`/`clamp()` for slide type — those cap on large screens and leave TVs under-filled, which
+the fixed canvas exists to prevent.
+
+Sentence case for headings/body; Title Case only for buttons/CTAs; ALL CAPS only for kickers and KPI labels.
+One idea per slide, ≤ ~6 lines of body.
+
+## Visual variety & contrast (UX review — the most common failure)
+
+Generated decks most often fail by looking **empty / no point of interest** — e.g. a white slide
+with white cards whose border barely shows (worst on a big screen). Fix with contrast and colour:
+
+- Don't make everything one mode — alternate light and dark/gradient slides; mode can also group/separate sections to avoid monotony.
+- Never put a same-colour card on a same-colour slide. On **light** slides use `.card.solid` (deep-blue fill, white text) or `.card.accent` (soft blue); on **dark/gradient** slides use `.card.invert` (white fill, dark text) — not only dark-on-dark cards.
+- Every content slide needs ≥1 point of interest (contrast card, Heritage-Blue stat, accent badge, or `class="decor"` background glow). Keep accents small and decor behind text.
+
+## Components for richer slides (use these, don't reinvent)
+
+- **Icons:** an inline SVG sprite is embedded (line style, no dependency). Use `<span class="chip"><svg class="ico"><use href="#i-target"/></svg></span>`. ids include `i-check i-database i-chart-line i-gear i-target i-shield i-eye i-bolt i-gauge i-cloud i-code i-users i-lightbulb i-warning` (+more). Add a `<symbol>` if one's missing; never import an icon font/library or use filled icons.
+- **`.split`** — default content layout: text one side, a visual the other (icon list, card, stat, diagram, image).
+- **`ul.feat`** — icon feature list (chip + bold lead-in + text); use instead of plain ticks.
+- **Icon card grid** — `.cols-3` of `.card`s each opened by a `.chip`; vary chip colour, make one `.card.solid`.
+- **`.rings`** — concentric-rings brand motif for title/section/closing: `<svg class="rings" style="top:-140px;right:-120px"><use href="#i-rings"/></svg>`.
+- **Pair most content slides with a visual.** Text-only slides are allowed where a point needs none (strong statement, divider, quote) — just don't let most of the deck be text-only.
+
+## Content kit (examples live in the template — it doubles as the gallery)
+
+- **Diagrams** (divs + sprite, no lib): `.flow` (process / box-and-arrow, `.node` + `.arrow`), `.compare` (`.col.good`/`.col.bad`), `.timeline`, `.tokens` (`.tok.flag` to highlight).
+- **Charts** (inline SVG from data, no lib): `<div class="chart" data-chart="bar|line|donut" data-values="…" data-labels="…" data-center="…">`.
+- **Image**: `.figure` (cover-fit, embed base64, always `alt`) inside `.split`, or a full-bleed `.slide.image` with a `.bleed` image + scrim + `.bleed-content`.
+- **Table**: `.tbl` (brand spec, tabular nums, `.num` right-align, `.nav` Heritage cells) — small comparisons only (~5 rows).
+- **Step reveals**: `.frag` elements appear one arrow-press at a time.
+- Pick a *variety* of slide types (title, section, content+visual, stats, diagram, chart, image, table, code, activity, takeaway, closing) — don't make every slide the same.
+
+**Before delivering, run** `node scripts/check-deck.js <deck>.html` and clear all errors (pure white, off-palette hex, fluid units, missing alt, external resources). Auto logo-swap, print-to-PDF, and the overflow badge are built into the template.
+
+## Accessibility colours & more patterns (UX review)
+
+- Secondary/caption text: `var(--cc-muted-light)` (#6F7072) on light slides, `var(--cc-muted-dark)` (#A9ABB1) on dark/image — never Grey Three #8C8D8F for small text on white. Green text/borders: `var(--cc-green-acc)` (#1C7C2C), not #3A9B4A. Text over a full-bleed image must be light.
+- **Subtitle**: `<p class="subhead">` after a heading. **6-up**: six `.card.compact` in `.cols-3` (or `.cols-2`). **Quote**: `.quote` (full-page or inline). **Title/opener over image**: `.slide.image` + text in a `.panel`. **Divider with half image**: `.slide.dark.flush` + `.split-bleed`. **Brand mark**: pinned bottom-left on every slide automatically (no markup).
+- **Subtle background graphics**: inline SVG only (no image files) — `<svg class="rings"><use href="#i-rings-outline"/></svg>` at low opacity off a corner, or `class="decor"` for a soft glow; both sit behind content. Add a `<symbol>` for any new motif.
+
+## Mechanics (keep from the template)
+
+Keyboard nav (→ Space / ← / Home / End / F fullscreen / O overview), slide counter, progress bar, hash deep-link.
+Interactive activities: copy a `[data-activity]` block, mark the right answer with `data-correct`, fill `.reveal`.
+Badges: pills, sentence case, ~12% fill + ~25%-darker border. Shadows Foundation-Blue tinted, never black.
+Logos in `logos/` — never recolour/stretch/crop/rotate; white on dark slides, blue on light.

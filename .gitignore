@@ -1,0 +1,39 @@
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Logs / local scratch
+*.log
+
+# capture_flow.py output (local log-capture dumps, not source)
+captured_logs.json
+flow*.json
+
+# Local agent config
+.claude/
+
+# Docs (local specs / design notes, not shipped)
+docs/
+
+# Playwright MCP tool output (screenshots, snapshots, console logs)
+.playwright-mcp/
+
+run.sh

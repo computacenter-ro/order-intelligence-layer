@@ -1,0 +1,79 @@
+@import "tailwindcss";
+@import "@computacenter-ro/style-guide/dist/base.css";
+@import "@computacenter-ro/style-guide/tokens/theme.css";
+
+@keyframes cc-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+body {
+  background: var(--cc-cloud-white);
+  color: var(--cc-grey-one);
+  font-family: var(--cc-font-brand);
+}
+
+/* Journeys table — the style-guide package doesn't tokenize these two
+   table-specific hexes from the guidelines' Tables spec, so they're defined
+   once here as reusable CSS custom properties instead of inline hex. */
+:root {
+  --cc-table-header-bg: #E3E8F4;
+  --cc-table-zebra: #F4F4F9;
+}
+
+.oil-journeys-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.oil-journeys-table thead th {
+  text-align: left;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--cc-foundation-blue);
+  background: var(--cc-table-header-bg);
+  padding: 12px 16px;
+}
+
+.oil-journeys-table tbody td {
+  padding: 14px 16px;
+  font-size: 14px;
+  color: var(--cc-grey-one);
+  border-bottom: 1px solid var(--cc-grey-five);
+}
+
+.oil-journeys-table tbody tr:nth-child(even) {
+  background: var(--cc-table-zebra);
+}
+
+.oil-journeys-table tbody tr:hover {
+  background: var(--cc-grey-six);
+}
+
+.oil-journeys-table tbody tr {
+  cursor: pointer;
+}
+
+.oil-mono {
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+.oil-pipeline-current {
+  animation: cc-pulse 2s infinite;
+}
+
+/* New-alerts banner hover — box-shadow only, no new colour (guidelines:
+   never introduce a hex outside the palette; the Info badge tone already
+   covers the resting state). */
+.oil-new-alerts-banner {
+  transition: box-shadow 120ms ease;
+}
+
+.oil-new-alerts-banner:hover {
+  box-shadow: var(--shadow-cc-md);
+}

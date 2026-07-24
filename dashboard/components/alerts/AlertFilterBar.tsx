@@ -1,5 +1,6 @@
 "use client";
 
+import { Button } from "@computacenter-ro/style-guide/components";
 import { radii, semanticSpacing } from "@computacenter-ro/style-guide/tokens";
 import { capitalize } from "@/lib/format";
 import type { Department, ProcessedAlert } from "@/lib/types";
@@ -144,7 +145,7 @@ const labelStyle: React.CSSProperties = {
 
 const selectStyle: React.CSSProperties = {
   height: "32px",
-  minWidth: "180px",
+  minWidth: "150px",
   padding: `0 ${semanticSpacing.md}`,
   fontSize: "14px",
   fontFamily: "inherit",
@@ -156,11 +157,17 @@ const selectStyle: React.CSSProperties = {
 };
 
 export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
+  // Already-default selection → nothing to reset, so the button is disabled
+  // rather than looking actionable for a no-op.
+  const isDefault = (Object.keys(DEFAULT_ALERT_FILTERS) as (keyof AlertFilters)[]).every(
+    (key) => value[key] === DEFAULT_ALERT_FILTERS[key]
+  );
+
   return (
     <div
       style={{
         display: "flex",
-        gap: semanticSpacing.lg,
+        gap: semanticSpacing.md,
         flexWrap: "wrap",
         alignItems: "flex-end",
         marginBottom: semanticSpacing.lg,
@@ -262,6 +269,17 @@ export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
           ))}
         </select>
       </div>
+
+      {/* Aligns to the bottom of the bar (parent alignItems: flex-end), level
+          with the selects. Resets every filter to "all" in one click; the
+          page's onChange re-fetches and persists. */}
+      <Button
+        variant="secondary"
+        onClick={() => onChange(DEFAULT_ALERT_FILTERS)}
+        disabled={isDefault}
+      >
+        Reset filters
+      </Button>
     </div>
   );
 }

@@ -12,7 +12,7 @@ Importing this module performs no I/O.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Generic, TypeVar
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict
 
@@ -30,6 +30,23 @@ def _to_utc(value: object) -> object:
 
 
 UtcDatetime = Annotated[datetime, BeforeValidator(_to_utc)]
+
+
+# --- pagination envelope -----------------------------------------------------
+
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    """One page of a cursor-paginated listing (see ``backend/pagination.py``).
+
+    ``next_cursor`` is an opaque token to pass back as ``?cursor=`` for the
+    following page; ``None`` means this was the last page.
+    """
+
+    items: list[T]
+    next_cursor: str | None = None
 
 
 # --- response schemas --------------------------------------------------------

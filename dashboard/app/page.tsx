@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { fetchAlerts, resolveAlert } from "@/lib/api";
+import { Button } from "@computacenter-ro/style-guide/components";
+import { fetchAlerts, resolveAlert, type Page } from "@/lib/api";
+import { usePagination } from "@/lib/usePagination";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
@@ -17,20 +19,22 @@ import type { ProcessedAlert, WsEvent } from "@/lib/types";
 
 const FILTERS_STORAGE_KEY = "oil.alertFilters";
 
+// Resolves without a network call — used before filters are rehydrated so the
+// hook's mount load doesn't fetch with the pre-rehydration default filter.
+const EMPTY_PAGE: Page<ProcessedAlert> = { items: [], next_cursor: null };
+
 export default function AlertFeedPage() {
-  const [alerts, setAlerts] = useState<ProcessedAlert[]>([]);
   const [pending, setPending] = useState<ProcessedAlert[]>([]);
   const [selected, setSelected] = useState<ProcessedAlert | null>(null);
   const [filters, setFilters] = useState<AlertFilters>(DEFAULT_ALERT_FILTERS);
-  // Gates the fetch until localStorage has been read, so the list loads once
-  // with the rehydrated selection instead of flashing the default filter first.
+  // Gates fetching until localStorage has been read, so the list loads once with
+  // the rehydrated selection instead of flashing the default filter first.
   const [filtersReady, setFiltersReady] = useState(false);
 
-  // Rehydrate the saved selection after mount, not during the initial render:
-  // reading localStorage synchronously (e.g. a useState lazy initializer) would
-  // make the client's first paint diverge from the server's (no localStorage),
-  // causing a hydration mismatch. Effects run after hydration, so this is safe.
-  // Runs exactly once, then unblocks the fetch effect below.
+  // Rehydrate the saved selection after mount (not during render): reading
+  // localStorage synchronously would diverge the client's first paint from the
+  // server's (no localStorage) and cause a hydration mismatch. Effects run after
+  // hydration, so this is safe. Runs once, then unblocks fetching below.
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
@@ -52,70 +56,74 @@ export default function AlertFeedPage() {
     }
   }, [filters, filtersReady]);
 
-  // (Re)load the list from the backend whenever the filter changes. "all" maps
-  // to undefined so fetchAlerts omits the query param entirely.
+  // The page owns the filters; the hook is filter-agnostic and just pages over
+  // whatever this closure fetches. "all" maps to undefined so the param is
+  // omitted. The feed only ever shows active (unresolved) alerts, newest first.
+  const fetchPage = useCallback(
+    (cursor: string | null): Promise<Page<ProcessedAlert>> => {
+      if (!filtersReady) return Promise.resolve(EMPTY_PAGE);
+      return fetchAlerts({
+        department: filters.department === "all" ? undefined : filters.department,
+        source: filters.source === "all" ? undefined : filters.source,
+        level: filters.level === "all" ? undefined : filters.level,
+        app_name: filters.app_name === "all" ? undefined : filters.app_name,
+        severity: filters.severity === "all" ? undefined : filters.severity,
+        resolved: false,
+        sort: "emitted_at",
+        cursor: cursor ?? undefined,
+      });
+    },
+    [filters, filtersReady]
+  );
+
+  const { items, loading, hasMore, loadMore, reload, prepend, remove } =
+    usePagination<ProcessedAlert>(fetchPage, (a) => a.alert_id);
+
+  // (Re)load the first page once filters are ready and on every filter change.
   useEffect(() => {
     if (!filtersReady) return;
-    let stale = false;
-    // The feed only ever shows active (unresolved) alerts; resolved ones live
-    // in History (see /history). So resolved:false is always sent, alongside
-    // the active filter selection.
-    fetchAlerts({
-      department: filters.department === "all" ? undefined : filters.department,
-      source: filters.source === "all" ? undefined : filters.source,
-      level: filters.level === "all" ? undefined : filters.level,
-      app_name: filters.app_name === "all" ? undefined : filters.app_name,
-      severity: filters.severity === "all" ? undefined : filters.severity,
-      resolved: false,
-    })
-      .then((next) => {
-        if (!stale) setAlerts(next);
-      })
-      .catch((err) => console.error("Failed to load alerts:", err));
-    return () => {
-      stale = true;
-    };
-  }, [filters, filtersReady]);
+    reload();
+  }, [filters, filtersReady, reload]);
 
   const handleFiltersChange = useCallback((next: AlertFilters) => {
     setFilters(next);
     // Drop live alerts captured under the previous filter; the re-fetched list
-    // already reflects the new filter, and future WS alerts are re-guarded below.
+    // reflects the new filter, and future WS alerts are re-guarded below.
     setPending([]);
   }, []);
 
   const handleEvent = useCallback(
     (event: WsEvent) => {
       if (event.type !== "alert.new") return;
-      // Critical: a live alert enters the feed only if it matches the active
-      // filter — otherwise a non-matching alert would leak into a filtered view.
+      // A live alert enters the feed only if it matches the active filter —
+      // otherwise a non-matching alert would leak into a filtered view.
       if (!alertMatchesFilters(event.data, filters)) return;
-      if (alerts.some((a) => a.alert_id === event.data.alert_id)) return;
       setPending((prev) =>
         prev.some((a) => a.alert_id === event.data.alert_id) ? prev : [event.data, ...prev]
       );
     },
-    [alerts, filters]
+    [filters]
   );
 
   useWebSocket(handleEvent);
 
   const handleReveal = useCallback(() => {
-    setAlerts((prev) => [...pending, ...prev]);
+    // pending is newest-first; prepend inserts at the top, so replay
+    // oldest-first to leave the newest alert on top. The hook dedups.
+    [...pending].reverse().forEach(prepend);
     setPending([]);
-  }, [pending]);
+  }, [pending, prepend]);
 
-  const handleResolve = useCallback((alert: ProcessedAlert) => {
-    resolveAlert(alert.alert_id)
-      .then((updated) => {
-        // Resolved alerts move to History — drop it from the live feed.
-        setAlerts((prev) => prev.filter((a) => a.alert_id !== updated.alert_id));
-      })
-      .catch((err) => console.error("Failed to resolve alert:", err));
-  }, []);
-
-  const sorted = [...alerts].sort(
-    (a, b) => new Date(b.emitted_at).getTime() - new Date(a.emitted_at).getTime()
+  const handleResolve = useCallback(
+    (alert: ProcessedAlert) => {
+      resolveAlert(alert.alert_id)
+        .then((updated) => {
+          // Resolved alerts move to History — drop it from the live feed.
+          remove(updated.alert_id);
+        })
+        .catch((err) => console.error("Failed to resolve alert:", err));
+    },
+    [remove]
   );
 
   return (
@@ -129,7 +137,8 @@ export default function AlertFeedPage() {
       <AlertFilterBar value={filters} onChange={handleFiltersChange} />
       <div>
         <NewAlertsBanner count={pending.length} onReveal={handleReveal} />
-        {sorted.map((alert) => (
+        {/* Server returns emitted_at DESC; prepend keeps live alerts on top. */}
+        {items.map((alert) => (
           <AlertCard
             key={alert.alert_id}
             alert={alert}
@@ -139,6 +148,13 @@ export default function AlertFeedPage() {
           />
         ))}
       </div>
+      {hasMore && (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: "16px" }}>
+          <Button variant="secondary" onClick={loadMore} disabled={loading} loading={loading}>
+            Load more
+          </Button>
+        </div>
+      )}
       <AlertDetailDrawer alert={selected} onClose={() => setSelected(null)} />
     </div>
   );

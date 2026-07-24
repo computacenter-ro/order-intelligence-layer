@@ -28,7 +28,7 @@ export default function JourneyDetailPage() {
       .catch(() => setJourney(null))
       .finally(() => setLoading(false));
     fetchAlerts()
-      .then((all) => setJourneyAlerts(all.filter((a) => a.journey_id === params.journeyId)))
+      .then((res) => setJourneyAlerts(res.items.filter((a) => a.journey_id === params.journeyId)))
       .catch((err) => console.error("Failed to load journey alerts:", err));
   }, [params.journeyId]);
 

@@ -34,7 +34,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user
 from backend.db import Alert, Journey, JourneyEvent, get_session
-from backend.schemas import AlertOut, JourneyDetailOut, JourneyEventOut, JourneyOut
+from backend.pagination import apply_keyset, build_page
+from backend.schemas import AlertOut, JourneyDetailOut, JourneyEventOut, JourneyOut, Page
 from shared.models import Department
 
 
@@ -50,7 +51,12 @@ def build_alerts_query(
     severity: str | None = None,
     resolved: bool | None = None,
 ) -> Select:
-    """Select alerts filtered by the given criteria, newest ``emitted_at`` first."""
+    """Select alerts filtered by the given criteria.
+
+    Filters only — ordering is applied by the paginator (:func:`apply_keyset`),
+    which owns the sort column so callers can page by ``emitted_at`` or
+    ``resolved_at`` over the same filter set.
+    """
     stmt = select(Alert)
     if since is not None:
         stmt = stmt.where(Alert.emitted_at >= since)
@@ -66,7 +72,7 @@ def build_alerts_query(
         stmt = stmt.where(Alert.app_name == app_name)
     if severity is not None:
         stmt = stmt.where(Alert.severity == severity)
-    return stmt.order_by(Alert.emitted_at.desc())
+    return stmt
 
 
 def build_journeys_query(status: str | None) -> Select:
@@ -86,7 +92,16 @@ def build_journeys_query(status: str | None) -> Select:
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
-@router.get("/alerts", response_model=list[AlertOut])
+# Sort keys accepted by GET /alerts, mapped to the ORM column the paginator
+# orders/seeks on. emitted_at = the live feed's newest-first; resolved_at =
+# History's most-recently-resolved-first.
+_ALERT_SORT_COLUMNS = {
+    "emitted_at": Alert.emitted_at,
+    "resolved_at": Alert.resolved_at,
+}
+
+
+@router.get("/alerts", response_model=Page[AlertOut])
 async def list_alerts(
     since: Annotated[datetime | None, Query()] = None,
     # Typing these as the Department enum / a source Literal makes FastAPI reject
@@ -107,9 +122,16 @@ async def list_alerts(
     severity: Annotated[
         Literal["critical", "high", "medium", "low"] | None, Query()
     ] = None,
+    # Cursor pagination (see backend/pagination.py). limit is clamped to 1..100
+    # rather than 422'd so a caller can pass anything and still get a sane page.
+    limit: Annotated[int, Query()] = 16,
+    cursor: Annotated[str | None, Query()] = None,
+    sort: Annotated[Literal["emitted_at", "resolved_at"], Query()] = "emitted_at",
     session: AsyncSession = Depends(get_session),
-) -> list[Alert]:
-    result = await session.execute(
+) -> Page[AlertOut]:
+    limit = max(1, min(limit, 100))
+    sort_col = _ALERT_SORT_COLUMNS[sort]
+    stmt = apply_keyset(
         build_alerts_query(
             since,
             department.value if department is not None else None,
@@ -118,9 +140,21 @@ async def list_alerts(
             app_name=app_name,
             severity=severity,
             resolved=resolved,
-        )
+        ),
+        sort_col,
+        Alert.alert_id,
+        cursor=cursor,
+        limit=limit,
     )
-    return result.scalars().all()
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    items, next_cursor = build_page(
+        rows, limit, lambda a: getattr(a, sort), lambda a: a.alert_id
+    )
+    return Page[AlertOut](
+        items=[AlertOut.model_validate(a) for a in items],
+        next_cursor=next_cursor,
+    )
 
 
 @router.patch("/alerts/{alert_id}/resolve", response_model=AlertOut)
@@ -142,13 +176,33 @@ async def resolve_alert(
     return alert
 
 
-@router.get("/journeys", response_model=list[JourneyOut])
+@router.get("/journeys", response_model=Page[JourneyOut])
 async def list_journeys(
     status: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query()] = 16,
+    cursor: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
-) -> list[Journey]:
-    result = await session.execute(build_journeys_query(status))
-    return result.scalars().all()
+) -> Page[JourneyOut]:
+    limit = max(1, min(limit, 100))
+    # last_ts is nullable (a journey may exist before its first event lands),
+    # so NULLs sort last in the newest-first order.
+    stmt = apply_keyset(
+        build_journeys_query(status),
+        Journey.last_ts,
+        Journey.journey_id,
+        cursor=cursor,
+        limit=limit,
+        nulls_last=True,
+    )
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    items, next_cursor = build_page(
+        rows, limit, lambda j: j.last_ts, lambda j: j.journey_id
+    )
+    return Page[JourneyOut](
+        items=[JourneyOut.model_validate(j) for j in items],
+        next_cursor=next_cursor,
+    )
 
 
 @router.get("/journeys/{journey_id}", response_model=JourneyDetailOut)

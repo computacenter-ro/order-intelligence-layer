@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { fetchAlerts } from "@/lib/api";
+import { Button } from "@computacenter-ro/style-guide/components";
+import { fetchAlerts, type Page } from "@/lib/api";
+import { usePagination } from "@/lib/usePagination";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
 import {
@@ -16,19 +18,17 @@ import type { ProcessedAlert } from "@/lib/types";
 // filter selections independently.
 const FILTERS_STORAGE_KEY = "oil.historyFilters";
 
+// Resolves without a network call — used before filters are rehydrated so the
+// hook's mount load doesn't fetch with the pre-rehydration default filter.
+const EMPTY_PAGE: Page<ProcessedAlert> = { items: [], next_cursor: null };
+
 export default function HistoryPage() {
-  const [alerts, setAlerts] = useState<ProcessedAlert[]>([]);
   const [selected, setSelected] = useState<ProcessedAlert | null>(null);
   const [filters, setFilters] = useState<AlertFilters>(DEFAULT_ALERT_FILTERS);
-  // Gates the fetch until localStorage has been read, so the list loads once
-  // with the rehydrated selection instead of flashing the default filter first.
+  // Gates fetching until localStorage has been read (see feed page for the
+  // hydration-mismatch rationale).
   const [filtersReady, setFiltersReady] = useState(false);
 
-  // Rehydrate the saved selection after mount, not during the initial render:
-  // reading localStorage synchronously (e.g. a useState lazy initializer) would
-  // make the client's first paint diverge from the server's (no localStorage),
-  // causing a hydration mismatch. Effects run after hydration, so this is safe.
-  // Runs exactly once, then unblocks the fetch effect below.
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
@@ -40,7 +40,6 @@ export default function HistoryPage() {
     setFiltersReady(true);
   }, []);
 
-  // Persist the selection whenever it changes (but not the pre-rehydration default).
   useEffect(() => {
     if (!filtersReady) return;
     try {
@@ -50,38 +49,39 @@ export default function HistoryPage() {
     }
   }, [filters, filtersReady]);
 
-  // (Re)load the resolved list from the backend whenever the filter changes.
-  // "all" maps to undefined so fetchAlerts omits the query param entirely.
-  // History is not live (no WS), so a plain re-fetch on filter change is enough —
-  // no live-alert guarding / pending logic is needed.
+  // History lists resolved alerts, most-recently-resolved first (the server
+  // sorts on resolved_at). Not live — no WS.
+  const fetchPage = useCallback(
+    (cursor: string | null): Promise<Page<ProcessedAlert>> => {
+      if (!filtersReady) return Promise.resolve(EMPTY_PAGE);
+      return fetchAlerts({
+        department: filters.department === "all" ? undefined : filters.department,
+        source: filters.source === "all" ? undefined : filters.source,
+        level: filters.level === "all" ? undefined : filters.level,
+        app_name: filters.app_name === "all" ? undefined : filters.app_name,
+        severity: filters.severity === "all" ? undefined : filters.severity,
+        resolved: true,
+        sort: "resolved_at",
+        cursor: cursor ?? undefined,
+      });
+    },
+    [filters, filtersReady]
+  );
+
+  const { items, loading, hasMore, loadMore, reload } = usePagination<ProcessedAlert>(
+    fetchPage,
+    (a) => a.alert_id
+  );
+
   useEffect(() => {
     if (!filtersReady) return;
-    let stale = false;
-    fetchAlerts({
-      department: filters.department === "all" ? undefined : filters.department,
-      source: filters.source === "all" ? undefined : filters.source,
-      level: filters.level === "all" ? undefined : filters.level,
-      app_name: filters.app_name === "all" ? undefined : filters.app_name,
-      severity: filters.severity === "all" ? undefined : filters.severity,
-      resolved: true,
-    })
-      .then((next) => {
-        if (!stale) setAlerts(next);
-      })
-      .catch((err) => console.error("Failed to load resolved alerts:", err));
-    return () => {
-      stale = true;
-    };
-  }, [filters, filtersReady]);
+    reload();
+  }, [filters, filtersReady, reload]);
 
   // Resolved alerts never re-enter the "mark resolved" flow from here — the
   // kebab menu already renders a plain "Resolved" indicator once is_resolved
   // is true, so this is never actually invoked.
   const handleResolve = useCallback(() => {}, []);
-
-  const sorted = [...alerts].sort(
-    (a, b) => new Date(b.resolved_at ?? 0).getTime() - new Date(a.resolved_at ?? 0).getTime()
-  );
 
   return (
     <div>
@@ -93,10 +93,10 @@ export default function HistoryPage() {
       </p>
       <AlertFilterBar value={filters} onChange={setFilters} />
       <div>
-        {sorted.length === 0 && (
+        {items.length === 0 && !loading && (
           <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet</p>
         )}
-        {sorted.map((alert) => (
+        {items.map((alert) => (
           <AlertCard
             key={alert.alert_id}
             alert={alert}
@@ -106,6 +106,13 @@ export default function HistoryPage() {
           />
         ))}
       </div>
+      {hasMore && (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: "16px" }}>
+          <Button variant="secondary" onClick={loadMore} disabled={loading} loading={loading}>
+            Load more
+          </Button>
+        </div>
+      )}
       <AlertDetailDrawer alert={selected} onClose={() => setSelected(null)} />
     </div>
   );

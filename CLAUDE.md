@@ -45,6 +45,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 ├── CLAUDE.md
 ├── docker-compose.yml            # rabbitmq (5672/15672), redis (6379), postgres (5432)
 ├── requirements.txt
+├── requirements-ml.txt           # optional: semantic-cache deps (sentence-transformers + CPU torch)
 ├── shared/                       # cross-cutting: used by pipeline/, ai_service/, and backend/
 │   ├── models.py                 # Pydantic: LogLine, Baton, ProcessedAlert
 │   ├── log_client.py             # POST log lines to the collector (all services use this)
@@ -64,6 +65,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   └── data/                     # reference fixtures (e.g. captured real-system log samples)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
+│   ├── semcache.py               # semantic cache (normalize + embed + LRU) — skips LLM on repeat log types
 ├── backend/                      # [5] :8000
 │   ├── main.py  consumers.py  journeys.py  stitching.py  teams.py  ws.py  db.py
 │   ├── api.py  schemas.py       # read-only REST API + Pydantic response schemas

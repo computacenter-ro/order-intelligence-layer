@@ -1,25 +1,18 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Card } from "@computacenter-ro/style-guide/components";
+import { Card, Button } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { Badge } from "@/components/ui/Badge";
 import { formatTime } from "@/lib/format";
 import { JOURNEY_STATUS_BADGE, JOURNEY_STATUS_LABEL } from "@/lib/journeyStatus";
 import { fetchJourneys } from "@/lib/api";
+import { usePagination } from "@/lib/usePagination";
 import { useWebSocket } from "@/lib/useWebSocket";
 import type { Journey, WsEvent } from "@/lib/types";
 
 const COLUMN_HEADINGS = ["Status", "Order ID", "Cart Header ID", "Event ID", "Outcome", "Last Seen"];
-
-function upsertJourney(prev: Journey[], next: Journey): Journey[] {
-  const index = prev.findIndex((j) => j.journey_id === next.journey_id);
-  if (index === -1) return [next, ...prev];
-  const copy = [...prev];
-  copy[index] = next;
-  return copy;
-}
 
 export default function JourneysPage() {
   return (
@@ -34,28 +27,35 @@ function JourneysPageContent() {
   const searchParams = useSearchParams();
   const highlightId = searchParams.get("highlight");
   const highlightRef = useRef<HTMLTableRowElement | null>(null);
-  const [journeys, setJourneys] = useState<Journey[]>([]);
 
-  useEffect(() => {
-    fetchJourneys()
-      .then(setJourneys)
-      .catch((err) => console.error("Failed to load journeys:", err));
-  }, []);
+  // No filters here, so fetchPage is stable; the server returns last_ts DESC.
+  const fetchPage = useCallback(
+    (cursor: string | null) => fetchJourneys({ cursor: cursor ?? undefined }),
+    []
+  );
+
+  const { items, loading, hasMore, loadMore, prepend, remove } = usePagination<Journey>(
+    fetchPage,
+    (j) => j.journey_id
+  );
 
   useEffect(() => {
     if (highlightId) highlightRef.current?.scrollIntoView({ block: "center" });
-  }, [highlightId, journeys]);
+  }, [highlightId, items]);
 
-  const handleEvent = useCallback((event: WsEvent) => {
-    if (event.type !== "journey.updated" && event.type !== "journey.completed") return;
-    setJourneys((prev) => upsertJourney(prev, event.data));
-  }, []);
+  const handleEvent = useCallback(
+    (event: WsEvent) => {
+      if (event.type !== "journey.updated" && event.type !== "journey.completed") return;
+      // A live update moves the journey to the top (order is last_ts DESC, and it
+      // was just touched): drop the old position, then prepend the fresh row.
+      // remove-then-prepend keeps the hook's dedup happy.
+      remove(event.data.journey_id);
+      prepend(event.data);
+    },
+    [remove, prepend]
+  );
 
   useWebSocket(handleEvent);
-
-  const sorted = [...journeys].sort(
-    (a, b) => new Date(b.last_ts).getTime() - new Date(a.last_ts).getTime()
-  );
 
   return (
     <div>
@@ -75,7 +75,7 @@ function JourneysPageContent() {
             </tr>
           </thead>
           <tbody>
-            {sorted.map((journey) => {
+            {items.map((journey) => {
               const isHighlighted = journey.journey_id === highlightId;
               return (
               <tr
@@ -109,6 +109,13 @@ function JourneysPageContent() {
           </tbody>
         </table>
       </Card>
+      {hasMore && (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: "16px" }}>
+          <Button variant="secondary" onClick={loadMore} disabled={loading} loading={loading}>
+            Load more
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

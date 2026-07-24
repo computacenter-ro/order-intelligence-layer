@@ -20,11 +20,13 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
 from backend.main import app
 from backend.db import get_session, Alert, Journey, JourneyEvent
 from backend.api import build_alerts_query, build_journeys_query
+from backend.pagination import apply_keyset, build_page, decode_cursor, encode_cursor
 from backend.auth import get_current_user
 
 UTC = timezone.utc
@@ -164,18 +166,20 @@ def test_resolve_alert_requires_auth():
 # --- query builders (pure; asserted via compiled SQL) ------------------------
 
 
-def test_alerts_query_applies_all_filters_and_desc_order():
+def test_alerts_query_applies_all_filters():
+    # build_alerts_query is filters-only now — ordering is the paginator's job
+    # (apply_keyset), so no ORDER BY is emitted here.
     sql = _compiled(build_alerts_query(datetime(2026, 7, 20, tzinfo=UTC), "backend", "ai"))
     assert "emitted_at >=" in sql
     assert "department =" in sql
     assert "source =" in sql
-    assert "ORDER BY alerts.emitted_at DESC" in sql
+    assert "ORDER BY" not in sql
 
 
-def test_alerts_query_no_filters_still_orders_desc():
+def test_alerts_query_no_filters_has_no_where_or_order():
     sql = _compiled(build_alerts_query(None, None, None))
     assert "WHERE" not in sql
-    assert "ORDER BY alerts.emitted_at DESC" in sql
+    assert "ORDER BY" not in sql
 
 
 def test_alerts_query_department_only():
@@ -221,7 +225,7 @@ def test_alerts_query_all_filters_including_level_and_app_name():
     assert "emitted_at >=" in sql
     assert "department =" in sql and "source =" in sql
     assert "level =" in sql and "app_name =" in sql
-    assert "ORDER BY alerts.emitted_at DESC" in sql
+    assert "ORDER BY" not in sql
 
 
 def test_alerts_query_severity_only():
@@ -245,13 +249,13 @@ def test_get_alerts_serializes_schema_not_orm():
                                     explanation=None, department=None, confidence=None)])])
     r = TestClient(app).get("/alerts")
     assert r.status_code == 200
-    body = r.json()
-    assert [a["alert_id"] for a in body] == ["a1", "a2"]
-    assert body[0]["department"] == "backend" and body[0]["source"] == "ai"
+    items = r.json()["items"]
+    assert [a["alert_id"] for a in items] == ["a1", "a2"]
+    assert items[0]["department"] == "backend" and items[0]["source"] == "ai"
     # fallback alert carries null enrichment
-    assert body[1]["explanation"] is None and body[1]["department"] is None
+    assert items[1]["explanation"] is None and items[1]["department"] is None
     # datetime is UTC-aware in the response
-    assert body[0]["emitted_at"].endswith(("Z", "+00:00"))
+    assert items[0]["emitted_at"].endswith(("Z", "+00:00"))
 
 
 def test_get_alerts_passes_query_params_into_the_filter():
@@ -380,7 +384,7 @@ def test_get_journeys_filters_by_status():
     session = _use([_FakeResult(items=[_journey(journey_id="J9", status="TIMED_OUT")])])
     r = TestClient(app).get("/journeys", params={"status": "TIMED_OUT"})
     assert r.status_code == 200
-    assert r.json()[0]["journey_id"] == "J9"
+    assert r.json()["items"][0]["journey_id"] == "J9"
     assert "status =" in _compiled(session.statements[0])
 
 
@@ -420,4 +424,177 @@ def test_naive_datetime_is_returned_as_utc_aware():
     # A naive datetime sneaking out of the DB must still be rendered UTC-aware.
     _use([_FakeResult(items=[_alert(emitted_at=datetime(2026, 7, 20, 8, 0, 0))])])
     body = TestClient(app).get("/alerts").json()
-    assert body[0]["emitted_at"].endswith(("Z", "+00:00"))
+    assert body["items"][0]["emitted_at"].endswith(("Z", "+00:00"))
+
+
+# --- pagination: pure functions (backend/pagination.py) ----------------------
+
+
+def _params(stmt) -> dict:
+    return stmt.compile(dialect=postgresql.dialect()).params
+
+
+def test_encode_decode_cursor_roundtrips_datetime_and_id():
+    dt = datetime(2026, 7, 20, 8, 0, 5, tzinfo=UTC)
+    token = encode_cursor(dt, "alert-5")
+    assert isinstance(token, str)
+    sort_value, id_value = decode_cursor(token)
+    # datetime is rehydrated (not left a string) and the id round-trips verbatim
+    assert sort_value == dt
+    assert id_value == "alert-5"
+
+
+def test_decode_cursor_leaves_non_datetime_sort_value_untouched():
+    token = encode_cursor("STATUS-X", "J1")
+    sort_value, id_value = decode_cursor(token)
+    assert sort_value == "STATUS-X" and id_value == "J1"
+
+
+def test_apply_keyset_orders_desc_and_requests_one_extra_row():
+    stmt = apply_keyset(
+        select(Alert), Alert.emitted_at, Alert.alert_id, cursor=None, limit=16
+    )
+    sql = _compiled(stmt)
+    assert "ORDER BY alerts.emitted_at DESC, alerts.alert_id DESC" in sql
+    # LIMIT limit+1 — the extra row is how build_page detects a further page.
+    assert 17 in _params(stmt).values()
+    # no cursor -> no seek predicate
+    assert "WHERE" not in sql
+
+
+def test_apply_keyset_adds_keyset_predicate_when_cursor_given():
+    cursor = encode_cursor(datetime(2026, 7, 20, 8, 0, 5, tzinfo=UTC), "alert-5")
+    stmt = apply_keyset(
+        select(Alert), Alert.emitted_at, Alert.alert_id, cursor=cursor, limit=16
+    )
+    sql = _compiled(stmt)
+    # row-value seek: (sort, id) < (cursor_sort, cursor_id)
+    assert "(alerts.emitted_at, alerts.alert_id) < (" in sql
+
+
+def test_apply_keyset_nulls_last_for_nullable_sort_column():
+    stmt = apply_keyset(
+        select(Journey), Journey.last_ts, Journey.journey_id,
+        cursor=None, limit=16, nulls_last=True,
+    )
+    sql = _compiled(stmt)
+    assert "ORDER BY journeys.last_ts DESC NULLS LAST, journeys.journey_id DESC" in sql
+
+
+def test_build_page_trims_and_mints_cursor_when_more_rows():
+    rows = [
+        _alert(alert_id="a1", emitted_at=datetime(2026, 7, 20, 8, 0, 3, tzinfo=UTC)),
+        _alert(alert_id="a2", emitted_at=datetime(2026, 7, 20, 8, 0, 2, tzinfo=UTC)),
+        _alert(alert_id="a3", emitted_at=datetime(2026, 7, 20, 8, 0, 1, tzinfo=UTC)),
+    ]
+    items, next_cursor = build_page(
+        rows, 2, lambda a: a.emitted_at, lambda a: a.alert_id
+    )
+    assert [a.alert_id for a in items] == ["a1", "a2"]
+    # cursor points at the last KEPT row, so the next page seeks strictly past a2
+    assert next_cursor is not None
+    sort_value, id_value = decode_cursor(next_cursor)
+    assert id_value == "a2"
+    assert sort_value == datetime(2026, 7, 20, 8, 0, 2, tzinfo=UTC)
+
+
+def test_build_page_no_cursor_when_last_page():
+    rows = [_alert(alert_id="a1"), _alert(alert_id="a2")]
+    items, next_cursor = build_page(
+        rows, 2, lambda a: a.emitted_at, lambda a: a.alert_id
+    )
+    assert [a.alert_id for a in items] == ["a1", "a2"]
+    assert next_cursor is None
+
+
+# --- pagination: GET /alerts -------------------------------------------------
+
+
+def test_get_alerts_first_page_returns_next_cursor_when_more_rows():
+    # limit=2 but 3 rows come back (build_alerts_query asks for limit+1) -> a
+    # further page exists; the page is trimmed to 2 and next_cursor is minted.
+    _use([_FakeResult(items=[
+        _alert(alert_id="a1", emitted_at=datetime(2026, 7, 20, 8, 0, 3, tzinfo=UTC)),
+        _alert(alert_id="a2", emitted_at=datetime(2026, 7, 20, 8, 0, 2, tzinfo=UTC)),
+        _alert(alert_id="a3", emitted_at=datetime(2026, 7, 20, 8, 0, 1, tzinfo=UTC)),
+    ])])
+    body = TestClient(app).get("/alerts", params={"limit": 2}).json()
+    assert [a["alert_id"] for a in body["items"]] == ["a1", "a2"]
+    assert body["next_cursor"] is not None
+    # cursor is anchored on the last kept row (a2), so page 2 won't repeat it
+    sort_value, id_value = decode_cursor(body["next_cursor"])
+    assert id_value == "a2"
+
+
+def test_get_alerts_second_page_seeks_past_cursor_without_overlap():
+    cursor = encode_cursor(datetime(2026, 7, 20, 8, 0, 2, tzinfo=UTC), "a2")
+    session = _use([_FakeResult(items=[
+        _alert(alert_id="a3", emitted_at=datetime(2026, 7, 20, 8, 0, 1, tzinfo=UTC)),
+        _alert(alert_id="a4", emitted_at=datetime(2026, 7, 20, 8, 0, 0, tzinfo=UTC)),
+    ])])
+    body = TestClient(app).get("/alerts", params={"limit": 2, "cursor": cursor}).json()
+    # fewer than limit+1 rows -> last page
+    assert [a["alert_id"] for a in body["items"]] == ["a3", "a4"]
+    assert body["next_cursor"] is None
+    # the executed query carries the seek predicate that excludes the first page
+    sql = _compiled(session.statements[0])
+    assert "(alerts.emitted_at, alerts.alert_id) < (" in sql
+
+
+def test_get_alerts_last_page_has_null_next_cursor():
+    _use([_FakeResult(items=[_alert(alert_id="a1"), _alert(alert_id="a2")])])
+    body = TestClient(app).get("/alerts", params={"limit": 5}).json()
+    assert len(body["items"]) == 2
+    assert body["next_cursor"] is None
+
+
+def test_get_alerts_limit_over_100_is_clamped():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"limit": 500})
+    assert r.status_code == 200
+    # clamp to 100 -> LIMIT 101 (100 + the detector row)
+    assert 101 in _params(session.statements[0]).values()
+
+
+def test_get_alerts_limit_below_1_is_clamped():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"limit": 0})
+    assert r.status_code == 200
+    # clamp to 1 -> LIMIT 2
+    assert 2 in _params(session.statements[0]).values()
+
+
+def test_get_alerts_sort_resolved_at_orders_on_resolved_at():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"sort": "resolved_at"})
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "ORDER BY alerts.resolved_at DESC, alerts.alert_id DESC" in sql
+
+
+def test_get_alerts_invalid_sort_is_422():
+    r = TestClient(app).get("/alerts", params={"sort": "nonsense"})
+    assert r.status_code == 422
+
+
+# --- pagination: GET /journeys -----------------------------------------------
+
+
+def test_get_journeys_paginates_and_orders_by_last_ts_desc():
+    session = _use([_FakeResult(items=[
+        _journey(journey_id="J1", last_ts=datetime(2026, 7, 20, 8, 0, 3, tzinfo=UTC)),
+        _journey(journey_id="J2", last_ts=datetime(2026, 7, 20, 8, 0, 2, tzinfo=UTC)),
+        _journey(journey_id="J3", last_ts=datetime(2026, 7, 20, 8, 0, 1, tzinfo=UTC)),
+    ])])
+    body = TestClient(app).get("/journeys", params={"limit": 2}).json()
+    assert [j["journey_id"] for j in body["items"]] == ["J1", "J2"]
+    assert body["next_cursor"] is not None
+    sql = _compiled(session.statements[0])
+    assert "ORDER BY journeys.last_ts DESC NULLS LAST, journeys.journey_id DESC" in sql
+
+
+def test_get_journeys_last_page_has_null_next_cursor():
+    _use([_FakeResult(items=[_journey(journey_id="J1"), _journey(journey_id="J2")])])
+    body = TestClient(app).get("/journeys", params={"limit": 5}).json()
+    assert [j["journey_id"] for j in body["items"]] == ["J1", "J2"]
+    assert body["next_cursor"] is None

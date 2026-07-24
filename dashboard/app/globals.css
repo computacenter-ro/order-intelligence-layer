@@ -12,6 +12,13 @@
   }
 }
 
+html {
+  /* Always reserve the vertical scrollbar gutter so it appearing (e.g. after
+     "Load more" makes the page taller) never narrows the content and reflows
+     the tables. */
+  scrollbar-gutter: stable;
+}
+
 body {
   background: var(--cc-cloud-white);
   color: var(--cc-grey-one);
@@ -39,6 +46,7 @@ body {
   color: var(--cc-foundation-blue);
   background: var(--cc-table-header-bg);
   padding: 12px 16px;
+  white-space: nowrap;
 }
 
 .oil-table tbody td {
@@ -46,6 +54,7 @@ body {
   font-size: 14px;
   color: var(--cc-grey-one);
   border-bottom: 1px solid var(--cc-grey-five);
+  white-space: nowrap;
 }
 
 .oil-table tbody tr:nth-child(even) {

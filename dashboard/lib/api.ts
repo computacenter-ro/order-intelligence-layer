@@ -2,6 +2,16 @@ import type { Journey, ProcessedAlert } from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+/**
+ * One page of a cursor-paginated listing (backend/schemas.py ``Page``).
+ * ``next_cursor`` is the opaque token to pass back as ``?cursor=`` for the next
+ * page; ``null`` means this was the last page.
+ */
+export interface Page<T> {
+  items: T[];
+  next_cursor: string | null;
+}
+
 /** Thrown when the backend rejects a request for lack of a valid session. */
 export class UnauthorizedError extends Error {
   constructor() {
@@ -61,6 +71,12 @@ export interface AlertsFilter {
   app_name?: string;
   severity?: string;
   resolved?: boolean;
+  // Cursor pagination (backend/pagination.py). `cursor` from a prior page's
+  // next_cursor; `sort` picks the keyset column (feed=emitted_at,
+  // history=resolved_at).
+  limit?: number;
+  cursor?: string;
+  sort?: "emitted_at" | "resolved_at";
 }
 
 /** Mark an alert resolved; returns the updated alert. */
@@ -74,7 +90,7 @@ export async function resolveAlert(alertId: string): Promise<ProcessedAlert> {
   return res.json() as Promise<ProcessedAlert>;
 }
 
-export function fetchAlerts(filter: AlertsFilter = {}): Promise<ProcessedAlert[]> {
+export function fetchAlerts(filter: AlertsFilter = {}): Promise<Page<ProcessedAlert>> {
   const params = new URLSearchParams();
   if (filter.since) params.set("since", filter.since);
   if (filter.department) params.set("department", filter.department);
@@ -83,13 +99,26 @@ export function fetchAlerts(filter: AlertsFilter = {}): Promise<ProcessedAlert[]
   if (filter.app_name) params.set("app_name", filter.app_name);
   if (filter.severity) params.set("severity", filter.severity);
   if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  if (filter.cursor) params.set("cursor", filter.cursor);
+  if (filter.sort) params.set("sort", filter.sort);
   const query = params.toString();
-  return getJson<ProcessedAlert[]>(`/alerts${query ? `?${query}` : ""}`);
+  return getJson<Page<ProcessedAlert>>(`/alerts${query ? `?${query}` : ""}`);
 }
 
-export function fetchJourneys(status?: string): Promise<Journey[]> {
-  const query = status ? `?status=${encodeURIComponent(status)}` : "";
-  return getJson<Journey[]>(`/journeys${query}`);
+export interface JourneysFilter {
+  status?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export function fetchJourneys(filter: JourneysFilter = {}): Promise<Page<Journey>> {
+  const params = new URLSearchParams();
+  if (filter.status) params.set("status", filter.status);
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  if (filter.cursor) params.set("cursor", filter.cursor);
+  const query = params.toString();
+  return getJson<Page<Journey>>(`/journeys${query ? `?${query}` : ""}`);
 }
 
 export function fetchJourney(journeyId: string): Promise<Journey> {

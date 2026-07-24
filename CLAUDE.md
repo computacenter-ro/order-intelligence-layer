@@ -369,9 +369,59 @@ await gather(process(l) for l in alertable)                # LLM off the fetch p
 > (journeys then `TIMED_OUT`). Do not reintroduce a `now`-anchored window or
 > inline LLM calls on the fetch path.
 
+### Semantic cache (`semcache.py`) — runs BEFORE the pipeline
+The alert corpus is highly repetitive: the same handful of WARN/ERROR *types*
+recur constantly, differing only by volatile ids. So before the explainer+router
+runs, `process()` consults a local semantic cache; a hit reuses the cached
+AI answer and **skips BOTH LLM calls**. Warm hit rate on the canonical scenarios
+is ~90%+ (measured).
+
+- **Normalization is the key trick.** The cache key is the message with volatile
+  ids masked (reusing the stitcher's id shapes): `ORD-\d+`→`<ORD>`,
+  `evt-…`→`<EVT>`, 19-digit→`<CART>`, 6+-digit account→`<ACC>`. So two same-type
+  logs differing only by ids collapse to one key. Semantically meaningful tokens
+  (retry counters `2/3`, percentages, thresholds) are **deliberately NOT masked**
+  — masking them would merge alerts that must stay distinct.
+- **Lookup order.** normalize → exact-match on normalized text (fast path, the
+  overwhelming majority of hits) → else cosine over local `all-MiniLM-L6-v2`
+  embeddings (CPU, loaded once at startup, injected like `api.py`'s deps) vs
+  stored vectors, taking the best only if similarity `>= SEMCACHE_THRESHOLD`
+  (default 0.95). Otherwise a miss.
+- **Divergence guard (cosine path only).** Cosine is blind to a *small but
+  meaning-flipping* difference — `"submission succeeded"` vs `"…failed"` score
+  ~0.95 on MiniLM yet must NOT share an answer. So a cosine candidate is accepted
+  only if the two normalized messages also agree on their **salient tokens**
+  (anything with a digit, plus configured outcome/polarity/negation words:
+  failed/succeeded/passed/aborted/blocked/timeout/not/… — extend via
+  `SEMCACHE_SALIENT_EXTRA`). Any salient disagreement vetoes the hit → miss. The
+  exact-match path never needs the guard. **The cache always fails toward a miss:
+  a false miss costs one LLM call; a false hit would serve a wrong AI-labelled
+  answer. Every uncertain path (guard veto, encoder load failure, corrupt
+  payload) degrades to a miss.**
+- **Id re-fill on hit.** The explanation is stored NORMALIZED (ids masked); on a
+  hit the CURRENT log's ids are substituted back in, so the reused explanation
+  shows the right order id, never the cached one.
+- **Provenance.** A hit keeps `source="ai"` (it *is* an AI answer, reused) so the
+  backend's source-based Teams routing is untouched; it sets `cached=true` on the
+  `ProcessedAlert` (the only field added to `shared/models.py`). Only `source="ai"`
+  results are cached — fallbacks are never stored, so LLM-down behavior is
+  unchanged.
+- **Store — no new infra.** In-memory LRU (cap `SEMCACHE_MAX_ENTRIES`, default
+  500) of `{normalized_text, vector, payload}`, persisted to the existing Redis
+  (`ai:semcache`). Hit/miss counters (`ai:semcache:hits` / `:misses`) drive the
+  hit rate on **`GET /semcache/stats`**. Cosine lookup is a linear scan — fine at
+  the ≤500 cap; an ANN index would be needed only at much larger scale.
+- **Deps.** Needs `sentence-transformers` + CPU `torch` (pinned in
+  `requirements-ml.txt`, separate from `requirements.txt`). If the package is
+  absent or the model can't load, the cache **disables itself** (deferred import)
+  and the pipeline runs exactly as before — every lookup misses.
+
 ### LangGraph pipeline (`graph.py`, `nodes.py`)
 ```
-input_queue → Explainer Node ──LLM call 1 (plain-English explanation)──► Router Node ──LLM call 2 (team)──► ProcessedAlert → processed.alerts
+input_queue → [semantic cache lookup] ──hit──► reuse cached answer (skip both LLM calls), source="ai" cached=true
+                   │ miss (runs the pipeline unchanged, then stores an "ai" result)
+                   ▼
+              Explainer Node ──LLM call 1 (plain-English explanation)──► Router Node ──LLM call 2 (team)──► ProcessedAlert → processed.alerts
                    │ circuit breaker wraps the LLM calls
                    └── breaker open / LLM error ──► ProcessedAlert with explanation=null, department=null,
                                                     source="fallback"  (raw log passed straight through)
@@ -410,6 +460,8 @@ class ProcessedAlert(BaseModel):
     severity: Severity | None           # per-log technical severity; None when source="fallback"
     confidence: float | None            # 0..1; None when source="fallback"
     source: Literal["ai", "fallback"]
+    cached: bool = False                 # True when served from the semantic cache
+                                         # (still source="ai"; routing unchanged)
 ```
 
 ### Journey summary API (`api.py`)
@@ -574,6 +626,8 @@ Connects to backend WS + REST. Feature contract:
 | `dedup:{log_id}` | string | 1h | AI-service poller SETNX dedup |
 | `ai:last_to` | string | — | poller watermark — `to` of the last fetched window; makes windows contiguous (see [3]). **Load-bearing, not optional.** |
 | `ai:breaker:state` | hash | — | circuit breaker state |
+| `ai:semcache` | string | — | semantic-cache dump (LRU entries persisted across restarts). Rebuildable — safe to drop. |
+| `ai:semcache:hits` / `:misses` | string | — | semantic-cache hit/miss counters (the demo number; `GET /semcache/stats`) |
 
 Journey state lives in Postgres — the backend owns journeys.
 
@@ -584,6 +638,10 @@ Journey state lives in Postgres — the backend owns journeys.
 ```bash
 docker compose up -d                          # rabbitmq, redis, postgres
 pip install -r requirements.txt
+# Optional — enables the AI-service semantic cache (CPU torch + embeddings).
+# Without it the cache disables itself and the pipeline runs unchanged.
+# Windows: enable long paths first (see requirements-ml.txt) or torch fails to unpack.
+pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
 uvicorn pipeline.mock_es.app:app --port 9200  # [2]
 python -m pipeline.services.run_all           # [1] all mock services (baton consumers)
 python -m ai_service.main                     # [3] poller + graph + api (:8100)
@@ -599,6 +657,9 @@ Env defaults: `ES_URL=http://localhost:9200`,
 `WINDOW_END_OFFSET=5`, `MAX_WINDOW_SPAN=120` (poller catch-up cap),
 `ALERT_CONCURRENCY=4` (concurrent alert LLM calls), `STALLED_TIMEOUT=90`,
 `STALLED_SWEEP_INTERVAL=15`, `DASHBOARD_URL` (dashboard base for journey links),
+`SEMCACHE_ENABLED=1`, `SEMCACHE_THRESHOLD=0.95` (cosine floor),
+`SEMCACHE_MAX_ENTRIES=500`, `SEMCACHE_MODEL=all-MiniLM-L6-v2`, `SEMCACHE_GUARD=1`,
+`SEMCACHE_SALIENT_EXTRA` (comma-sep extra guard words),
 plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 
 ---
@@ -620,6 +681,14 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
   failures; fallback alerts have null explanation/department,
   `source="fallback"`, and land in the general Teams channel; router output is
   always one of the 5 departments.
+- **Semantic cache**: a hit reuses the cached answer WITHOUT calling the LLM
+  (assert the model isn't invoked); two same-type logs with different ids hit
+  (normalization); different error types miss (no false collapse); a
+  retry-counter difference (`2/3` vs `3/3`) misses (meaningful tokens unmasked);
+  id re-fill puts the CURRENT log's id in the reused explanation; a log just
+  below `SEMCACHE_THRESHOLD` misses; the divergence guard vetoes a high-cosine
+  meaning-flip (`succeeded` vs `failed`) → miss; hit/miss counters increment;
+  fallbacks are never cached.
 - **Journey rules**: each of the 10 scenarios ends with its expected outcome;
   killing the chain mid-flow (drop the baton) produces `TIMED_OUT` after 90s.
 - **End-to-end**: `injector --all` → 10 journeys with the exact outcomes
@@ -649,7 +718,17 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 - Both output queues are at-least-once: consumers must be idempotent.
 - The system must remain useful with the LLM completely down (breaker +
   pass-through alerts + template journey summaries). Test this path.
-- All LLM/provider wiring stays in one module (Azure AI Foundry today).
+- The semantic cache must **fail toward a miss**, never a false hit: a false miss
+  costs one LLM call, a false hit serves a wrong AI-labelled answer. Never cache a
+  `source="fallback"` result. `normalize()` masks ONLY volatile ids — never mask
+  retry counters/percentages/thresholds (that would merge distinct alerts). A
+  cosine hit must pass the divergence guard. `normalize()` reuses the same id
+  shapes as `backend/stitching.py`'s mining patterns — changing one means
+  changing both. A hit keeps `source="ai"` (backend Teams routing depends on it);
+  only `cached=true` distinguishes it.
+- All LLM/provider wiring stays in one module (Azure AI Foundry today). The
+  semantic-cache embedding model (sentence-transformers) is local, not a provider
+  — it lives in `ai_service/semcache.py`, not `llm.py`.
 - All datetimes ae UTC and timezone aware (timestamptz in Postgres,
   datetime.now(timezone.utc) in Python - never utcnow(), never naive
   datetimes). The 90s stalled journey arithmetic depends on this.

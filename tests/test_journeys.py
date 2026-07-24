@@ -284,11 +284,13 @@ from backend.stitching import Stitcher  # noqa: F401 — used via JourneyAssembl
 
 FIXTURE = (
     Path(__file__).resolve().parent.parent
-    / "pipeline" / "data" / "mock-order-flows-v2.json"
+    / "pipeline" / "data" / "mock-order-flows-v3.json"
 )
 
-# The one log where eventId coexists with the new order id(s): inbound's
-# ResponseListener logging the creation response (CLAUDE.md Correlation Model).
+# The order-creation-response ack: inbound's ResponseListener line. In v3 it
+# carries ONLY eventId (no order ids) — the eventId->order-id join is recovered
+# by mining the order-engine creation logs' text (CLAUDE.md Correlation Model).
+# We still locate this line to exercise a poll boundary right at it.
 _BRIDGE_LOGGER = "c.c.inbound.listener.ResponseListener"
 
 
@@ -387,9 +389,10 @@ def test_flow_stitches_across_multiple_polls(flow):
 
 @pytest.mark.parametrize("flow", BRIDGE_FLOWS, ids=BRIDGE_FLOW_IDS)
 def test_flow_stitches_with_poll_boundary_at_the_bridge(flow):
-    # A poll boundary lands EXACTLY at the bridge line — the hardest split for
-    # the Correlation Model: phase 1 (eventId only) | bridge | phase 2 (order
-    # ids only). Single-pass stitching must still bridge the id change.
+    # A poll boundary lands EXACTLY at the (eventId-only) bridge line. The join
+    # no longer depends on the bridge: the order-engine creation logs preceding
+    # it already tied eventId to the order ids (mined from their text), so the
+    # phase-1 | bridge | phase-2 split must still yield one journey.
     logs, b = flow["logs"], flow["bridge_idx"]
     batches = [logs[:b], logs[b : b + 1], logs[b + 1 :]]
     batches = [batch for batch in batches if batch]

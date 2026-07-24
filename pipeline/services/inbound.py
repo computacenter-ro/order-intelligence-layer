@@ -5,16 +5,18 @@ Blocks:
     line, publish to order.inbound.queue. Failure variant (``fail_at=transform``,
     scenario 4): an unknown product has no SKU mapping → 3 delivery attempts →
     route to the DLQ, and the chain stops.
-  * ``bridge``  — the one log where eventId coexists with the new order id(s),
-    per ``ctx.bridge_ids``. Also emits the failure-response variant when the
-    order was never created (scenario 5).
+  * ``bridge``  — the order-creation-response acknowledgement. It carries ONLY
+    eventId (no order ids, neither as fields nor in its text). Also emits the
+    failure-response variant when the order was never created (scenario 5).
 
-Id discipline: ``receive`` is pure phase 1 (eventId only). ``bridge`` is the
-hinge — it logs eventId AND whichever order id(s) ctx.bridge_ids selected.
+Id discipline: ``receive`` and ``bridge`` are both pure phase 1 (eventId only).
+The bridge no longer links the id families — the eventId->order-id join is
+recovered downstream by mining the order-engine creation logs' message text
+(see backend/stitching.py and CLAUDE.md "THE CORRELATION MODEL"). The
+``ctx.bridge_ids`` knob is now inert (kept only to keep the scenario/baton
+schema unchanged); nothing reads it here anymore.
 """
 from __future__ import annotations
-
-import random
 
 from pipeline.services.blocklib import emit_line, phase1_ids
 from pipeline.services.profiles import profile
@@ -108,42 +110,20 @@ async def _transform_failure(emit: EmitFn, ctx: BatonContext) -> bool:
 
 @register("inbound", "bridge")
 async def bridge(baton: Baton, emit: EmitFn) -> bool:
-    """The bridge log: eventId + the order id(s) selected by ctx.bridge_ids.
+    """The order-creation-response acknowledgement — eventId ONLY.
 
-    This is the only line where eventId coexists with the order ids. Which ids
-    appear is driven by ctx.bridge_ids: ``both`` / ``order`` / ``cart`` /
-    ``random`` (resolved here). The message text mirrors the real system's
-    ResponseListener line and includes exactly the ids that are present.
+    Deliberately carries no order ids: not as structured fields and not in its
+    message text (the text ends ``: status=CREATED``). This line therefore no
+    longer links the eventId and order-id families. Correlation survives because
+    the order-engine creation logs — emitted just before this line, on the same
+    flow, carrying eventId as a field and the order ids in their message text —
+    let the stitcher mine and register the order ids as journey aliases (closing
+    the join even earlier than this line used to). ``ctx.bridge_ids`` is ignored.
     """
     ctx = baton.ctx
-    expose = _resolve_bridge_ids(ctx.bridge_ids)
-
-    order_id = ctx.orderId if expose in ("both", "order") else None
-    cart_id = ctx.cartHeaderId if expose in ("both", "cart") else None
-
-    # Message lists only the ids actually exposed on this line (fixture-faithful).
-    parts = []
-    if order_id is not None:
-        parts.append(f"orderNumber={order_id}")
-    if cart_id is not None:
-        parts.append(f"cartHeaderId={cart_id}")
-    detail = ", ".join(parts)
-
     await emit_line(
         emit, _PROF, logger=_LOG_RESPONSE_LISTENER, level="INFO", thread=_RESPONSE_THREAD,
-        message=f"Received order creation response for event {ctx.eventId}: {detail}",
-        ids={
-            "eventId": ctx.eventId,
-            "orderId": order_id,
-            "cartHeaderId": cart_id,
-            "accountNumber": ctx.accountNumber,
-        },
+        message=f"Received order creation response for event {ctx.eventId}: status=CREATED",
+        ids=phase1_ids(ctx),  # eventId + accountNumber only — no order ids
     )
     return True
-
-
-def _resolve_bridge_ids(bridge_ids: str) -> str:
-    """Resolve ``random`` to a concrete both/order/cart choice."""
-    if bridge_ids == "random":
-        return random.choice(("both", "order", "cart"))
-    return bridge_ids

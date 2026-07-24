@@ -5,8 +5,10 @@ collector) by calling the registered block handlers directly, exactly as
 ``pipeline/services/runner.py`` would, and assert:
 
   * the correlation-model invariants hold on the emitted LogLines
-    (phase-1 = eventId only; bridge = eventId + >=1 order id; phase-2 = both
-    order ids, never eventId);
+    (phase-1 = eventId only; the bridge ack = eventId ONLY; phase-2 = both
+    order ids, never eventId; and NO single line links both id families as
+    structured fields — the eventId->order-id join lives only in the
+    order-engine creation logs' message text);
   * each scenario ends on its canonical terminal message (the load-bearing text
     the backend's journey assembler matches on);
   * emitted lines carry the authentic "big project" identity (app_name / logger
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -27,7 +30,7 @@ from pipeline.services.registry import BLOCKS
 from shared.models import Baton, BatonContext, LogLine
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v2.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v3.json"
 
 # Importing the service modules registers their blocks (import side-effect).
 _SERVICE_MODULES = [
@@ -99,17 +102,18 @@ async def test_scenario_ends_on_canonical_terminal(sid):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sid", range(1, 11))
-async def test_no_event_id_on_phase2_lines(sid):
-    """No line that carries an order id may also carry eventId — except the bridge."""
+async def test_no_single_line_links_both_id_families_as_fields(sid):
+    """The honest-bridge invariant: NO emitted line carries an eventId FIELD
+    together with an order-id FIELD. The bridge is no longer an exception — it
+    now carries eventId only. (The eventId->order-id join lives solely in the
+    order-engine creation logs' message *text*, asserted separately.)"""
     logs, _ctx = await _drive(sid)
-    bridges = set(id(l) for l in _bridge_lines(logs))
     for l in logs:
-        if id(l) in bridges:
-            continue
-        if l.orderId is not None or l.cartHeaderId is not None:
-            assert l.eventId is None, (
-                f"S{sid}: eventId leaked onto phase-2 line: {l.message!r}"
-            )
+        has_evt = l.eventId is not None
+        has_order = l.orderId is not None or l.cartHeaderId is not None
+        assert not (has_evt and has_order), (
+            f"S{sid}: line links both id families as fields: {l.message!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -128,21 +132,55 @@ async def test_pre_creation_failures_are_event_id_only(sid):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10])
-async def test_bridge_has_event_id_and_at_least_one_order_id(sid):
-    """The bridge is the hinge: eventId + >=1 order id, matching bridge_ids."""
-    logs, ctx = await _drive(sid)
+async def test_bridge_carries_only_event_id(sid):
+    """The honest bridge: eventId ONLY — no order ids as fields, and none in its
+    text (the message ends ``: status=CREATED``). It no longer links the id
+    families; ``bridge_ids`` is inert."""
+    logs, _ctx = await _drive(sid)
     bridges = _bridge_lines(logs)
     assert len(bridges) == 1, f"S{sid}: expected exactly one bridge line, got {len(bridges)}"
     b = bridges[0]
     assert b.eventId is not None
-    assert (b.orderId is not None) or (b.cartHeaderId is not None)
-    # honor bridge_ids selection
-    if ctx.bridge_ids == "order":
-        assert b.orderId is not None and b.cartHeaderId is None
-    elif ctx.bridge_ids == "cart":
-        assert b.cartHeaderId is not None and b.orderId is None
-    elif ctx.bridge_ids == "both":
-        assert b.orderId is not None and b.cartHeaderId is not None
+    assert b.orderId is None and b.cartHeaderId is None, (
+        f"S{sid}: bridge still carries an order-id field: {b.message!r}"
+    )
+    assert b.message.endswith(": status=CREATED"), (
+        f"S{sid}: bridge message is not the honest form: {b.message!r}"
+    )
+    # No order id in the TEXT either (word-boundary — the same shapes the
+    # stitcher mines): the bridge must not be a de-facto family link.
+    assert not re.search(r"\bORD-\d+\b", b.message)
+    assert not re.search(r"\b\d{19}\b", b.message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10])
+async def test_creation_logs_carry_order_ids_in_text_contract(sid):
+    """CONTRACT (load-bearing, like the terminal messages): for every flow that
+    creates an order, the order-engine creation logs must expose BOTH order ids
+    in their message TEXT while carrying eventId as a field. This is the only
+    thing that ties the two id families together now that the bridge is honest —
+    the stitcher's mining depends on it. Fail loudly if that text ever changes.
+    """
+    logs, ctx = await _drive(sid)
+    creation = [
+        l for l in logs
+        if l.logger == "c.c.orderengine.service.OrderCreationService"
+        and l.eventId is not None
+    ]
+    # The orderId must appear as ORD-<n> in some creation line's text...
+    assert any(re.search(r"\bORD-\d+\b", l.message) for l in creation), (
+        f"S{sid}: no creation log exposes an ORD- id in its text"
+    )
+    # ...and the 19-digit cartHeaderId in some creation line's text.
+    assert any(re.search(r"\b\d{19}\b", l.message) for l in creation), (
+        f"S{sid}: no creation log exposes a 19-digit cart id in its text"
+    )
+    # And those mined ids must equal the ctx ids the flow actually minted.
+    joined = " ".join(l.message for l in creation)
+    assert ctx.orderId in joined and ctx.cartHeaderId in joined, (
+        f"S{sid}: creation-log text does not contain the minted ids"
+    )
 
 
 @pytest.mark.asyncio

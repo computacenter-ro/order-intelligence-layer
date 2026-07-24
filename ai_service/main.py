@@ -21,11 +21,12 @@ import asyncio
 import redis.asyncio as aioredis
 import uvicorn
 
-from ai_service import api, llm, settings
+from ai_service import api, llm, semcache, settings
 from ai_service.breaker import CircuitBreaker
 from ai_service.graph import PipelineDeps
 from ai_service.poller import Poller
 from ai_service.publisher import Publisher
+from ai_service.semcache import SemanticCache, SemCacheDeps
 
 
 async def _run() -> None:
@@ -36,6 +37,27 @@ async def _run() -> None:
         explainer=llm.explainer_model(),
         router=llm.router_model(),
     )
+
+    # Semantic cache: load the local embedding model ONCE, share the existing
+    # Redis for its dump + hit/miss counters, and restore any persisted entries.
+    encoder = semcache.load_encoder(settings.SEMCACHE_MODEL) if settings.SEMCACHE_ENABLED else None
+    semcache.configure(
+        SemCacheDeps(
+            cache=SemanticCache(
+                encoder,
+                threshold=settings.SEMCACHE_THRESHOLD,
+                max_entries=settings.SEMCACHE_MAX_ENTRIES,
+                salient_words=settings.SEMCACHE_SALIENT_WORDS,
+                guard=settings.SEMCACHE_GUARD,
+            ),
+            redis=redis_client,
+            dump_key=settings.SEMCACHE_KEY,
+            hits_key=settings.SEMCACHE_HITS_KEY,
+            misses_key=settings.SEMCACHE_MISSES_KEY,
+        )
+    )
+    await semcache.restore()
+
     poller = Poller(redis=redis_client, publisher=publisher, pipeline_deps=deps)
 
     # The summary API shares the same breaker + Redis; its model is the stronger
@@ -52,10 +74,11 @@ async def _run() -> None:
     )
 
     mode = "AI" if settings.llm_configured() else "FALLBACK (no Azure creds)"
+    cache_mode = "on" if (encoder is not None) else "off"
     print(
         f"[ai_service] started — poll every {settings.POLL_INTERVAL}s, "
         f"window [-{settings.WINDOW_START_OFFSET}s, -{settings.WINDOW_END_OFFSET}s], "
-        f"API on :8100, LLM mode: {mode}",
+        f"API on :8100, LLM mode: {mode}, semantic cache: {cache_mode}",
         flush=True,
     )
     try:

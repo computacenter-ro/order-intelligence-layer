@@ -111,3 +111,8 @@ class ProcessedAlert(BaseModel):
     severity: Severity | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     source: Literal["ai", "fallback"]
+    # True when this alert's explanation/routing was served from the AI
+    # service's semantic cache (a reused AI answer) rather than a fresh LLM
+    # call. ``source`` stays "ai" on a cache hit so backend routing is unchanged
+    # — this flag is purely informational (dashboard/metrics).
+    cached: bool = False

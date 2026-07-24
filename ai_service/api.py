@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 
-from ai_service import nodes
+from ai_service import nodes, semcache
 from ai_service.breaker import CircuitBreaker
 from shared.models import LogLine
 
@@ -94,6 +94,12 @@ app = FastAPI(title="AI Service — Journey Summary API")
 async def health() -> dict[str, str]:
     llm = "up" if (_deps and _deps.model is not None) else "fallback"
     return {"status": "ok", "llm": llm}
+
+
+@app.get("/semcache/stats")
+async def semcache_stats() -> dict:
+    """Current semantic-cache hit/miss counters + hit rate (the demo number)."""
+    return await semcache.stats()
 
 
 @app.post("/summarize-journey", response_model=SummaryResponse)

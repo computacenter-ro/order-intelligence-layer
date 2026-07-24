@@ -63,6 +63,45 @@ BREAKER_STATE_KEY = os.getenv("BREAKER_STATE_KEY", "ai:breaker:state")
 BREAKER_FAIL_THRESHOLD = int(os.getenv("BREAKER_FAIL_THRESHOLD", "3"))
 BREAKER_OPEN_SECONDS = int(os.getenv("BREAKER_OPEN_SECONDS", "60"))
 
+# --- Semantic cache -----------------------------------------------------------
+# Before the explainer+router LLM calls run for a WARN/ERROR log, a local
+# semantic cache is consulted (CLAUDE.md [3]): normalize the message (mask
+# volatile ids), exact-match the normalized text, else cosine-compare a local
+# embedding against stored vectors. A hit >= SEMCACHE_THRESHOLD reuses the
+# cached explanation/department/severity/confidence and skips both LLM calls.
+# The corpus is highly repetitive, so the hit rate is high after warm-up.
+SEMCACHE_ENABLED = os.getenv("SEMCACHE_ENABLED", "1") not in ("0", "false", "False", "")
+# Cosine-similarity floor for a semantic (non-exact) hit. High by default so
+# only near-identical logs collide; below it we miss and run the pipeline.
+SEMCACHE_THRESHOLD = float(os.getenv("SEMCACHE_THRESHOLD", "0.95"))
+# LRU capacity (distinct normalized log types kept in memory / persisted).
+SEMCACHE_MAX_ENTRIES = int(os.getenv("SEMCACHE_MAX_ENTRIES", "500"))
+# Local CPU embedding model loaded ONCE at startup (sentence-transformers).
+SEMCACHE_MODEL = os.getenv("SEMCACHE_MODEL", "all-MiniLM-L6-v2")
+# Redis keys: the persisted cache dump + the hit/miss counters (the demo number).
+SEMCACHE_KEY = os.getenv("SEMCACHE_KEY", "ai:semcache")
+SEMCACHE_HITS_KEY = os.getenv("SEMCACHE_HITS_KEY", "ai:semcache:hits")
+SEMCACHE_MISSES_KEY = os.getenv("SEMCACHE_MISSES_KEY", "ai:semcache:misses")
+# Divergence guard (cosine path only): a cosine candidate is rejected if the two
+# normalized messages disagree on a SALIENT token — cosine can't see that a
+# one-word flip ("succeeded" vs "failed") changes the meaning. Numbers/units are
+# always salient; these outcome/polarity/negation words are too. Extend the word
+# set for your own log vocabulary via SEMCACHE_SALIENT_EXTRA (comma-separated) —
+# for a real (non-mock) log stream, seed it with your domain's error/status
+# vocabulary. Set SEMCACHE_GUARD=0 to disable the guard (not recommended).
+SEMCACHE_GUARD = os.getenv("SEMCACHE_GUARD", "1") not in ("0", "false", "False", "")
+_SALIENT_DEFAULT = (
+    "failed", "failure", "succeeded", "success", "passed", "pass", "aborted",
+    "abort", "blocked", "denied", "deny", "rejected", "reject", "timeout",
+    "timed", "unavailable", "unauthorized", "forbidden", "retry", "retrying",
+    "final", "not", "no", "none", "unable", "cannot", "missing", "invalid",
+    "disabled", "enabled", "up", "down",
+)
+_SALIENT_EXTRA = tuple(
+    s.strip().lower() for s in os.getenv("SEMCACHE_SALIENT_EXTRA", "").split(",") if s.strip()
+)
+SEMCACHE_SALIENT_WORDS: frozenset[str] = frozenset(_SALIENT_DEFAULT + _SALIENT_EXTRA)
+
 # --- Suppression list ---------------------------------------------------------
 # Benign WARNs that must never become alerts (CLAUDE.md [3] "Suppression list").
 # Case-sensitive substring match on the log ``message`` (the fixture wording is

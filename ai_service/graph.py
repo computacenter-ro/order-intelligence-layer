@@ -25,7 +25,7 @@ from typing import TypedDict
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
-from ai_service import nodes
+from ai_service import nodes, semcache
 from ai_service.breaker import CircuitBreaker
 from shared.models import Department, LogLine, ProcessedAlert, Severity
 
@@ -86,11 +86,87 @@ def build_pipeline(deps: PipelineDeps):
 async def process(log: LogLine, deps: PipelineDeps) -> ProcessedAlert:
     """Run one WARN/ERROR log through the pipeline → a ``ProcessedAlert``.
 
+    Semantic cache short-circuit (CLAUDE.md [3]): BEFORE the breaker/LLM runs,
+    look up a near-identical, already-processed log by its normalized message.
+    On a hit we build the alert from the cached AI answer (ids re-filled) and
+    skip BOTH LLM calls. On a miss we run the pipeline exactly as before, then
+    store a successful AI result for reuse. The cache holds only AI answers, so
+    a miss while the breaker is open still falls back exactly as today.
+
     Never raises: LLM/breaker problems degrade to a fallback alert.
     """
+    cached_alert = await _try_cache(log)
+    if cached_alert is not None:
+        await semcache.record_hit()
+        return cached_alert
+
     app = build_pipeline(deps)
     state: _State = await app.ainvoke({"log": log})
-    return _to_alert(log, state)
+    alert = _to_alert(log, state)
+
+    await semcache.record_miss()
+    await _maybe_store(log, alert)
+    return alert
+
+
+async def _try_cache(log: LogLine) -> ProcessedAlert | None:
+    """Build a ProcessedAlert from a cache hit, or ``None`` on a miss.
+
+    The cached department is re-validated against the ``Department`` enum
+    defensively (a corrupt persisted payload must never yield an invalid
+    alert); an unusable payload is treated as a miss. The explanation's masked
+    ids are re-filled with THIS log's ids so the reused text reads correctly.
+    """
+    deps = semcache.get()
+    if deps is None:
+        return None
+    payload = deps.cache.lookup(log.message)
+    if payload is None:
+        return None
+    try:
+        department = Department(payload.department)
+    except (ValueError, TypeError):
+        return None  # corrupt payload → miss, run the pipeline
+    severity = None
+    if payload.severity is not None:
+        try:
+            severity = Severity(payload.severity)
+        except (ValueError, TypeError):
+            severity = None
+    explanation = semcache.refill(payload.normalized_explanation, log)
+    return ProcessedAlert(
+        alert_id=str(uuid.uuid4()),
+        emitted_at=datetime.now(timezone.utc),
+        log=log,
+        explanation=explanation,
+        department=department,
+        severity=severity,
+        confidence=payload.confidence,
+        source="ai",       # a cache hit is still an AI answer (routing unchanged)
+        cached=True,
+    )
+
+
+async def _maybe_store(log: LogLine, alert: ProcessedAlert) -> None:
+    """Store a successful (non-cached) AI alert for later reuse.
+
+    Only ``source="ai"`` results are cached — fallback pass-throughs are not an
+    answer worth reusing. The explanation is stored in NORMALIZED form (ids
+    masked) so :func:`semcache.refill` can substitute each future log's ids.
+    """
+    deps = semcache.get()
+    if deps is None or alert.source != "ai" or alert.cached:
+        return
+    if alert.explanation is None or alert.department is None:
+        return
+    payload = semcache.CachePayload(
+        normalized_explanation=semcache.normalize(alert.explanation),
+        department=alert.department.value,
+        severity=alert.severity.value if alert.severity is not None else None,
+        confidence=alert.confidence,
+    )
+    deps.cache.store(log.message, payload)
+    await semcache.persist()
 
 
 def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:

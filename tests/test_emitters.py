@@ -238,3 +238,76 @@ async def test_emitted_identity_matches_fixture():
         # Loggers: every emitted logger must be a real one for that service.
         unknown = slot["loggers"] - ident[app_name]["loggers"]
         assert not unknown, f"{app_name}: emitted logger(s) not in reference dataset: {unknown}"
+
+
+# =============================================================================
+# Minted-id uniqueness (order_engine._mint_ids)
+#
+# Uniqueness is load-bearing for CORRELATION, not cosmetic: the backend keys a
+# journey on an alias set of ids, so two flows sharing an orderId are merged
+# into one journey — the loser then never reaches a terminal marker and is swept
+# as TIMED_OUT. The original implementation drew orderId from
+# random.randint(1, 999), so a few dozen flows collided by the birthday bound.
+# =============================================================================
+def _mint(n: int) -> tuple[list[str], list[str]]:
+    """Mint ``n`` fresh id pairs through the real _mint_ids."""
+    from pipeline.services.order_engine import _mint_ids
+
+    orders: list[str] = []
+    carts: list[str] = []
+    for i in range(n):
+        ctx = BatonContext(eventId=f"evt-uniq-{i}", **SCENARIOS[1].context_seed())
+        _mint_ids(ctx)
+        orders.append(ctx.orderId)
+        carts.append(ctx.cartHeaderId)
+    return orders, carts
+
+
+def test_minted_ids_are_unique():
+    """No duplicates across many mints — the regression that caused TIMED_OUT."""
+    orders, carts = _mint(2000)
+    assert len(set(orders)) == len(orders), "duplicate orderId minted"
+    assert len(set(carts)) == len(carts), "duplicate cartHeaderId minted"
+
+
+def test_minted_cart_header_is_exactly_19_digits():
+    """backend/stitching.py mines the cart id with ``\\b\\d{19}\\b`` — anchored at
+    BOTH ends, so an 18- or 20-digit value silently stops correlating."""
+    _, carts = _mint(500)
+    assert {len(c) for c in carts} == {19}, sorted({len(c) for c in carts})
+    assert all(c.isdigit() for c in carts)
+    # The exact pattern the stitcher/semcache use must fullmatch.
+    assert all(re.fullmatch(r"\d{19}", c) for c in carts)
+
+
+def test_minted_order_id_matches_the_mined_pattern():
+    """orderId must stay ``ORD-<digits>`` (stitching.py + semcache.py both use
+    ``\\bORD-\\d+\\b``); the digit COUNT is free to grow."""
+    orders, _ = _mint(500)
+    assert all(re.fullmatch(r"ORD-\d+", o) for o in orders)
+
+
+def test_mint_ids_keeps_preseeded_ids():
+    """Deterministic tests pre-seed ids; _mint_ids must not overwrite them."""
+    from pipeline.services.order_engine import _mint_ids
+
+    ctx = BatonContext(eventId="evt-x", **SCENARIOS[1].context_seed())
+    ctx.orderId = "ORD-6001"
+    ctx.cartHeaderId = "1840927365018240001"
+    _mint_ids(ctx)
+    assert ctx.orderId == "ORD-6001"
+    assert ctx.cartHeaderId == "1840927365018240001"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", [1, 2, 3])
+async def test_concurrent_flows_never_share_order_ids(sid):
+    """End-to-end guard: driving the same scenario repeatedly must yield a
+    DISTINCT order id each run (this is what stops journey merging)."""
+    seen_orders, seen_carts = set(), set()
+    for _ in range(12):
+        _logs, ctx = await _drive(sid)
+        assert ctx.orderId not in seen_orders, f"orderId reused: {ctx.orderId}"
+        assert ctx.cartHeaderId not in seen_carts, f"cartHeaderId reused: {ctx.cartHeaderId}"
+        seen_orders.add(ctx.orderId)
+        seen_carts.add(ctx.cartHeaderId)

@@ -308,10 +308,19 @@ tells the next service "your turn to emit", carrying the flow context.
 | 10 | `SAP_SUBMISSION_FAILED` | sap | both |
 
 ### Injector (`pipeline/injector/inject.py`)
-Creates fresh ids (`eventId` = new UUID, `orderId` = `ORD-<seq>`,
-`cartHeaderId` = unique 19-digit), compiles the scenario's step chain into a
-baton, publishes it to `sim.step.inbound`.
+Mints **only** `eventId` (= `evt-<uuid>`) — per the correlation model the order
+ids do not exist yet — compiles the scenario's step chain into a baton, and
+publishes it to `sim.step.inbound`.
 `--scenario N` | `--all` (10 staggered) | `--mode continuous --interval S`.
+
+`orderId` / `cartHeaderId` are born later, in `order_engine._mint_ids`, and
+**must be unique** (`ORD-<seq>` from a counter; `cartHeaderId` = 13-digit prefix
++ 6-digit counter = **exactly 19 digits**). Uniqueness is load-bearing for
+correlation, not cosmetic: two flows sharing an `orderId` get merged into one
+journey, and the loser — starved of further logs — is swept as `TIMED_OUT`. Use a
+counter, never `random.randint` over a small range (the original 999-value
+random orderId collided within a few dozen flows). The 19-digit width is fixed by
+`backend/stitching.py`'s `\b\d{19}\b` mining pattern, anchored at both ends.
 
 ---
 

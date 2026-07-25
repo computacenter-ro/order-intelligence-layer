@@ -380,10 +380,16 @@ is ~90%+ (measured).
 
 - **Normalization is the key trick.** The cache key is the message with volatile
   ids masked (reusing the stitcher's id shapes): `ORD-\d+`→`<ORD>`,
-  `evt-…`→`<EVT>`, 19-digit→`<CART>`, 6+-digit account→`<ACC>`. So two same-type
-  logs differing only by ids collapse to one key. Semantically meaningful tokens
-  (retry counters `2/3`, percentages, thresholds) are **deliberately NOT masked**
-  — masking them would merge alerts that must stay distinct.
+  `evt-…`→`<EVT>`, 19-digit→`<CART>`, **exactly-8-digit** account→`<ACC>`. So two
+  same-type logs differing only by ids collapse to one key. Semantically
+  meaningful tokens (retry counters `2/3`, percentages, thresholds, **7-digit
+  product ids**) are **deliberately NOT masked** — masking them would merge
+  alerts that must stay distinct. The account pattern is `\d{8}`, not `\d{6,}`,
+  precisely so it cannot swallow a product id: `"No internal SKU mapping found
+  for product 9999999"` is *about* that id, and masking it both merged distinct
+  SKU-mapping alerts and made re-fill substitute the log's `accountNumber` where
+  a product id belonged. (Accounts are 8 digits and product ids 7 in
+  `shared/scenarios.py` — if that ever changes, this pattern changes with it.)
 - **Lookup order.** normalize → exact-match on normalized text (fast path, the
   overwhelming majority of hits) → else cosine over local `all-MiniLM-L6-v2`
   embeddings (CPU, loaded once at startup, injected like `api.py`'s deps) vs
@@ -402,7 +408,30 @@ is ~90%+ (measured).
   payload) degrades to a miss.**
 - **Id re-fill on hit.** The explanation is stored NORMALIZED (ids masked); on a
   hit the CURRENT log's ids are substituted back in, so the reused explanation
-  shows the right order id, never the cached one.
+  shows the right order id, never the cached one. **Every mask token
+  `normalize()` can emit must be re-fillable** — `<EVT>`/`<ORD>`/`<CART>` from
+  their fields (or mined from text), **`<ACC>` from `accountNumber`** — or the
+  placeholder leaks verbatim into the agent-facing explanation. A token with no
+  value on this log degrades to neutral prose ("the account"), never the raw
+  mask. Mining applies `_MASKS` precedence, so the account pattern can never
+  mine a 19-digit cart header and print it as an account.
+  (Re-filling `<ACC>` is display-only and does not make `accountNumber`
+  a correlation key — stitching still never consults it.)
+- **Single flight — concurrent identical logs.** The store happens only AFTER both
+  LLM calls return, so there is a multi-second window where an answer is being
+  computed but nothing records it. The poller runs alerts **concurrently**
+  (`ALERT_CONCURRENCY`) and a failure burst emits **byte-identical** lines
+  milliseconds apart — so without coalescing every log in the burst misses and
+  duplicates both LLM calls (measured: 4 identical logs → **8** LLM calls where 2
+  suffice; on the canonical scenarios this cost ~60% of the achievable hits). The
+  first caller for a normalized key is the **leader** and computes; concurrent
+  callers are **followers** that await its `CachePayload` and re-fill ids from
+  their OWN log (the payload is shared, never the leader's finished alert — that
+  is what keeps a follower from showing the leader's order id). If the leader
+  produces nothing reusable (fallback / breaker open / LLM error) followers are
+  woken with `None` and run the pipeline themselves — **still failing toward a
+  miss**. This is a cost optimization only: it never changes which answer a log
+  gets. Per-process (there is one AI service), no new infra.
 - **Provenance.** A hit keeps `source="ai"` (it *is* an AI answer, reused) so the
   backend's source-based Teams routing is untouched; it sets `cached=true` on the
   `ProcessedAlert` (the only field added to `shared/models.py`). Only `source="ai"`
@@ -687,8 +716,14 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
   (assert the model isn't invoked); two same-type logs with different ids hit
   (normalization); different error types miss (no false collapse); a
   retry-counter difference (`2/3` vs `3/3`) misses (meaningful tokens unmasked);
-  id re-fill puts the CURRENT log's id in the reused explanation; a log just
-  below `SEMCACHE_THRESHOLD` misses; the divergence guard vetoes a high-cosine
+  **concurrent identical logs call the LLM ONCE** (single flight: one leader, the
+  rest `cached=true`) while concurrent *distinct* types each still call it; a
+  follower shows its OWN ids, never the leader's; a failed leader does not poison
+  its followers (all get clean `source="fallback"`, nothing cached);
+  id re-fill puts the CURRENT log's id in the reused explanation; **no mask
+  token (`<ORD>`/`<ACC>`/…) ever survives re-fill, for any log** — including a
+  log missing every id; a cart header is never re-filled as the account; a log
+  just below `SEMCACHE_THRESHOLD` misses; the divergence guard vetoes a high-cosine
   meaning-flip (`succeeded` vs `failed`) → miss; hit/miss counters increment;
   fallbacks are never cached.
 - **Journey rules**: each of the 10 scenarios ends with its expected outcome;
@@ -723,7 +758,10 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 - The semantic cache must **fail toward a miss**, never a false hit: a false miss
   costs one LLM call, a false hit serves a wrong AI-labelled answer. Never cache a
   `source="fallback"` result. `normalize()` masks ONLY volatile ids — never mask
-  retry counters/percentages/thresholds (that would merge distinct alerts). A
+  retry counters/percentages/thresholds/**7-digit product ids** (that would merge
+  distinct alerts). **Anything `normalize()` masks, `refill()` must be able to put
+  back**, or the mask either shows up verbatim in the explanation or — worse — gets
+  a wrong value substituted in its place. A
   cosine hit must pass the divergence guard. `normalize()` reuses the same id
   shapes as `backend/stitching.py`'s mining patterns — changing one means
   changing both. A hit keeps `source="ai"` (backend Teams routing depends on it);

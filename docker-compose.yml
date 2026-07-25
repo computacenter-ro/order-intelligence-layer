@@ -97,6 +97,8 @@ services:
     image: oil-app
     restart: on-failure          # same RabbitMQ startup-race guard as mock-services
     command: python -m ai_service.main
+    ports:
+      - "8100:8100"   # /semcache/stats + /summarize-journey reachable from the host
     environment:
       ES_URL: http://collector:9200
       REDIS_URL: redis://redis:6379/0

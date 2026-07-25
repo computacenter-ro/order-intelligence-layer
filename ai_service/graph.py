@@ -93,6 +93,14 @@ async def process(log: LogLine, deps: PipelineDeps) -> ProcessedAlert:
     store a successful AI result for reuse. The cache holds only AI answers, so
     a miss while the breaker is open still falls back exactly as today.
 
+    Single flight: the cache is only populated after the LLM returns, so
+    concurrent identical logs (the poller runs alerts concurrently, and a
+    failure burst emits byte-identical lines) would each miss and each call the
+    LLM. The first caller for a normalized key computes; the rest await its
+    payload and re-fill ids from their OWN log. Followers whose leader produced
+    no reusable answer run the pipeline themselves — the cache still fails
+    toward a miss.
+
     Never raises: LLM/breaker problems degrade to a fallback alert.
     """
     cached_alert = await _try_cache(log)
@@ -100,12 +108,41 @@ async def process(log: LogLine, deps: PipelineDeps) -> ProcessedAlert:
         await semcache.record_hit()
         return cached_alert
 
+    deps_sc = semcache.get()
+    key = semcache.normalize(log.message) if deps_sc is not None else None
+    follow = deps_sc.inflight.leader(key) if key is not None else None
+    if follow is not None:
+        # A task is already computing this exact log type — await its answer
+        # instead of duplicating both LLM calls.
+        payload = await follow
+        alert = _alert_from_payload(log, payload) if payload is not None else None
+        if alert is not None:
+            await semcache.record_hit()
+            return alert
+        # Leader had no reusable answer (fallback/breaker/error) → do it myself.
+        return await _run_pipeline(log, deps, store=False)
+
+    try:
+        return await _run_pipeline(log, deps, store=True)
+    finally:
+        if key is not None:
+            # Publish the leader's OWN stored payload (peek_exact, never the
+            # fuzzy cosine path — a lookalike neighbour is not this leader's
+            # answer). None when nothing reusable was produced, which sends
+            # followers to the pipeline rather than to a wrong answer.
+            done = deps_sc.cache.peek_exact(log.message) if deps_sc.cache.enabled else None
+            deps_sc.inflight.resolve(key, done)
+
+
+async def _run_pipeline(log: LogLine, deps: PipelineDeps, *, store: bool) -> ProcessedAlert:
+    """Run the explainer→router graph for ``log`` and count it as a cache miss."""
     app = build_pipeline(deps)
     state: _State = await app.ainvoke({"log": log})
     alert = _to_alert(log, state)
 
     await semcache.record_miss()
-    await _maybe_store(log, alert)
+    if store:
+        await _maybe_store(log, alert)
     return alert
 
 
@@ -123,6 +160,18 @@ async def _try_cache(log: LogLine) -> ProcessedAlert | None:
     payload = deps.cache.lookup(log.message)
     if payload is None:
         return None
+    return _alert_from_payload(log, payload)
+
+
+def _alert_from_payload(log: LogLine, payload: semcache.CachePayload) -> ProcessedAlert | None:
+    """Build a cached-hit alert for ``log`` from a reusable payload.
+
+    Shared by the cache-hit path and the single-flight follower path — both
+    reuse another log's answer, and both must re-fill ids from THIS log. The
+    department is re-validated against the enum defensively (a corrupt persisted
+    payload must never yield an invalid alert); ``None`` means "unusable, run
+    the pipeline instead".
+    """
     try:
         department = Department(payload.department)
     except (ValueError, TypeError):

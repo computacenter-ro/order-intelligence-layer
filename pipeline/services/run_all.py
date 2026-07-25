@@ -38,26 +38,67 @@ def _all_services() -> list[str]:
     return services
 
 
-async def _run() -> None:
+async def _run() -> list[str]:
+    """Run every service concurrently; return the names that died.
+
+    ``return_exceptions=True`` is load-bearing. Without it the FIRST task to raise
+    makes ``gather`` propagate immediately and the other nine are abandoned
+    mid-flight — they keep looping with nobody awaiting them, which is how this
+    process used to end up alive but not consuming (a container that looks healthy
+    to Docker while draining no queues). With it, every task is awaited, one
+    service's failure is contained, and the caller can decide deliberately.
+    """
     services = _all_services()
     print(f"[run_all] starting {len(services)} services: {', '.join(services)}", flush=True)
     # One task per service; each runs its own consume loop forever. If one dies,
     # surface it but keep the others alive.
     tasks = [asyncio.create_task(run_service(svc), name=svc) for svc in services]
     try:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:  # pragma: no cover - Ctrl-C path
         for task in tasks:
             task.cancel()
         raise
 
+    # A consume loop is supposed to run forever, so ANY return here is a death —
+    # an exception or an unexpected clean exit. Name each one; the broker-unreachable
+    # case can no longer appear (runner._connect retries), so anything landing here
+    # is a real bug worth a non-zero exit and a restart.
+    failed: list[str] = []
+    for service, result in zip(services, results):
+        if isinstance(result, asyncio.CancelledError):
+            continue  # shutdown, not a failure
+        if isinstance(result, BaseException):
+            print(
+                f"[run_all] service {service!r} died: "
+                f"{type(result).__name__}: {result}",
+                flush=True,
+            )
+        else:
+            print(f"[run_all] service {service!r} exited unexpectedly", flush=True)
+        failed.append(service)
+    return failed
 
-def main() -> None:
+
+def main() -> int:
+    """Exit non-zero if any service died, so ``restart: on-failure`` can act.
+
+    The old code could leave the process alive with dead consumers, so Docker saw
+    a healthy container and never restarted it. Returning a real exit status makes
+    the failure visible to the orchestrator (compose restart policy today, a
+    Kubernetes liveness probe later).
+    """
     try:
-        asyncio.run(_run())
+        failed = asyncio.run(_run())
     except KeyboardInterrupt:  # pragma: no cover
         print("\n[run_all] shutting down", flush=True)
+        return 0
+    if failed:
+        print(f"[run_all] exiting non-zero: {len(failed)} service(s) died: {', '.join(failed)}",
+              flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

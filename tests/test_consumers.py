@@ -126,6 +126,28 @@ def test_alert_row_values_ai_maps_log_and_enrichment():
     assert values["source"] == "ai"
 
 
+def test_alert_row_values_maps_cached_flag():
+    # A semantic-cache hit must reach the row; it was previously computed on the
+    # ProcessedAlert and then dropped at the DB boundary.
+    hit = _alert("ai")
+    hit.cached = True
+    assert alert_row_values(hit)["cached"] is True
+
+
+def test_alert_row_values_cached_defaults_false_and_keeps_source_ai():
+    # cached modifies source rather than replacing it: a hit is still "ai", which
+    # is what the backend's Teams routing keys off.
+    values = alert_row_values(_alert("ai"))
+    assert values["cached"] is False
+    assert values["source"] == "ai"
+
+
+def test_alert_row_values_fallback_is_never_cached():
+    # Fallbacks are never stored in the cache, so they can never be served from it.
+    values = alert_row_values(_alert("fallback"))
+    assert values["cached"] is False
+
+
 def test_alert_row_values_fallback_nulls_enrichment():
     values = alert_row_values(_alert("fallback"))
     assert values["source"] == "fallback"

@@ -68,6 +68,8 @@ export default function AlertFeedPage() {
         level: filters.level === "all" ? undefined : filters.level,
         app_name: filters.app_name === "all" ? undefined : filters.app_name,
         severity: filters.severity === "all" ? undefined : filters.severity,
+        // "all" omits the param; otherwise "cached" -> true, "fresh" -> false.
+        cached: filters.cached === "all" ? undefined : filters.cached === "cached",
         resolved: false,
         sort: "emitted_at",
         cursor: cursor ?? undefined,

@@ -18,6 +18,10 @@ export type SourceFilter = "all" | "ai" | "fallback";
 export type LevelFilter = "all" | "WARN" | "ERROR";
 export type AppNameFilter = "all" | (typeof APP_NAMES)[number];
 export type SeverityFilter = "all" | "critical" | "high" | "medium" | "low";
+// Semantic-cache provenance. Orthogonal to SourceFilter — cached alerts are all
+// source="ai" — so this narrows within AI answers rather than competing with it.
+// "all" is the same UI-only sentinel; the page maps it to `undefined`.
+export type CachedFilter = "all" | "cached" | "fresh";
 
 export interface AlertFilters {
   department: DepartmentFilter;
@@ -25,6 +29,7 @@ export interface AlertFilters {
   level: LevelFilter;
   app_name: AppNameFilter;
   severity: SeverityFilter;
+  cached: CachedFilter;
 }
 
 export const DEFAULT_ALERT_FILTERS: AlertFilters = {
@@ -33,6 +38,7 @@ export const DEFAULT_ALERT_FILTERS: AlertFilters = {
   level: "all",
   app_name: "all",
   severity: "all",
+  cached: "all",
 };
 
 const DEPARTMENTS: Department[] = ["networking", "devops", "backend", "database", "general"];
@@ -63,6 +69,7 @@ const APP_NAME_FILTERS: AppNameFilter[] = ["all", ...APP_NAMES];
 // Router LLM severities (shared/models.py Severity), most→least urgent.
 const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 const SEVERITY_FILTERS: SeverityFilter[] = ["all", ...SEVERITIES];
+const CACHED_FILTERS: CachedFilter[] = ["all", "cached", "fresh"];
 
 // Labels spelled out where capitalize() would mangle them ("ai" -> "Ai").
 const SOURCE_LABELS: Record<SourceFilter, string> = {
@@ -75,6 +82,12 @@ const LEVEL_LABELS: Record<LevelFilter, string> = {
   all: "All Levels",
   WARN: "WARN",
   ERROR: "ERROR",
+};
+
+const CACHED_LABELS: Record<CachedFilter, string> = {
+  all: "All Answers",
+  cached: "Cached",
+  fresh: "Freshly analyzed",
 };
 
 const SEVERITY_LABELS: Record<SeverityFilter, string> = {
@@ -107,7 +120,10 @@ export function sanitizeAlertFilters(raw: unknown): AlertFilters {
   const severity = SEVERITY_FILTERS.includes(obj.severity as SeverityFilter)
     ? (obj.severity as SeverityFilter)
     : "all";
-  return { department, source, level, app_name, severity };
+  const cached = CACHED_FILTERS.includes(obj.cached as CachedFilter)
+    ? (obj.cached as CachedFilter)
+    : "all";
+  return { department, source, level, app_name, severity, cached };
 }
 
 /**
@@ -125,6 +141,10 @@ export function alertMatchesFilters(alert: ProcessedAlert, filters: AlertFilters
   if (filters.level !== "all" && alert.level !== filters.level) return false;
   if (filters.app_name !== "all" && alert.app_name !== filters.app_name) return false;
   if (filters.severity !== "all" && alert.severity !== filters.severity) return false;
+  // Mirrors `Alert.cached == cached` server-side. Fallback alerts are never
+  // cache hits, so "cached" excludes them and "fresh" admits them — the same
+  // partition the backend applies.
+  if (filters.cached !== "all" && alert.cached !== (filters.cached === "cached")) return false;
   return true;
 }
 
@@ -265,6 +285,25 @@ export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
           {SOURCE_FILTERS.map((src) => (
             <option key={src} value={src}>
               {SOURCE_LABELS[src]}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column" }}>
+        <label htmlFor="alert-filter-cached" style={labelStyle}>
+          Answer
+        </label>
+        <select
+          id="alert-filter-cached"
+          className="oil-filter-select"
+          style={selectStyle}
+          value={value.cached}
+          onChange={(e) => onChange({ ...value, cached: e.target.value as CachedFilter })}
+        >
+          {CACHED_FILTERS.map((c) => (
+            <option key={c} value={c}>
+              {CACHED_LABELS[c]}
             </option>
           ))}
         </select>

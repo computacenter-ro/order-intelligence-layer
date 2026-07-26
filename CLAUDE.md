@@ -575,7 +575,7 @@ possibly later than the alert that referenced it.
 ```
 alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
        event_id, order_id, cart_header_id, account_number,
-       explanation, department, severity, confidence, source, journey_id FK NULL)
+       explanation, department, severity, confidence, source, cached, journey_id FK NULL)
 journeys(journey_id PK, status, outcome NULL, first_ts, last_ts,
          event_id, order_id, cart_header_id, summary NULL)
 journey_events(journey_id FK, log_id UNIQUE, ts, raw JSONB)
@@ -586,7 +586,10 @@ journey_events(journey_id FK, log_id UNIQUE, ts, raw JSONB)
 POST /auth/login                        # {username,password} -> sets httpOnly session cookie
 POST /auth/logout                       # clears the cookie
 GET  /auth/me                           # current user (401 if no valid session) — the frontend guard
-GET  /alerts?since=&department=&source= # 🔒 requires session
+GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
+                                        # cached=true|false is ORTHOGONAL to source:
+                                        # every cached alert is source="ai", so it
+                                        # narrows within AI answers, not beside them.
 GET  /journeys?status=                  # 🔒 requires session
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
 WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
@@ -649,7 +652,11 @@ failing sink so one never stops the other or the consumers.
 
 Connects to backend WS + REST. Feature contract:
 - Real-time alert feed with plain-English explanations.
-- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**
+- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**, plus a
+  **`Cached` badge alongside `AI-analyzed`** when `ProcessedAlert.cached` is set
+  (a cache hit is the same AI answer reused — a modifier, never a replacement, so
+  the two badges show together). An "Answer" filter (`all` / `cached` / `fresh`)
+  maps to `?cached=`.
   (from `ProcessedAlert.source`).
 - Order journey timeline view: complete path — services touched, where it
   stopped, why; per-step alert explanations where they exist; LLM journey

@@ -84,6 +84,10 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
         "severity": alert.severity.value if alert.severity is not None else None,
         "confidence": alert.confidence,
         "source": alert.source,
+        # Semantic-cache hit: the explanation/department were reused rather than
+        # recomputed. Kept distinct from ``source`` on purpose — a hit is still
+        # source="ai", so Teams routing is unchanged and only this flag differs.
+        "cached": alert.cached,
     }
 
 

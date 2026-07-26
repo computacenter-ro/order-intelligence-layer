@@ -235,6 +235,54 @@ def test_alerts_query_severity_only():
     assert "department =" not in sql and "source =" not in sql
 
 
+def test_alerts_query_cached_true_only():
+    sql = _compiled(build_alerts_query(None, None, None, cached=True))
+    assert "cached =" in sql
+    assert "source =" not in sql
+    assert "severity =" not in sql
+
+
+def test_alerts_query_cached_false_is_a_real_filter_not_omitted():
+    # cached=False must narrow to non-cache-hits. A truthiness check instead of
+    # `is not None` would silently drop this filter and return everything.
+    sql = _compiled(build_alerts_query(None, None, None, cached=False))
+    assert "cached =" in sql
+
+
+def test_alerts_query_cached_none_omits_the_filter():
+    assert "cached =" not in _compiled(build_alerts_query(None, None, None))
+
+
+def test_alerts_query_cached_composes_with_source():
+    # cached is orthogonal to source (every cached alert is source="ai"), so
+    # both predicates must appear together rather than one replacing the other.
+    sql = _compiled(build_alerts_query(None, None, "ai", cached=True))
+    assert "source =" in sql and "cached =" in sql
+
+
+def test_get_alerts_accepts_cached_query_param():
+    _use([_FakeResult(items=[_alert(alert_id="a1", cached=True)])])
+    r = TestClient(app).get("/alerts", params={"cached": "true"})
+    assert r.status_code == 200
+    assert r.json()["items"][0]["cached"] is True
+
+
+def test_get_alerts_rejects_non_boolean_cached():
+    _use([_FakeResult(items=[])])
+    assert TestClient(app).get("/alerts", params={"cached": "maybe"}).status_code == 422
+
+
+def test_alert_out_coerces_unflushed_none_cached_to_false():
+    # `cached` has a DB-side server_default, so an Alert serialized before it is
+    # flushed (the alert.new WebSocket envelope does exactly that) reads None.
+    # AlertOut must normalize that to False rather than 500 on a non-optional bool.
+    from backend.schemas import AlertOut
+
+    row = _alert(alert_id="a1")
+    assert row.cached is None  # guards the premise: no Python-side value pre-flush
+    assert AlertOut.model_validate(row).cached is False
+
+
 def test_journeys_query_status_filter():
     assert "status =" in _compiled(build_journeys_query("SUCCESS"))
     assert "WHERE" not in _compiled(build_journeys_query(None))

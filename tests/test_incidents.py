@@ -536,10 +536,9 @@ async def test_new_incident_emits_incident_new_via_on_event():
     assert events[0]["data"]["failure_subtype"] == "ENRICHMENT_FAILED"
 
 
-async def test_joining_existing_incident_does_not_emit_incident_new():
-    """Joining an already-open incident must NOT push incident.new — only the
-    newly-created case does (mirrors alert.new: a push per new row, never an
-    in-place update as an incident's counts grow)."""
+async def test_joining_existing_incident_emits_incident_updated_not_new():
+    """Joining an already-open incident must push incident.updated (counts
+    grew), NOT incident.new — that's reserved for the actually-new row."""
     existing = Incident(
         incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
         failing_service="SPT", error_token=None, title="ENRICHMENT_FAILED — SPT",
@@ -571,7 +570,12 @@ async def test_joining_existing_incident_does_not_emit_incident_new():
         session, _completion(JourneyStatus.FAILED), on_event=on_event
     )
     assert incident is existing
-    assert events == []  # joined, not created — no push
+    assert len(events) == 1
+    assert events[0]["type"] == "incident.updated"
+    assert events[0]["data"]["incident_id"] == existing.incident_id
+    # The count bump is visible in the pushed payload, not just in memory.
+    assert events[0]["data"]["alert_count"] == 5
+    assert events[0]["data"]["journey_count"] == 2
 
 
 from backend.incidents import INCIDENT_QUIET_TIMEOUT, sweep_stale_incidents

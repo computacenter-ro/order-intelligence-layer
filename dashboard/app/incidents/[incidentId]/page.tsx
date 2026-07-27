@@ -8,10 +8,11 @@ import { WarningIcon } from "@phosphor-icons/react";
 import { fetchIncident, resolveIncident } from "@/lib/api";
 import { groupAlertsByOrder } from "@/lib/incidents";
 import { INCIDENT_STATUS_BADGE, INCIDENT_STATUS_LABEL } from "@/lib/incidentStatus";
+import { useWebSocket } from "@/lib/useWebSocket";
 import { Badge } from "@/components/ui/Badge";
 import { OrderGroupRow } from "@/components/incidents/OrderGroupRow";
 import { formatTime, capitalize } from "@/lib/format";
-import type { IncidentDetail } from "@/lib/types";
+import type { IncidentDetail, WsEvent } from "@/lib/types";
 
 export default function IncidentDetailPage() {
   const params = useParams<{ incidentId: string }>();
@@ -37,6 +38,21 @@ export default function IncidentDetailPage() {
       .catch((err) => console.error("Failed to resolve incident:", err))
       .finally(() => setResolving(false));
   }, [incident]);
+
+  const handleEvent = useCallback(
+    (event: WsEvent) => {
+      if (event.type !== "incident.updated") return;
+      if (event.data.incident_id !== params.incidentId) return;
+      // Counts/last_ts changed AND a new order's alerts joined — re-fetch full
+      // detail rather than patching just the header fields (mirrors the
+      // journey detail page's journey.updated handling: a re-fetch is what
+      // grows the list, the pushed payload itself is header-only).
+      fetchIncident(params.incidentId).then(setIncident).catch(() => {});
+    },
+    [params.incidentId]
+  );
+
+  useWebSocket(handleEvent);
 
   if (loading) {
     return <p style={{ fontSize: "16px", color: "var(--cc-grey-three)" }}>Loading incident…</p>;

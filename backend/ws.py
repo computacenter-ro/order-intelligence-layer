@@ -12,9 +12,10 @@ Every pushed message uses one consistent envelope::
 
 with ``type`` one of ``alert.new`` / ``journey.updated`` / ``journey.completed``
 (CLAUDE.md: ``alert.new | journey.updated | journey.completed``) plus
-``incident.new`` (a newly-created incident — mirrors ``alert.new``'s "push the
-just-created row" shape; incidents growing in place or resolving are not
-pushed live, same as an alert never gets an in-place WS update).
+``incident.new`` (a freshly created incident) and ``incident.updated`` (an
+existing OPEN incident just absorbed another journey — counts/last_ts
+changed). Resolving an incident is not pushed live — same as an individual
+alert resolve, which is REST-only and applied by the dashboard optimistically.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ EVENT_ALERT_NEW = "alert.new"
 EVENT_JOURNEY_UPDATED = "journey.updated"
 EVENT_JOURNEY_COMPLETED = "journey.completed"
 EVENT_INCIDENT_NEW = "incident.new"
+EVENT_INCIDENT_UPDATED = "incident.updated"
 
 
 def make_event(type_: str, data: dict) -> dict:

@@ -42,7 +42,7 @@ export default function IncidentsPage() {
     [status]
   );
 
-  const { items, loading, hasMore, loadMore, reload, prepend, remove } = usePagination<Incident>(
+  const { items, loading, hasMore, loadMore, reload, prepend, remove, patch } = usePagination<Incident>(
     fetchPage,
     (i) => i.incident_id
   );
@@ -67,6 +67,14 @@ export default function IncidentsPage() {
 
   const handleEvent = useCallback(
     (event: WsEvent) => {
+      if (event.type === "incident.updated") {
+        // An already-open incident absorbed another journey — its counts /
+        // last_ts changed in place, so patch the row directly rather than
+        // treating it as a new arrival. No-op if it isn't currently loaded
+        // (e.g. it's on a page not yet fetched via "Load more").
+        patch(event.data.incident_id, event.data);
+        return;
+      }
       if (event.type !== "incident.new") return;
       // A freshly created incident is always "open" — it only belongs in the
       // live feed under the "open"/"all" filters, never under "resolved".
@@ -75,7 +83,7 @@ export default function IncidentsPage() {
         prev.some((i) => i.incident_id === event.data.incident_id) ? prev : [event.data, ...prev]
       );
     },
-    [status]
+    [status, patch]
   );
 
   useWebSocket(handleEvent);

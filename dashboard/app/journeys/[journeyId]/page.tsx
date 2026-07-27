@@ -34,7 +34,8 @@ export default function JourneyDetailPage() {
 
   const handleEvent = useCallback(
     (event: WsEvent) => {
-      if (event.type === "incident.new") return; // this page has no use for incident events
+      // this page has no use for incident events
+      if (event.type === "incident.new" || event.type === "incident.updated") return;
       if (event.data.journey_id !== params.journeyId) return;
       if (event.type === "journey.completed") {
         setJourney(event.data);

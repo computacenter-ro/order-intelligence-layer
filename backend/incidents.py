@@ -456,6 +456,16 @@ def _incident_new_event(incident) -> dict:
     return make_event(EVENT_INCIDENT_NEW, data)
 
 
+def _incident_updated_event(incident) -> dict:
+    """An ``incident.updated`` envelope for an existing incident that just
+    absorbed another journey (counts/last_ts changed, same row)."""
+    from backend.schemas import IncidentOut
+    from backend.ws import EVENT_INCIDENT_UPDATED, make_event
+
+    data = IncidentOut.model_validate(incident).model_dump(mode="json")
+    return make_event(EVENT_INCIDENT_UPDATED, data)
+
+
 async def process_completion(session, completion, *, now: datetime | None = None, on_event=None):
     """Cluster one journey's completion into an incident, or return ``None``
     if ineligible (source spec §4 Eligibility):
@@ -470,10 +480,10 @@ async def process_completion(session, completion, *, now: datetime | None = None
     completion safely).
 
     When ``on_event`` is given (e.g. the WebSocket hub's ``broadcast``, same as
-    ``backend/journeys.py``'s ``on_event`` wiring), emits ``incident.new`` —
-    but ONLY when this call actually created a fresh incident, never when it
-    joined an existing one. Mirrors ``alert.new``: a push for the newly-created
-    row, not an in-place update as an incident's counts grow.
+    ``backend/journeys.py``'s ``on_event`` wiring), emits ``incident.new`` when
+    this call created a fresh incident, or ``incident.updated`` when it joined
+    an already-open one — so ``journey_count``/``alert_count``/``last_ts`` stay
+    live on screen as an incident's blast radius grows, not just at creation.
     """
     from sqlalchemy import select, update
     from backend.db import Alert, Journey
@@ -533,8 +543,11 @@ async def process_completion(session, completion, *, now: datetime | None = None
     )
     await session.commit()
 
-    if on_event is not None and is_new:
-        await on_event(_incident_new_event(incident))
+    if on_event is not None:
+        if is_new:
+            await on_event(_incident_new_event(incident))
+        else:
+            await on_event(_incident_updated_event(incident))
     return incident
 
 

@@ -24,6 +24,10 @@ export interface Paginated<T> {
   prepend: (item: T) => void;
   /** Drop an item by id (e.g. a resolved alert leaving the feed). */
   remove: (id: string) => void;
+  /** Merge `updates` into the item with this id in place; no-op if the item
+   * isn't currently loaded (e.g. filtered out, or on a page not yet fetched).
+   * WS `incident.updated` — counts/last_ts changing on an already-visible row. */
+  patch: (id: string, updates: Partial<T>) => void;
 }
 
 export function usePagination<T>(
@@ -118,11 +122,17 @@ export function usePagination<T>(
     setItems((prev) => prev.filter((it) => idOfRef.current(it) !== id));
   }, []);
 
+  const patch = useCallback((id: string, updates: Partial<T>) => {
+    setItems((prev) =>
+      prev.map((it) => (idOfRef.current(it) === id ? { ...it, ...updates } : it))
+    );
+  }, []);
+
   // Initial load at mount. `reload` is stable, so this fires exactly once; the
   // page drives subsequent reloads itself when its filters change.
   useEffect(() => {
     reload();
   }, [reload]);
 
-  return { items, loading, hasMore, error, loadMore, reload, prepend, remove };
+  return { items, loading, hasMore, error, loadMore, reload, prepend, remove, patch };
 }

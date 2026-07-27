@@ -18,6 +18,9 @@ Endpoints:
   one of ``WARN`` / ``ERROR``; any other value is a 422 (validated at the route,
   so ``build_alerts_query`` stays pure). ``app_name`` is a free string (the set
   of services can grow) — an unknown value simply matches nothing.
+  ``cached=true|false`` narrows by semantic-cache provenance; it is orthogonal to
+  ``source`` (every cached alert is ``source="ai"``), so it filters *within* AI
+  answers rather than beside them.
 * ``GET /journeys?status=`` — journeys filtered by ``status``.
 * ``GET /journeys/{journey_id}`` — one journey + its events (ordered by ``ts``)
   + summary; 404 if the journey does not exist.
@@ -50,6 +53,7 @@ def build_alerts_query(
     app_name: str | None = None,
     severity: str | None = None,
     resolved: bool | None = None,
+    cached: bool | None = None,
 ) -> Select:
     """Select alerts filtered by the given criteria.
 
@@ -72,6 +76,8 @@ def build_alerts_query(
         stmt = stmt.where(Alert.app_name == app_name)
     if severity is not None:
         stmt = stmt.where(Alert.severity == severity)
+    if cached is not None:
+        stmt = stmt.where(Alert.cached == cached)
     return stmt
 
 
@@ -122,6 +128,10 @@ async def list_alerts(
     severity: Annotated[
         Literal["critical", "high", "medium", "low"] | None, Query()
     ] = None,
+    # Semantic-cache provenance. Orthogonal to ``source``: cached alerts are all
+    # source="ai", so ?cached=true narrows within AI answers rather than being an
+    # alternative to them. Omitted = both.
+    cached: Annotated[bool | None, Query()] = None,
     # Cursor pagination (see backend/pagination.py). limit is clamped to 1..100
     # rather than 422'd so a caller can pass anything and still get a sane page.
     limit: Annotated[int, Query()] = 16,
@@ -140,6 +150,7 @@ async def list_alerts(
             app_name=app_name,
             severity=severity,
             resolved=resolved,
+            cached=cached,
         ),
         sort_col,
         Alert.alert_id,

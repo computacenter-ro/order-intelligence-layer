@@ -148,6 +148,18 @@ class Alert(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=False)
 
+    # Semantic-cache provenance: True when the AI service reused a stored answer
+    # instead of calling the LLM. A MODIFIER on source="ai" (a hit is still an AI
+    # answer), never an alternative to it — Teams routing keys off source alone.
+    # Non-null with a false default, mirroring ProcessedAlert.cached.
+    # ``default`` (Python-side) as well as ``server_default`` (DDL): the server
+    # default only applies on INSERT, so an Alert built in memory and serialized
+    # before any flush — exactly what the ``alert.new`` WebSocket envelope does —
+    # would otherwise read None and fail AlertOut's non-optional bool.
+    cached: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.false()
+    )
+
     # Nullable FK: the alert may precede its assembled journey.
     journey_id: Mapped[str | None] = mapped_column(
         ForeignKey("journeys.journey_id"), nullable=True, index=True

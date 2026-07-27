@@ -39,6 +39,10 @@ export interface ProcessedAlert {
   severity: Severity | null;
   confidence: number | null;
   source: "ai" | "fallback";
+  // Semantic-cache hit: the AI answer was reused rather than recomputed. A
+  // modifier on source="ai", not an alternative — cached alerts are still
+  // AI-analyzed, so both flags are shown together.
+  cached: boolean;
   journey_id: string | null;
   is_resolved: boolean;
   resolved_at: string | null;

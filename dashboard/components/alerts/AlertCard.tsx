@@ -75,6 +75,13 @@ export function AlertCard({ alert, onOpen, onResolve, isSelected = false }: Aler
           {alert.source === "ai" ? (
             <>
               <Badge status="other">AI-analyzed</Badge>
+              {/* Modifier on AI-analyzed, never a replacement: a cache hit is the
+                  same AI answer reused, so both badges show together. */}
+              {alert.cached && (
+                <span title="Reused from a previous identical alert — no new LLM call">
+                  <Badge status="primary">Cached</Badge>
+                </span>
+              )}
               {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
               {alert.confidence != null && <ConfidenceBar confidence={alert.confidence} />}
             </>

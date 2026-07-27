@@ -148,6 +148,10 @@ AZURE_AI_FOUNDRY_API_VERSION = os.getenv("AZURE_AI_FOUNDRY_API_VERSION", "previe
 AZURE_DEPLOYMENT_EXPLAINER = os.getenv("AZURE_AI_FOUNDRY_DEPLOYMENT_EXPLAINER", "")
 AZURE_DEPLOYMENT_ROUTER = os.getenv("AZURE_AI_FOUNDRY_DEPLOYMENT_ROUTER", "")
 AZURE_DEPLOYMENT_SUMMARY = os.getenv("AZURE_AI_FOUNDRY_DEPLOYMENT_SUMMARY", "")
+# Grounded chat composition (POST /chat). Optional: llm.chat_model() falls back
+# to the SUMMARY deployment when this is unset, so /chat needs no new config to
+# work — set it only to point chat at a different (e.g. cheaper) deployment.
+AZURE_DEPLOYMENT_CHAT = os.getenv("AZURE_AI_FOUNDRY_DEPLOYMENT_CHAT", "")
 
 
 def service_endpoint() -> str:

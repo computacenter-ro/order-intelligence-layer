@@ -87,6 +87,62 @@ class AlertOut(BaseModel):
     resolved_at: UtcDatetime | None = None
 
 
+# --- chat (proxied to the AI service, behind this API's auth) ----------------
+
+
+class ChatContext(BaseModel):
+    """Scope a question to one record — the "ask about this journey/alert" button.
+
+    The backend resolves ``(kind, id)`` against its own DB and prepends that
+    record's text to the question, so the answer is anchored to what the agent is
+    looking at instead of whatever the query happens to retrieve.
+    """
+
+    kind: str                          # "alert" | "journey"
+    id: str
+
+
+class ChatRequest(BaseModel):
+    query: str
+    k: int = 5
+    filters: dict | None = None
+    context: ChatContext | None = None
+
+
+class ChatSource(BaseModel):
+    """One cited incident record, with a dashboard link when one can be built."""
+
+    id: str
+    kind: str
+    score: float
+    snippet: str
+    # DASHBOARD_URL + journey_id/order_id; None when DASHBOARD_URL is unset or the
+    # record carries no id to link to (same rule as the Teams card's link).
+    link: str | None = None
+
+
+class ChatCoverage(BaseModel):
+    """How much of the history the answer drew on (computed by the AI service).
+
+    ``truncated`` means retrieval hit its limit, so other matching incidents very
+    likely exist beyond the ones cited. The dashboard should surface this on
+    counting questions ("2 orders failed…") — an answer built from a capped sample
+    otherwise reads as a complete history. See ``ai_service/api.py::ChatCoverage``
+    for why this is a field rather than a sentence in the answer.
+    """
+
+    shown: int = 0
+    limit: int = 0
+    truncated: bool = False
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[ChatSource]
+    mode: str                          # "ai" | "retrieval-only"
+    coverage: ChatCoverage = ChatCoverage()
+
+
 class JourneyOut(BaseModel):
     """A journey header (``journeys`` row); alias ids may be null."""
 

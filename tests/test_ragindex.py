@@ -274,6 +274,10 @@ def test_index_endpoint_reports_false_when_disabled(install_index):
 
 
 def test_chat_returns_sources_and_retrieval_only_mode(index, install_index):
+    # No api.configure() here, so there is no chat model: slice 2's composition
+    # step is skipped and the phase-1 deterministic answer is served. The
+    # LLM-composed path and its fallbacks are covered in tests/test_chat.py.
+    api._deps = None
     install_index(index, FakeRedis())
     resp = TestClient(api.app).post(
         "/chat", json={"query": "margin check failed below threshold", "k": 3}
@@ -283,7 +287,9 @@ def test_chat_returns_sources_and_retrieval_only_mode(index, install_index):
     assert body["mode"] == "retrieval-only"
     assert body["sources"], "expected retrieved sources"
     assert body["sources"][0]["id"] == "a1"
-    assert set(body["sources"][0]) == {"id", "kind", "score", "snippet"}
+    # metadata was added in slice 2 so the backend can build dashboard links
+    # from journey_id/order_id without a second lookup.
+    assert set(body["sources"][0]) == {"id", "kind", "score", "snippet", "metadata"}
     # The answer is a deterministic template over the sources — it must name them.
     assert "a1" in body["answer"]
     assert "1 related incident" in body["answer"] or "related incident(s)" in body["answer"]

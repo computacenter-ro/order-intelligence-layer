@@ -31,6 +31,16 @@ AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://localhost:8100").rstrip("/"
 # Deliberately short. An index push is best-effort and sits on the alert-persist
 # and journey-completion paths — it must never be the reason those get slow.
 RAG_INDEX_TIMEOUT = float(os.getenv("RAG_INDEX_TIMEOUT", "5"))
+# Longer than the index timeout: /chat runs an LLM call with a user waiting on it,
+# whereas an index push is a background write.
+RAG_CHAT_TIMEOUT = float(os.getenv("RAG_CHAT_TIMEOUT", "30"))
+
+# Shown when the AI service is unreachable. Says what happened rather than
+# pretending nothing matched — an empty result and an outage are different facts.
+_UNAVAILABLE = (
+    "The chat service is currently unavailable, so no answer could be composed. "
+    "Alerts and journeys are still searchable from the dashboard."
+)
 
 
 # --- pure text/metadata builders ---------------------------------------------
@@ -97,6 +107,50 @@ async def push(
             flush=True,
         )
         return False
+
+
+async def ask(
+    query: str,
+    k: int = 5,
+    filters: dict | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict:
+    """POST a question to the AI service's ``/chat``; return its response body.
+
+    Unlike the index pushes above this is NOT fire-and-forget — a user is waiting
+    for the answer — so it uses a longer timeout (an LLM call, not a write) and
+    returns a well-formed degraded body rather than raising. The backend route
+    then always has something to serve, and the failure reads to the agent the
+    same way an LLM outage does: no narrative, no sources, but not an error page.
+    """
+    url = f"{AI_SERVICE_URL}/chat"
+    body = {"query": query, "k": k, "filters": filters}
+    try:
+        if client is not None:
+            resp = await client.post(url, json=body, timeout=RAG_CHAT_TIMEOUT)
+        else:
+            async with httpx.AsyncClient(timeout=RAG_CHAT_TIMEOUT) as http:
+                resp = await http.post(url, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        # Defensive: a malformed body must not propagate half-shapes into the API.
+        return {
+            "answer": str(data.get("answer") or _UNAVAILABLE),
+            "sources": list(data.get("sources") or []),
+            "mode": str(data.get("mode") or "retrieval-only"),
+            "coverage": dict(data.get("coverage") or {}),
+        }
+    except Exception as exc:  # noqa: BLE001 — degrade, never 500 the dashboard
+        print(f"[rag_client] chat unavailable ({type(exc).__name__}: {exc})", flush=True)
+        # Nothing was retrieved, so nothing was truncated — an unreachable service
+        # must not look like a capped result set.
+        return {
+            "answer": _UNAVAILABLE,
+            "sources": [],
+            "mode": "retrieval-only",
+            "coverage": {"shown": 0, "limit": k, "truncated": False},
+        }
 
 
 async def index_alert(alert, *, client: httpx.AsyncClient | None = None) -> bool:

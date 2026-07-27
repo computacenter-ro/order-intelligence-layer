@@ -312,7 +312,18 @@ async def resolve_incident(
     session: AsyncSession = Depends(get_session),
 ) -> Incident:
     """Manual close — the PRIMARY lifecycle mechanism (source spec §4 step 7);
-    the quiet-timeout sweep in backend/incidents.py is only the fallback."""
+    the quiet-timeout sweep in backend/incidents.py is only the fallback.
+
+    Cascades to every alert linked to this incident: an incident is a
+    collapsed VIEW of those alerts, so leaving them "active" after their
+    incident is closed would defeat the point of collapsing them — they'd
+    never leave the live Alert Feed and never show up in History. Uses the
+    same is_resolved/resolved_at values PATCH /alerts/{id}/resolve does, so a
+    cascaded alert is indistinguishable from an individually-resolved one.
+    Alerts already resolved (individually, earlier) are left with their
+    original resolved_at.
+    """
+    now = datetime.now(timezone.utc)
     stmt = (
         update(Incident)
         .where(Incident.incident_id == incident_id)
@@ -323,5 +334,11 @@ async def resolve_incident(
     incident = result.scalar_one_or_none()
     if incident is None:
         raise HTTPException(status_code=404, detail=f"incident {incident_id!r} not found")
+
+    await session.execute(
+        update(Alert)
+        .where(Alert.incident_id == incident_id, Alert.is_resolved.is_(False))
+        .values(is_resolved=True, resolved_at=now)
+    )
     await session.commit()
     return incident

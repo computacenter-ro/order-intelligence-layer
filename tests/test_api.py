@@ -740,3 +740,24 @@ def test_resolve_incident_sets_status_and_returns_404_when_missing(monkeypatch):
     _use([_FakeResult(one=None)])
     resp = client.patch("/incidents/does-not-exist/resolve")
     assert resp.status_code == 404
+
+
+def test_resolve_incident_cascades_to_its_alerts():
+    """Resolving an incident must also resolve every alert linked to it — an
+    incident collapses those alerts, so they must leave the live Alert Feed
+    and show up in History exactly as if each were individually resolved."""
+    client = TestClient(app)
+    session = _use([
+        _FakeResult(one=_incident(status="resolved")),
+        _FakeResult(),  # the cascade UPDATE on alerts — return value unused
+    ])
+    resp = client.patch("/incidents/inc-1/resolve")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "resolved"
+
+    assert len(session.statements) == 2
+    cascade_sql = _compiled(session.statements[1]).lower()
+    assert "alerts" in cascade_sql
+    assert "is_resolved" in cascade_sql
+    assert "resolved_at" in cascade_sql
+    assert "incident_id" in cascade_sql

@@ -536,3 +536,58 @@ async def sweep_stale_incidents(session, now: datetime | None = None) -> list:
     if stale:
         await session.commit()
     return stale
+
+
+# --- lifecycle: retry journeys whose completion outran their alerts (DB) --------
+
+
+async def retry_unclustered_completions(session, now: datetime | None = None) -> list:
+    """Re-attempt clustering for terminal journeys still missing an incident.
+
+    ``process_completion`` runs exactly once, synchronously, the instant
+    ``backend/journeys.py`` detects a journey's completion via ``raw.events`` —
+    a path that never waits on the LLM. A journey's own alerts, by contrast,
+    only land in ``alerts`` after ``processed.alerts`` — which DOES wait on the
+    LLM (or the breaker's fallback) and is bounded by ``ALERT_CONCURRENCY``.
+    Under load, raw-event completion detection routinely outruns alert
+    persistence, so ``process_completion``'s one shot can find zero causal
+    candidates and permanently skip the journey (discovered via live testing,
+    not by the unit tests, which always hand-fed already-linked alerts).
+
+    This is the catch-up: on the same periodic cadence as the other sweeps,
+    find every terminal (``FAILED``/``TIMED_OUT``) journey with no
+    ``incident_id`` yet and call ``process_completion`` again. Safe to call
+    repeatedly — ``process_completion`` re-checks ``Journey.incident_id``
+    itself, and a journey that still has no causal alert simply no-ops again
+    until a later sweep catches it.
+    """
+    from sqlalchemy import select
+    from backend.db import Journey
+    from backend.journeys import Completion, JourneyStatus
+    from backend.stitching import StitchedJourney
+
+    result = await session.execute(
+        select(Journey).where(
+            Journey.status.in_([JourneyStatus.FAILED.value, JourneyStatus.TIMED_OUT.value]),
+            Journey.incident_id.is_(None),
+        )
+    )
+    journeys = result.scalars().all()
+
+    incidents = []
+    for journey in journeys:
+        completion = Completion(
+            journey_id=journey.journey_id,
+            journey=StitchedJourney(
+                journey_id=journey.journey_id,
+                event_id=journey.event_id,
+                order_id=journey.order_id,
+                cart_header_id=journey.cart_header_id,
+            ),
+            status=JourneyStatus(journey.status),
+            outcome=journey.outcome,
+        )
+        incident = await process_completion(session, completion, now=now)
+        if incident is not None:
+            incidents.append(incident)
+    return incidents

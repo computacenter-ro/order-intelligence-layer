@@ -40,7 +40,7 @@ import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractIncomingMessage
 
 from shared.models import LogLine, ProcessedAlert
-from backend.incidents import process_completion, sweep_stale_incidents
+from backend.incidents import process_completion, retry_unclustered_completions, sweep_stale_incidents
 from backend.journeys import JourneyAssembler, OnEvent
 
 # --- Config (env-driven, matching ai_service/settings.py conventions) --------
@@ -319,8 +319,12 @@ async def _sweep_stalled_loop(
 async def _sweep_incidents_loop() -> None:
     """Periodically close incidents that have gone quiet past
     INCIDENT_QUIET_TIMEOUT (the safety-net closing mechanism — manual dashboard
-    resolve is the primary one, added in Plan 2's API work). Runs on the same
-    cadence as the stalled-journey sweep."""
+    resolve is the primary one, added in Plan 2's API work), and retry
+    clustering for any terminal journey still missing an incident (a journey's
+    completion, detected via raw.events, can be persisted before its own
+    alerts — bound by the LLM and ALERT_CONCURRENCY via processed.alerts —
+    exist yet; see backend.incidents.retry_unclustered_completions). Runs on
+    the same cadence as the stalled-journey sweep."""
     import asyncio
 
     from backend.db import SessionLocal
@@ -331,6 +335,7 @@ async def _sweep_incidents_loop() -> None:
             try:
                 async with SessionLocal() as session:
                     await sweep_stale_incidents(session)
+                    await retry_unclustered_completions(session)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[incident-sweep] ERROR (continuing): {exc}", flush=True)
     except asyncio.CancelledError:

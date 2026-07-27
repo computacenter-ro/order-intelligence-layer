@@ -520,3 +520,60 @@ async def test_sweep_leaves_recently_active_incidents_open():
     session = _FakeSession([_FakeResult(items=[])])  # query already filters by last_ts
     closed = await sweep_stale_incidents(session, now=NOW)
     assert closed == []
+
+
+from backend.db import Journey
+from backend.incidents import retry_unclustered_completions
+
+
+async def test_retry_clusters_a_journey_whose_alerts_have_since_landed():
+    """Mirrors the live-testing discovery: a journey completed (raw.events,
+    no LLM wait) before its own alerts existed (processed.alerts, LLM-bound),
+    so the first process_completion attempt found nothing. By the time this
+    retry runs, the alerts have landed — clustering should now succeed.
+    """
+    journey = Journey(
+        journey_id="j1", status="FAILED", outcome="ENRICHMENT_FAILED",
+        first_ts=NOW, last_ts=NOW, incident_id=None,
+    )
+    alerts = [
+        Alert(alert_id="a1", emitted_at=NOW, log_id="l1", level="ERROR",
+              app_name="cc-order-engine", logger="c.c.orderengine.client.SptClient",
+              message="[SptClient#getSptPriceListCode] <--- ERROR SocketTimeoutException (10014ms)",
+              source="fallback", department=None, embedding=None, journey_id="j1"),
+    ]
+    session = _FakeSession([
+        _FakeResult(items=[journey]),           # find unclustered terminal journeys
+        _RowResult(None),                       # process_completion: not yet clustered
+        _FakeResult(items=alerts),               # causal-candidate fetch (now populated)
+        _FakeResult(items=[]),                   # no open incident with this signature
+        _FakeResult(items=alerts),               # journey's full alert set, for linking
+        _FakeResult(items=[]),                   # closing UPDATE journeys — return value unused
+    ])
+    incidents = await retry_unclustered_completions(session, now=NOW)
+    assert len(incidents) == 1
+    assert incidents[0].failure_subtype == "ENRICHMENT_FAILED"
+    assert journey.incident_id is None  # this fake session doesn't apply the UPDATE to `journey`
+
+
+async def test_retry_leaves_a_journey_alone_when_still_no_causal_alert():
+    """Safe to call repeatedly: if the alerts still haven't landed, this must
+    no-op again (not crash, not create a bogus incident) — a later sweep gets
+    another chance."""
+    journey = Journey(
+        journey_id="j2", status="FAILED", outcome="ENRICHMENT_FAILED",
+        first_ts=NOW, last_ts=NOW, incident_id=None,
+    )
+    session = _FakeSession([
+        _FakeResult(items=[journey]),  # find unclustered terminal journeys
+        _RowResult(None),              # process_completion: not yet clustered
+        _FakeResult(items=[]),         # still zero alerts for this journey
+    ])
+    incidents = await retry_unclustered_completions(session, now=NOW)
+    assert incidents == []
+
+
+async def test_retry_finds_nothing_when_no_journeys_are_unclustered():
+    session = _FakeSession([_FakeResult(items=[])])
+    incidents = await retry_unclustered_completions(session, now=NOW)
+    assert incidents == []

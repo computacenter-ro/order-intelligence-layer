@@ -35,15 +35,84 @@ _EXPLAIN_SYSTEM = (
     "with the explanation only."
 )
 
+# Hand-written department semantics. The ALLOWED list above is generated from the
+# Department enum, but these definitions are NOT — adding a department to the enum
+# updates the list automatically and silently leaves this block stale. Keep the two
+# in sync by hand.
+#
+# The load-bearing distinction is backend vs general: "the code misbehaved" vs "the
+# code behaved correctly and rejected the order". Without it the model routes on
+# surface association (log came from a service -> services are code -> backend), which
+# put every business-rule rejection on the backend team's queue as phantom work.
+_DEPARTMENT_GUIDE = (
+    "- networking: connectivity between services — timeouts, unreachable hosts, "
+    "HTTP transport failures, a downstream service not answering.\n"
+    "- devops: message-queue and infrastructure plumbing — redeliveries, retry "
+    "exhaustion, dead-letter (DLQ/_error) routing.\n"
+    "- database: persistence failures — DB timeouts, connection pools, SQL errors.\n"
+    "- backend: an application code or integration DEFECT — the service itself "
+    "behaved wrongly (unexpected exception, bad payload it produced, broken logic).\n"
+    "- general: NOT an engineering fault. The pipeline worked exactly as designed "
+    "and correctly REJECTED an order because of a business rule, user-supplied "
+    "data, reference data, or account configuration. Nobody needs to change any "
+    "code. Route here even though the log came from a service, is level=ERROR, "
+    "and says FAILED or aborted.\n"
+)
+
+# Examples are taken verbatim from the emitters' real message shapes so they match
+# at inference. Deliberately paired: each business-rule 'general' case sits next to a
+# genuine technical failure that looks similar on the surface, because the contrast
+# is what teaches the boundary — a list of general-only examples would just bias the
+# model toward general.
+_ROUTE_EXAMPLES = (
+    "Examples:\n"
+    'message=Margin check FAILED for order ORD-6042: overall margin 8.10% below '
+    'threshold 12.00% -> {"department": "general", "severity": "medium", '
+    '"confidence": 0.9}  (the checker worked; the order is simply unprofitable)\n'
+    "message=Validation failed: mandatory UDF 'costCenter' missing on line 2 -> "
+    '{"department": "general", "severity": "medium", "confidence": 0.9}  '
+    "(user-supplied data is incomplete; no defect)\n"
+    "message=Authentication failed for user RFLORIA: account disabled in JAM -> "
+    '{"department": "general", "severity": "medium", "confidence": 0.88}  '
+    "(access administration, not code)\n"
+    "message=Order processing aborted for order ORD-6108: SPT price list service "
+    'unavailable after 3 attempt(s) -> {"department": "networking", "severity": '
+    '"high", "confidence": 0.9}  (a real dependency outage)\n'
+    # Paired against the timeout above: both are raw HTTP client lines, so the
+    # transport framing is identical and only the STATUS separates them. A 403 means
+    # the call reached the server and was refused — an authorization decision, not a
+    # connectivity fault. Without this pair the model routes 403s to networking on
+    # the strength of "HTTP/1.1" alone.
+    "message=[JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- "
+    'HTTP/1.1 403 (250ms) -> {"department": "general", "severity": "medium", '
+    '"confidence": 0.85}  (the call SUCCEEDED and was refused — an access '
+    "decision; a 4xx authorization refusal is never a networking fault, whereas a "
+    "timeout or connection error is)\n"
+    "message=Order creation failed for event evt-1a2b: DB_TIMEOUT — no order was "
+    'created -> {"department": "database", "severity": "critical", "confidence": '
+    "0.92}\n"
+    "message=Max redelivery attempts reached for event evt-1a2b; routing message "
+    'to order.inbound.dlq -> {"department": "devops", "severity": "high", '
+    '"confidence": 0.9}\n'
+)
+
 _ROUTE_SYSTEM = (
     "You triage an IT-support alert for an order-management pipeline. Do two "
     "things for the single WARN/ERROR log line:\n"
     f"1. Route it to exactly one team. Choose from these departments ONLY: "
     f"{_DEPARTMENTS}.\n"
+    f"{_DEPARTMENT_GUIDE}"
+    "   Before choosing, ask: is anything actually BROKEN? If the service executed "
+    "its logic correctly and the order was rejected on business grounds — margin "
+    "thresholds, missing or invalid user input, disabled accounts, unmapped "
+    "products — the answer is general, whatever the log level and whichever "
+    "service emitted it. ERROR means the order stopped, not that code is at fault. "
+    "Reserve backend for an actual defect.\n"
     f"2. Rate its technical severity as one of: {_SEVERITIES}. Judge how urgent "
     "THIS log is on its own (an ERROR that aborts or dead-letters an order is "
     "more severe than a benign/retryable WARN). Base it on the log only; do not "
     "consider business impact you cannot see.\n"
+    f"{_ROUTE_EXAMPLES}"
     'Reply with a single JSON object: {"department": "<one of the list>", '
     '"severity": "<one of the list>", "confidence": <0..1>}. '
     "No prose, no code fence."

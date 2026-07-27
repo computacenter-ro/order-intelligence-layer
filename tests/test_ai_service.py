@@ -293,6 +293,53 @@ async def test_router_accepts_all_five_departments():
         assert d == dept
 
 
+def test_route_prompt_defines_every_department():
+    """The ALLOWED list is generated from the enum; the definitions are not.
+
+    Adding a Department therefore updates the prompt's list automatically and
+    silently leaves it undefined — the model would then have to guess what the new
+    label means, which is exactly the failure the guide exists to prevent. Fail
+    here so the two stay in sync.
+    """
+    from ai_service.nodes import _DEPARTMENT_GUIDE
+
+    missing = [d.value for d in Department if f"- {d.value}:" not in _DEPARTMENT_GUIDE]
+    assert not missing, f"departments missing a prompt definition: {missing}"
+
+
+def test_route_prompt_draws_the_backend_vs_general_line():
+    # The misroute this prompt fixes: business-rule rejections landing on backend.
+    # Assert the two load-bearing instructions survive future edits.
+    from ai_service.nodes import _ROUTE_SYSTEM
+
+    assert "NOT an engineering fault" in _ROUTE_SYSTEM
+    assert "Reserve backend for an actual defect." in _ROUTE_SYSTEM
+
+
+def test_route_prompt_examples_are_valid_enum_values():
+    """Few-shot answers must be routable — a typo'd example teaches an LLMError."""
+    import json
+    import re
+
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    payloads = re.findall(r'\{"department".*?\}', _ROUTE_EXAMPLES)
+    assert len(payloads) >= 6, f"expected the full example set, found {len(payloads)}"
+    for raw in payloads:
+        obj = json.loads(raw)
+        Department(obj["department"])  # raises if not a real department
+        Severity(obj["severity"])
+        assert 0.0 <= obj["confidence"] <= 1.0
+
+
+def test_route_prompt_examples_cover_general_and_technical_routes():
+    # Paired by design: general-only examples would bias the model toward general.
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    for dept in ("general", "networking", "database", "devops"):
+        assert f'"department": "{dept}"' in _ROUTE_EXAMPLES
+
+
 async def test_router_tolerates_code_fence_and_prose():
     d, s, c = await route(
         _log(), "x",

@@ -102,6 +102,28 @@ _SALIENT_EXTRA = tuple(
 )
 SEMCACHE_SALIENT_WORDS: frozenset[str] = frozenset(_SALIENT_DEFAULT + _SALIENT_EXTRA)
 
+# --- Retrieval index (RAG phase 1: retrieval only, no LLM) --------------------
+# Semantic search over incident history (processed alerts + completed journeys)
+# backing POST /chat. Same embedding stack as the semantic cache — deliberately
+# the SAME model, so one sentence-transformers load serves both and no new ML
+# dependency is introduced.
+RAGINDEX_ENABLED = os.getenv("RAGINDEX_ENABLED", "1") not in ("0", "false", "False", "")
+# Reuses SEMCACHE_MODEL as its default: sharing the model is what keeps this to
+# one CPU model load. Overridable only if you deliberately want a second model.
+RAGINDEX_MODEL = os.getenv("RAGINDEX_MODEL", SEMCACHE_MODEL)
+# Cosine floor for a retrieved record. LOW on purpose (0.30) and NOT related to
+# SEMCACHE_THRESHOLD (0.95): the cache must fail toward a miss because a false hit
+# serves a wrong AI-labelled answer, whereas retrieval wants RECALL — a marginal
+# source is merely less useful to the agent, never wrong. This is a noise floor,
+# not a precision gate. Do not "harmonize" the two numbers.
+RAGINDEX_MIN_SCORE = float(os.getenv("RAGINDEX_MIN_SCORE", "0.30"))
+# Capacity in records. An order of magnitude above the cache: the cache holds log
+# TYPES (~500 distinct shapes), the index holds incident HISTORY (every alert and
+# journey), which is the corpus retrieval searches.
+RAGINDEX_MAX_ENTRIES = int(os.getenv("RAGINDEX_MAX_ENTRIES", "5000"))
+# Redis key for the persisted index dump (rebuildable via backfill_rag).
+RAGINDEX_KEY = os.getenv("RAGINDEX_KEY", "ai:ragindex")
+
 # --- Suppression list ---------------------------------------------------------
 # Benign WARNs that must never become alerts (CLAUDE.md [3] "Suppression list").
 # Case-sensitive substring match on the log ``message`` (the fixture wording is

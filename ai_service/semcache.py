@@ -296,7 +296,12 @@ class _Entry:
 
 
 # --- cosine -------------------------------------------------------------------
-def _cosine(a: list[float], b: list[float]) -> float:
+# Public (unprefixed) because ai_service/ragindex.py imports them: both the cache
+# and the retrieval index run cosine over vectors from the SAME encoder, so they
+# must use the same similarity and the same coercion. Shared, never duplicated —
+# two copies could drift and make a 0.95 cache threshold and a 0.30 retrieval
+# floor mean subtly different things.
+def cosine(a: list[float], b: list[float]) -> float:
     """Cosine similarity of two equal-length vectors (0 if either is zero)."""
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -306,11 +311,17 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-def _as_floats(vector) -> list[float]:
+def as_floats(vector) -> list[float]:
     """Coerce an encoder result (list / numpy array / tuple) to list[float]."""
     if hasattr(vector, "tolist"):
         vector = vector.tolist()
     return [float(x) for x in vector]
+
+
+# Back-compat aliases: the private names predate the ragindex extraction and are
+# still used below (and possibly by tests), so keep both pointing at one impl.
+_cosine = cosine
+_as_floats = as_floats
 
 
 class SemanticCache:

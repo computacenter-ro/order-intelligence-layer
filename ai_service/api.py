@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 
-from ai_service import nodes, semcache
+from ai_service import nodes, ragindex, semcache
 from ai_service.breaker import CircuitBreaker
 from shared.models import LogLine
 
@@ -48,6 +48,46 @@ class SummaryResponse(BaseModel):
     journey_id: str
     summary: str
     source: str                        # "ai" | "fallback"
+
+
+# --- retrieval contract (the seam with the backend + future chatbot) ----------
+class IndexRequest(BaseModel):
+    """One record for the retrieval index, POSTed by the backend.
+
+    The backend owns the DB and decides what is worth indexing and filtering on;
+    the AI service owns the encoder. ``metadata`` is free-form so a new filter
+    key needs no change here.
+    """
+
+    id: str
+    kind: str                          # "alert" | "journey"
+    text: str
+    metadata: dict = {}
+
+
+class IndexResponse(BaseModel):
+    indexed: bool
+
+
+class ChatRequest(BaseModel):
+    query: str
+    k: int = 5
+    filters: dict | None = None
+
+
+class ChatSource(BaseModel):
+    """One retrieved record, trimmed for display."""
+
+    id: str
+    kind: str
+    score: float
+    snippet: str
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[ChatSource]
+    mode: str                          # "retrieval-only" in this phase
 
 
 # --- injectable dependencies -------------------------------------------------
@@ -86,6 +126,51 @@ def template_summary(req: SummaryRequest) -> str:
     )
 
 
+# --- retrieval-only answer (deterministic, no LLM) ---------------------------
+SNIPPET_CHARS = 200
+RETRIEVAL_ONLY = "retrieval-only"
+
+NO_RESULTS_ANSWER = (
+    "No related incidents found in the indexed history for that question. "
+    "The index may not yet contain matching alerts or journeys — "
+    "run the backfill (python -m backend.scripts.backfill_rag) if it looks empty."
+)
+
+
+def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
+    """First ``limit`` characters of ``text``, ellipsised on a word boundary."""
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def build_retrieval_answer(query: str, results: list[dict]) -> str:
+    """A deterministic answer assembled from the retrieved records.
+
+    **No LLM in this phase** (by design): the answer is a template listing what
+    was retrieved, so the endpoint is useful and fully testable before any
+    generation step exists. A later phase can replace this function with an LLM
+    call and keep the request/response contract — which is why the response
+    carries ``mode`` and the answer never claims more than "here is what I found".
+    """
+    if not results:
+        return NO_RESULTS_ANSWER
+    kinds = {"alert": 0, "journey": 0}
+    for record in results:
+        kinds[record["kind"]] = kinds.get(record["kind"], 0) + 1
+    parts = [f"{kinds.get('alert', 0)} alert(s)", f"{kinds.get('journey', 0)} journey(s)"]
+    lines = [
+        f"Found {len(results)} related incident(s) ({', '.join(parts)}) for: {query.strip()}"
+    ]
+    for i, record in enumerate(results, 1):
+        lines.append(
+            f"{i}. [{record['kind']} {record['id']}] "
+            f"(score {record['score']:.2f}) {_snippet(record['text'])}"
+        )
+    return "\n".join(lines)
+
+
 # --- app ---------------------------------------------------------------------
 app = FastAPI(title="AI Service — Journey Summary API")
 
@@ -100,6 +185,45 @@ async def health() -> dict[str, str]:
 async def semcache_stats() -> dict:
     """Current semantic-cache hit/miss counters + hit rate (the demo number)."""
     return await semcache.stats()
+
+
+@app.get("/ragindex/stats")
+async def ragindex_stats() -> dict:
+    """Retrieval-index size + enabled flag."""
+    return await ragindex.stats()
+
+
+@app.post("/index", response_model=IndexResponse)
+async def index(req: IndexRequest) -> IndexResponse:
+    """Embed + store one incident record (upsert by id).
+
+    ``indexed=false`` is a normal outcome, not an error: the index self-disables
+    when the encoder is unavailable, and the backend pushes fire-and-forget, so a
+    200 with ``false`` lets the caller carry on without special-casing failure.
+    """
+    stored = await ragindex.index_record(req.id, req.kind, req.text, req.metadata)
+    return IndexResponse(indexed=stored)
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest) -> ChatResponse:
+    """Answer from retrieved incident history — RETRIEVAL ONLY, no LLM.
+
+    Returns the retrieved records as ``sources`` plus a deterministic templated
+    ``answer``. ``mode`` names the behaviour so a caller (and a future generation
+    phase) can tell them apart without sniffing the text.
+    """
+    results = ragindex.retrieve(req.query, k=req.k, filters=req.filters)
+    return ChatResponse(
+        answer=build_retrieval_answer(req.query, results),
+        sources=[
+            ChatSource(
+                id=r["id"], kind=r["kind"], score=r["score"], snippet=_snippet(r["text"])
+            )
+            for r in results
+        ],
+        mode=RETRIEVAL_ONLY,
+    )
 
 
 @app.post("/summarize-journey", response_model=SummaryResponse)

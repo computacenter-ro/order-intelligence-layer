@@ -197,6 +197,7 @@ class JourneyAssembler:
         self,
         stalled_timeout: int | None = None,
         summarizer=None,
+        indexer=None,
     ) -> None:
         self._stitcher = Stitcher()
         self._completed: dict[str, Completion] = {}
@@ -206,6 +207,11 @@ class JourneyAssembler:
         # (the DB-free decision layer and tests stay network-free). Wired to
         # backend.summarizer.fetch_summary by backend.consumers at runtime.
         self._summarizer = summarizer
+        # Optional async ``(Completion, summary) -> None`` that pushes the
+        # completed journey to the AI service's retrieval index. Same injection
+        # rationale as ``summarizer``: default None keeps this layer network-free.
+        # Wired to backend.rag_client.index_journey by backend.consumers.
+        self._indexer = indexer
 
     # --- DB-free decision layer ---------------------------------------------
 
@@ -435,13 +441,38 @@ class JourneyAssembler:
         Best-effort: the summarizer itself never raises (returns None on any
         failure), so a slow/down AI service degrades to summary=None without
         breaking completion.
+
+        Also pushes each completed journey to the retrieval index, since this is
+        the one place that has both the completion and its summary. Gated on
+        ``self._indexer`` for the same reason as ``_summarizer``: the DB-free
+        decision layer and its tests stay network-free unless a runtime wires it.
         """
         if self._summarizer is None or not completions:
             return {}
         summaries: dict[str, str | None] = {}
         for completion in completions:
-            summaries[completion.journey_id] = await self._summarizer(completion)
+            summary = await self._summarizer(completion)
+            summaries[completion.journey_id] = summary
+            await self._index_journey_safely(completion, summary)
         return summaries
+
+    async def _index_journey_safely(self, completion: Completion, summary: str | None) -> None:
+        """Push a completed journey to the retrieval index; swallow everything.
+
+        Journey completion is the important work; making it searchable is not, so
+        an indexing failure is logged and dropped rather than propagated. Mirrors
+        the isolation ``backend/consumers.py`` applies on the alert path.
+        """
+        if self._indexer is None:
+            return
+        try:
+            await self._indexer(completion, summary)
+        except Exception as exc:  # noqa: BLE001 — never break journey completion
+            print(
+                f"[journeys] retrieval indexing skipped for {completion.journey_id}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
 
 def _as_list(logs) -> list[LogLine]:

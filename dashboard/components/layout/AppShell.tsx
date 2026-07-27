@@ -5,7 +5,13 @@ import { useRouter, usePathname } from "next/navigation";
 import Image from "next/image";
 import { SideNav } from "@computacenter-ro/style-guide/components";
 import type { BaseNavItem, SideNavItem } from "@computacenter-ro/style-guide/components";
-import { BellIcon, ClockCounterClockwiseIcon, MapTrifoldIcon, SignOutIcon } from "@phosphor-icons/react";
+import {
+  BellIcon,
+  ChartBarIcon,
+  ClockCounterClockwiseIcon,
+  MapTrifoldIcon,
+  SignOutIcon,
+} from "@phosphor-icons/react";
 import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
 import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-mark.png";
 import { useAuth } from "@/lib/auth";
@@ -50,6 +56,12 @@ export function AppShell({ children }: AppShellProps) {
       href: "/history",
       icon: <ClockCounterClockwiseIcon size={20} />,
       active: pathname === "/history",
+    },
+    {
+      label: "Insights",
+      href: "/insights",
+      icon: <ChartBarIcon size={20} />,
+      active: pathname === "/insights",
     },
   ];
 

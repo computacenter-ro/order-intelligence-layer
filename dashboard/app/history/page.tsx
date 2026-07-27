@@ -96,7 +96,7 @@ export default function HistoryPage() {
       <AlertFilterBar value={filters} onChange={setFilters} />
       <div>
         {items.length === 0 && !loading && (
-          <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet</p>
+          <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet.</p>
         )}
         {items.map((alert) => (
           <AlertCard

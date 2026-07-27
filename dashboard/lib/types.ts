@@ -86,3 +86,36 @@ export type BadgeStatus =
   | "inactive"
   | "other"
   | "primary";
+
+// --- insights aggregation (GET /stats/insights) ------------------------------
+//
+// Mirrors backend/schemas.py OverviewStats. The breakdowns are open-ended
+// Records rather than keyed unions on purpose: the backend adds an explicit
+// bucket for nullable columns ("unassigned" department, "unrated" severity,
+// "none" outcome) so each map sums back to its total, and a new
+// department/severity/outcome must not break the type.
+
+export interface JourneyStats {
+  total: number;
+  by_status: Record<string, number>;
+  by_outcome: Record<string, number>;
+  // Over finished journeys only (SUCCESS+FAILED+TIMED_OUT); 0 when none have finished.
+  success_rate: number;
+  // null when no finished journey has both timestamps.
+  avg_duration_seconds: number | null;
+}
+
+export interface AlertStats {
+  total: number;
+  open: number;
+  resolved: number;
+  by_department: Record<string, number>;
+  by_severity: Record<string, number>;
+  by_level: Record<string, number>;
+  by_source: Record<string, number>;
+}
+
+export interface OverviewStats {
+  journeys: JourneyStats;
+  alerts: AlertStats;
+}

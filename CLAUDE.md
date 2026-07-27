@@ -612,8 +612,22 @@ GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
                                         # narrows within AI answers, not beside them.
 GET  /journeys?status=                  # 🔒 requires session
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
+GET  /stats/insights                    # 🔒 aggregate counters for the insights page
+                                        # journeys: total, by_status, by_outcome,
+                                        # success_rate (over SUCCESS+FAILED+TIMED_OUT
+                                        # only; 0 when none finished), avg_duration_seconds
+                                        # alerts: total, open/resolved, by_department,
+                                        # by_severity, by_level, by_source
 WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
 ```
+
+Aggregation lives in **`backend/stats.py`**, split so both halves are pure and
+unit-testable like `build_alerts_query`: query builders returning `Select`s with
+`GROUP BY` (`alerts_by(column)` is generic over the four alert columns —
+whitelisted, never interpolated), and `assemble_overview(...)` which folds the
+executed rows into the response. Nullable group-by columns get an explicit bucket
+(`department` → `"unassigned"`, `severity` → `"unrated"`, `outcome` → `"none"`) so
+every breakdown sums back to its total instead of silently dropping nulls.
 
 ### Auth (`auth.py`) — Phase 1: single hardcoded admin
 Two deliberately separated layers so later auth methods are cheap:

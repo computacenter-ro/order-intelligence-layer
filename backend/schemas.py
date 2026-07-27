@@ -83,8 +83,7 @@ class AlertOut(BaseModel):
     # mean "not a cache hit", which is the correct reading for every such row.
     cached: Annotated[bool, BeforeValidator(lambda v: False if v is None else v)] = False
     journey_id: str | None = None
-    is_resolved: bool\
-        :q= False
+    is_resolved: bool = False
     resolved_at: UtcDatetime | None = None
 
 

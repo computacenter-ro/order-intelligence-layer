@@ -243,6 +243,30 @@ class AlertsConsumer(_QueueConsumer):
         if self._on_event is not None and result.rowcount != 0:
             await self._on_event(_alert_new_event(alert))
 
+        # Feed the retrieval index. Gated on the same rowcount as the broadcast so
+        # a redelivered duplicate does no extra work (the index upserts by id, so
+        # a re-push would be harmless — just wasted). AFTER the commit and outside
+        # the session: search being stale is never a reason to fail persistence.
+        if result.rowcount != 0:
+            await _index_alert_safely(alert)
+
+
+async def _index_alert_safely(alert: ProcessedAlert) -> None:
+    """Push an alert to the retrieval index, swallowing everything.
+
+    ``rag_client.push`` already catches its own I/O failures; this second layer
+    covers anything it cannot — an import error, a malformed alert, a bug in the
+    text builders. The alert is already committed by the time we get here, so an
+    exception escaping would nack a message whose row is durably written and
+    trigger a pointless redelivery. Belt and braces on a best-effort side channel.
+    """
+    try:
+        from backend.rag_client import index_alert
+
+        await index_alert(alert)
+    except Exception as exc:  # noqa: BLE001 — indexing must never break consumption
+        print(f"[alerts] retrieval indexing skipped: {type(exc).__name__}: {exc}", flush=True)
+
 
 # --- raw.events --------------------------------------------------------------
 
@@ -375,9 +399,10 @@ async def run_consumers(
     # is wired to fetch each completed journey's summary from the AI service;
     # an injected assembler (tests) is used as-is.
     if assembler is None:
+        from backend.rag_client import index_journey
         from backend.summarizer import fetch_summary
 
-        assembler = JourneyAssembler(summarizer=fetch_summary)
+        assembler = JourneyAssembler(summarizer=fetch_summary, indexer=index_journey)
 
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     async with connection:

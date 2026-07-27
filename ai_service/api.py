@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 
-from ai_service import nodes, semcache
+from ai_service import nodes, ragindex, semcache
 from ai_service.breaker import CircuitBreaker
 from shared.models import LogLine
 
@@ -50,11 +50,90 @@ class SummaryResponse(BaseModel):
     source: str                        # "ai" | "fallback"
 
 
+# --- retrieval contract (the seam with the backend + future chatbot) ----------
+class IndexRequest(BaseModel):
+    """One record for the retrieval index, POSTed by the backend.
+
+    The backend owns the DB and decides what is worth indexing and filtering on;
+    the AI service owns the encoder. ``metadata`` is free-form so a new filter
+    key needs no change here.
+    """
+
+    id: str
+    kind: str                          # "alert" | "journey"
+    text: str
+    metadata: dict = {}
+
+
+class IndexResponse(BaseModel):
+    indexed: bool
+
+
+class ChatRequest(BaseModel):
+    query: str
+    k: int = 5
+    filters: dict | None = None
+
+
+class ChatSource(BaseModel):
+    """One retrieved record, trimmed for display.
+
+    ``metadata`` is passed through from the index so the caller can build links
+    and badges without a second lookup — the backend uses ``journey_id`` /
+    ``order_id`` from here to attach a dashboard URL to each citation.
+    """
+
+    id: str
+    kind: str
+    score: float
+    snippet: str
+    metadata: dict = {}
+
+
+class ChatCoverage(BaseModel):
+    """How much of the history the answer is based on — computed, never generated.
+
+    Top-k retrieval has no notion of coverage: several alerts about one incident
+    can crowd out a second, distinct incident that also matched (measured — two
+    journeys failed SAP submission, but at k=3 only one was retrieved, the other
+    ranking 6th behind four alerts). An answer built from that sample can read as
+    if it described the whole history.
+
+    The server knows these numbers exactly, so it reports them instead of asking
+    the model to. Two earlier prompt-based attempts were followed only about half
+    the time in each direction — caveats appeared on cause questions where they
+    were noise and vanished from counting questions where they mattered. A field
+    is deterministic, costs no tokens, and a UI can render it as a badge.
+
+    ``truncated`` is the one a caller should act on: True means the limit was hit
+    and other matching incidents very likely exist beyond it.
+    """
+
+    shown: int                         # records returned to the caller
+    limit: int                         # the k that was applied
+    truncated: bool                    # shown == limit, so more may exist
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[ChatSource]
+    # "ai"             — the answer was composed by the LLM, grounded in sources
+    # "retrieval-only" — deterministic template (LLM down/absent, or no sources)
+    # The sources are IDENTICAL either way; only the prose differs, so a caller
+    # can always render citations regardless of mode.
+    mode: str
+    coverage: ChatCoverage
+
+
 # --- injectable dependencies -------------------------------------------------
 @dataclass
 class SummaryDeps:
     breaker: CircuitBreaker
     model: BaseChatModel | None
+    # Grounded-chat model for POST /chat. Defaulted to None so every existing
+    # construction site (and test) keeps working and simply gets the
+    # retrieval-only answer — the same degradation as an LLM outage.
+    chat: BaseChatModel | None = None
 
 
 _deps: SummaryDeps | None = None
@@ -86,6 +165,52 @@ def template_summary(req: SummaryRequest) -> str:
     )
 
 
+# --- retrieval-only answer (deterministic, no LLM) ---------------------------
+SNIPPET_CHARS = 200
+RETRIEVAL_ONLY = "retrieval-only"
+AI_COMPOSED = "ai"
+
+NO_RESULTS_ANSWER = (
+    "No related incidents found in the indexed history for that question. "
+    "The index may not yet contain matching alerts or journeys — "
+    "run the backfill (python -m backend.scripts.backfill_rag) if it looks empty."
+)
+
+
+def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
+    """First ``limit`` characters of ``text``, ellipsised on a word boundary."""
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def build_retrieval_answer(query: str, results: list[dict]) -> str:
+    """A deterministic answer assembled from the retrieved records.
+
+    **No LLM in this phase** (by design): the answer is a template listing what
+    was retrieved, so the endpoint is useful and fully testable before any
+    generation step exists. A later phase can replace this function with an LLM
+    call and keep the request/response contract — which is why the response
+    carries ``mode`` and the answer never claims more than "here is what I found".
+    """
+    if not results:
+        return NO_RESULTS_ANSWER
+    kinds = {"alert": 0, "journey": 0}
+    for record in results:
+        kinds[record["kind"]] = kinds.get(record["kind"], 0) + 1
+    parts = [f"{kinds.get('alert', 0)} alert(s)", f"{kinds.get('journey', 0)} journey(s)"]
+    lines = [
+        f"Found {len(results)} related incident(s) ({', '.join(parts)}) for: {query.strip()}"
+    ]
+    for i, record in enumerate(results, 1):
+        lines.append(
+            f"{i}. [{record['kind']} {record['id']}] "
+            f"(score {record['score']:.2f}) {_snippet(record['text'])}"
+        )
+    return "\n".join(lines)
+
+
 # --- app ---------------------------------------------------------------------
 app = FastAPI(title="AI Service — Journey Summary API")
 
@@ -100,6 +225,77 @@ async def health() -> dict[str, str]:
 async def semcache_stats() -> dict:
     """Current semantic-cache hit/miss counters + hit rate (the demo number)."""
     return await semcache.stats()
+
+
+@app.get("/ragindex/stats")
+async def ragindex_stats() -> dict:
+    """Retrieval-index size + enabled flag."""
+    return await ragindex.stats()
+
+
+@app.post("/index", response_model=IndexResponse)
+async def index(req: IndexRequest) -> IndexResponse:
+    """Embed + store one incident record (upsert by id).
+
+    ``indexed=false`` is a normal outcome, not an error: the index self-disables
+    when the encoder is unavailable, and the backend pushes fire-and-forget, so a
+    200 with ``false`` lets the caller carry on without special-casing failure.
+    """
+    stored = await ragindex.index_record(req.id, req.kind, req.text, req.metadata)
+    return IndexResponse(indexed=stored)
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest) -> ChatResponse:
+    """Answer a question from retrieved incident history, grounded by the LLM.
+
+    Retrieve top-k (phase 1) → compose an answer from those records ONLY, under
+    the SHARED circuit breaker. Degradation is layered so the endpoint is always
+    useful:
+
+    * sources + LLM ok        → ``mode="ai"``, a grounded narrative answer
+    * breaker open / LLM error → ``mode="retrieval-only"``, the phase-1 template
+    * nothing retrieved        → ``mode="retrieval-only"``, "no related incidents"
+
+    The ``sources`` are the same in every case — only the prose differs — so a UI
+    can render citations without branching on mode. This is the chatbot's share
+    of the system-wide "useful with the LLM completely down" guarantee: an
+    outage costs you the narrative, never the search.
+    """
+    results = ragindex.retrieve(req.query, k=req.k, filters=req.filters)
+    sources = [
+        ChatSource(
+            id=r["id"],
+            kind=r["kind"],
+            score=r["score"],
+            snippet=_snippet(r["text"]),
+            metadata=r.get("metadata") or {},
+        )
+        for r in results
+    ]
+
+    answer, mode = build_retrieval_answer(req.query, results), RETRIEVAL_ONLY
+    # Only attempt composition when there is something to ground in — with no
+    # sources the model has nothing to answer from, and the template already says
+    # so honestly. (compose_chat_answer also refuses, belt and braces.)
+    if results and _deps is not None:
+        composed = await _deps.breaker.call(
+            lambda: nodes.compose_chat_answer(req.query, results, _deps.chat),
+            fallback=None,
+        )
+        if composed:
+            answer, mode = composed, AI_COMPOSED
+
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        mode=mode,
+        # Computed, not generated: retrieval filling every slot it was allowed
+        # means matches were almost certainly cut off beyond the limit.
+        coverage=ChatCoverage(
+            shown=len(results), limit=req.k, truncated=len(results) >= req.k
+        ),
+    )
 
 
 @app.post("/summarize-journey", response_model=SummaryResponse)

@@ -4,7 +4,7 @@ import { XIcon } from "@phosphor-icons/react";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
-import { formatTime, capitalize } from "@/lib/format";
+import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
@@ -107,7 +107,10 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
           <SeverityPill level={alert.level} severity={alert.severity} />
-          <span style={{ fontSize: "14px", color: "var(--cc-grey-three)" }}>
+          <span
+            style={{ fontSize: "14px", color: "var(--cc-grey-three)" }}
+            title={formatTimestampFull(alert.emitted_at)}
+          >
             {formatTime(alert.emitted_at)}
           </span>
         </div>

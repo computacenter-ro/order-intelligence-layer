@@ -21,11 +21,12 @@ import asyncio
 import redis.asyncio as aioredis
 import uvicorn
 
-from ai_service import api, llm, semcache, settings
+from ai_service import api, llm, ragindex, semcache, settings
 from ai_service.breaker import CircuitBreaker
 from ai_service.graph import PipelineDeps
 from ai_service.poller import Poller
 from ai_service.publisher import Publisher
+from ai_service.ragindex import RagDeps, RagIndex
 from ai_service.semcache import SemanticCache, SemCacheDeps
 
 
@@ -58,13 +59,41 @@ async def _run() -> None:
     )
     await semcache.restore()
 
+    # Retrieval index (RAG phase 1): REUSES the semantic cache's encoder when the
+    # two are configured with the same model — one sentence-transformers load
+    # serves both, which is what keeps startup at a single model download. Only
+    # load a second encoder if RAGINDEX_MODEL was deliberately pointed elsewhere.
+    if not settings.RAGINDEX_ENABLED:
+        rag_encoder = None
+    elif encoder is not None and settings.RAGINDEX_MODEL == settings.SEMCACHE_MODEL:
+        rag_encoder = encoder
+    else:
+        rag_encoder = ragindex.load_encoder(settings.RAGINDEX_MODEL)
+    ragindex.configure(
+        RagDeps(
+            index=RagIndex(
+                rag_encoder,
+                min_score=settings.RAGINDEX_MIN_SCORE,
+                max_entries=settings.RAGINDEX_MAX_ENTRIES,
+            ),
+            redis=redis_client,
+            dump_key=settings.RAGINDEX_KEY,
+        )
+    )
+    await ragindex.restore()
+
     poller = Poller(redis=redis_client, publisher=publisher, pipeline_deps=deps)
 
     # The summary API shares the same breaker + Redis; its model is the stronger
     # summary deployment (None with no creds → template fallback).
+    # The summary API and grounded /chat share this breaker with each other (one
+    # provider, one outage, one breaker — CLAUDE.md). chat_model() falls back to
+    # the summary deployment when AZURE_AI_FOUNDRY_DEPLOYMENT_CHAT is unset.
     api.configure(
         api.SummaryDeps(
-            breaker=CircuitBreaker(redis_client), model=llm.summary_model()
+            breaker=CircuitBreaker(redis_client),
+            model=llm.summary_model(),
+            chat=llm.chat_model(),
         )
     )
     server = uvicorn.Server(
@@ -75,10 +104,12 @@ async def _run() -> None:
 
     mode = "AI" if settings.llm_configured() else "FALLBACK (no Azure creds)"
     cache_mode = "on" if (encoder is not None) else "off"
+    rag_mode = "on" if (rag_encoder is not None) else "off"
     print(
         f"[ai_service] started — poll every {settings.POLL_INTERVAL}s, "
         f"window [-{settings.WINDOW_START_OFFSET}s, -{settings.WINDOW_END_OFFSET}s], "
-        f"API on :8100, LLM mode: {mode}, semantic cache: {cache_mode}",
+        f"API on :8100, LLM mode: {mode}, semantic cache: {cache_mode}, "
+        f"retrieval index: {rag_mode}",
         flush=True,
     )
     try:

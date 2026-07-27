@@ -1,5 +1,5 @@
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
-import { formatTime } from "@/lib/format";
+import { formatTime, formatTimestampFull } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { Journey, LogLevel, ProcessedAlert } from "@/lib/types";
 
@@ -39,7 +39,7 @@ export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: "12px", color: "var(--cc-grey-three)", display: "flex", gap: "8px" }}>
                 <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{event.raw.app_name}</span>
-                <span>{formatTime(event.ts)}</span>
+                <span title={formatTimestampFull(event.ts)}>{formatTime(event.ts)}</span>
               </div>
               <div
                 style={{

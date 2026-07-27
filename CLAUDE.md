@@ -619,8 +619,27 @@ GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
                                         # cached=true|false is ORTHOGONAL to source:
                                         # every cached alert is source="ai", so it
                                         # narrows within AI answers, not beside them.
+                                        # department/app_name/severity are MULTI-valued:
+                                        # repeat the param to OR within the category
+                                        # (SQL IN). Omitted / empty = no filter — an
+                                        # IN () would match nothing and empty the feed.
+                                        # A non-empty list excludes NULLs, so filtering
+                                        # by department drops fallback alerts.
+GET  /alerts/facets                     # 🔒 per-value counts for the 3 multi-selects
+                                        # (severity/department/app_name). Same filter
+                                        # params as /alerts, no paging. EXCLUDE-SELF:
+                                        # each facet omits its OWN filter, so ticking
+                                        # one value never collapses that facet's list;
+                                        # the other filters still scope it. NULLs are
+                                        # skipped (no filter option to count them on).
 GET  /journeys?status=                  # 🔒 requires session
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
+GET  /stats/insights                    # 🔒 aggregate counters for the insights page
+                                        # journeys: total, by_status, by_outcome,
+                                        # success_rate (over SUCCESS+FAILED+TIMED_OUT
+                                        # only; 0 when none finished), avg_duration_seconds
+                                        # alerts: total, open/resolved, by_department,
+                                        # by_severity, by_level, by_source
 WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
 POST  /auth/login                        # {username,password} -> sets httpOnly session cookie
 POST  /auth/logout                       # clears the cookie
@@ -631,6 +650,20 @@ GET   /journeys?status=                  # 🔒 requires session
 GET   /journeys/{id}                     # 🔒 journey + its events + summary
 WS    /ws                                # 🔒 alert.new | journey.updated | journey.completed
 ```
+
+Alert filter conditions live in ONE place — `alert_filter_conditions()` in
+`backend/api.py` returns the WHERE clauses as a list, which `build_alerts_query`
+applies wholesale and `/alerts/facets` applies minus one clause per facet. Adding
+a filter there reaches both, so the feed and its counts cannot disagree about what
+a filter means (a test pins the two endpoints' query params to the same set).
+
+Aggregation lives in **`backend/stats.py`**, split so both halves are pure and
+unit-testable like `build_alerts_query`: query builders returning `Select`s with
+`GROUP BY` (`alerts_by(column)` is generic over the four alert columns —
+whitelisted, never interpolated), and `assemble_overview(...)` which folds the
+executed rows into the response. Nullable group-by columns get an explicit bucket
+(`department` → `"unassigned"`, `severity` → `"unrated"`, `outcome` → `"none"`) so
+every breakdown sums back to its total instead of silently dropping nulls.
 
 ### Auth (`auth.py`) — Phase 1: single hardcoded admin
 Two deliberately separated layers so later auth methods are cheap:

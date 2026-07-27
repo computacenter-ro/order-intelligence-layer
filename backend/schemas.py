@@ -83,7 +83,8 @@ class AlertOut(BaseModel):
     # mean "not a cache hit", which is the correct reading for every such row.
     cached: Annotated[bool, BeforeValidator(lambda v: False if v is None else v)] = False
     journey_id: str | None = None
-    is_resolved: bool = False
+    is_resolved: bool\
+        :q= False
     resolved_at: UtcDatetime | None = None
 
 
@@ -117,3 +118,45 @@ class JourneyDetailOut(JourneyOut):
     """A journey plus its ordered events (the ``GET /journeys/{id}`` payload)."""
 
     events: list[JourneyEventOut]
+
+
+# --- insights aggregation (GET /stats/insights) -------------------------------
+#
+# Assembled by backend/stats.py from GROUP BY results. The breakdown dicts are
+# open-ended maps rather than fixed fields on purpose: a new department /
+# severity / outcome shows up without a schema change, and nullable columns get
+# an explicit bucket key ("unassigned"/"unrated"/...) so every dict sums back to
+# its ``total``.
+
+
+class JourneyStats(BaseModel):
+    """Journey-side counters. ``success_rate`` is over *finished* journeys only
+    (SUCCESS/FAILED/TIMED_OUT), and is 0.0 when none have finished yet.
+    ``avg_duration_seconds`` is null when no finished journey has both
+    timestamps.
+    """
+
+    total: int
+    by_status: dict[str, int]
+    by_outcome: dict[str, int]
+    success_rate: float
+    avg_duration_seconds: float | None
+
+
+class AlertStats(BaseModel):
+    """Alert-side counters. ``open`` + ``resolved`` == ``total``."""
+
+    total: int
+    open: int
+    resolved: int
+    by_department: dict[str, int]
+    by_severity: dict[str, int]
+    by_level: dict[str, int]
+    by_source: dict[str, int]
+
+
+class OverviewStats(BaseModel):
+    """The ``GET /stats/insights`` payload — the dashboard insights page."""
+
+    journeys: JourneyStats
+    alerts: AlertStats

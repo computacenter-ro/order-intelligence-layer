@@ -5,8 +5,10 @@ import { CaretDownIcon, CaretUpIcon } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { radii, semanticSpacing } from "@computacenter-ro/style-guide/tokens";
 import { capitalize } from "@/lib/format";
+import type { AlertFacets, AlertsFilter } from "@/lib/api";
 import { FilterDropdown, type FilterOption } from "@/components/alerts/FilterDropdown";
-import type { Department, ProcessedAlert } from "@/lib/types";
+import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
+import type { Department, ProcessedAlert, Severity } from "@/lib/types";
 
 // --- filter model ------------------------------------------------------------
 //
@@ -16,11 +18,14 @@ import type { Department, ProcessedAlert } from "@/lib/types";
 // ProcessedAlert.source, the WARN/ERROR levels, and app_name — so a selection
 // round-trips to /alerts unchanged.
 
-export type DepartmentFilter = Department | "all";
+// department / severity / app_name are MULTI-select: arrays of concrete values
+// with NO "all" sentinel. An empty array means "no filter" — the same convention
+// the backend uses (build_alerts_query treats [] and None alike), so "nothing
+// ticked" shows everything rather than matching nothing.
+export type AppNameFilter = (typeof APP_NAMES)[number];
+// Single-select filters keep the "all" sentinel.
 export type SourceFilter = "all" | "ai" | "fallback";
 export type LevelFilter = "all" | "WARN" | "ERROR";
-export type AppNameFilter = "all" | (typeof APP_NAMES)[number];
-export type SeverityFilter = "all" | "critical" | "high" | "medium" | "low";
 // Semantic-cache provenance. Orthogonal to SourceFilter — cached alerts are all
 // source="ai" — so this narrows within AI answers rather than competing with it.
 // "all" is the same UI-only sentinel; the page maps it to `undefined`.
@@ -33,21 +38,23 @@ export type CachedFilter = "all" | "cached" | "fresh";
 export type TimeFilter = "all" | "1h" | "24h" | "7d";
 
 export interface AlertFilters {
-  department: DepartmentFilter;
+  // Multi-select; [] = no filter.
+  department: Department[];
+  severity: Severity[];
+  app_name: AppNameFilter[];
+  // Single-select; "all" = no filter.
   source: SourceFilter;
   level: LevelFilter;
-  app_name: AppNameFilter;
-  severity: SeverityFilter;
   cached: CachedFilter;
   time: TimeFilter;
 }
 
 export const DEFAULT_ALERT_FILTERS: AlertFilters = {
-  department: "all",
+  department: [],
+  severity: [],
+  app_name: [],
   source: "all",
   level: "all",
-  app_name: "all",
-  severity: "all",
   cached: "all",
   time: "all",
 };
@@ -72,14 +79,12 @@ const APP_NAMES = [
   "cc-track-trace",
 ] as const;
 
-const DEPARTMENT_FILTERS: DepartmentFilter[] = ["all", ...DEPARTMENTS];
 const SOURCE_FILTERS: SourceFilter[] = ["all", "ai", "fallback"];
 const LEVEL_FILTERS: LevelFilter[] = ["all", "WARN", "ERROR"];
-const APP_NAME_FILTERS: AppNameFilter[] = ["all", ...APP_NAMES];
 
-// Router LLM severities (shared/models.py Severity), most→least urgent.
-const SEVERITIES = ["critical", "high", "medium", "low"] as const;
-const SEVERITY_FILTERS: SeverityFilter[] = ["all", ...SEVERITIES];
+// Router LLM severities (shared/models.py Severity), most→least urgent. No "all"
+// entry: for the multi-selects, "none ticked" already means all.
+const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 const CACHED_FILTERS: CachedFilter[] = ["all", "cached", "fresh"];
 const TIME_FILTERS: TimeFilter[] = ["all", "1h", "24h", "7d"];
 
@@ -105,6 +110,40 @@ export function sinceForTimeFilter(time: TimeFilter): string | undefined {
   if (time === "all") return undefined;
   return new Date(Date.now() - TIME_WINDOW_MS[time]).toISOString();
 }
+
+/**
+ * Map the UI filter model onto the API query for BOTH the list and the facet
+ * counts.
+ *
+ * One mapping, four call sites (feed + History, each fetching a list and its
+ * counts). Copies would drift, and a drift here is subtle rather than loud: the
+ * counts would describe a slightly different query than the list they annotate —
+ * numbers that look authoritative and are quietly wrong. The backend guards the
+ * same hazard with a test pinning `/alerts` and `/alerts/facets` to one param set.
+ *
+ * `resolved` is the caller's, because it is the one thing the two pages genuinely
+ * disagree on: the feed shows open alerts, History resolved ones.
+ *
+ * Call this per request, never memoize it: `sinceForTimeFilter` re-anchors the
+ * rolling time window to the current clock each time it runs.
+ */
+export function toAlertsQuery(filters: AlertFilters, resolved: boolean): AlertsFilter {
+  return {
+    // Multi-select arrays go through as-is: empty = no filter, several values =
+    // one IN (...) server-side. No "all" sentinel to unmap for these three.
+    department: filters.department,
+    app_name: filters.app_name,
+    severity: filters.severity,
+    // Single-select: "all" is the UI-only sentinel, mapped to an omitted param.
+    source: filters.source === "all" ? undefined : filters.source,
+    level: filters.level === "all" ? undefined : filters.level,
+    // "all" omits the param; otherwise "cached" -> true, "fresh" -> false.
+    cached: filters.cached === "all" ? undefined : filters.cached === "cached",
+    since: sinceForTimeFilter(filters.time),
+    resolved,
+  };
+}
+
 
 // Labels spelled out where capitalize() would mangle them ("ai" -> "Ai").
 const SOURCE_LABELS: Record<SourceFilter, string> = {
@@ -132,8 +171,7 @@ const TIME_LABELS: Record<TimeFilter, string> = {
   "7d": "Last 7 days",
 };
 
-const SEVERITY_LABELS: Record<SeverityFilter, string> = {
-  all: "All Severities",
+const SEVERITY_LABELS: Record<Severity, string> = {
   critical: "Critical",
   high: "High",
   medium: "Medium",
@@ -145,22 +183,33 @@ const SEVERITY_LABELS: Record<SeverityFilter, string> = {
  * falling back to the defaults for anything outside the known domain. Keeps a
  * stale or hand-edited `oil.alertFilters` entry from poisoning the UI.
  */
+function coerceList<T extends string>(raw: unknown, allowed: readonly T[]): T[] {
+  // Not an array (including the single strings persisted by the pre-multi-select
+  // version of this bar) -> no filter. Unknown members are dropped rather than
+  // rejecting the whole list, and duplicates are collapsed so a hand-edited entry
+  // can't produce "Severity 3" over two real values.
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<T>();
+  for (const item of raw) {
+    if (allowed.includes(item as T)) seen.add(item as T);
+  }
+  return [...seen];
+}
+
 export function sanitizeAlertFilters(raw: unknown): AlertFilters {
   const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const department = DEPARTMENT_FILTERS.includes(obj.department as DepartmentFilter)
-    ? (obj.department as DepartmentFilter)
-    : "all";
+  // Multi-select: coerce to a list of known values, defaulting to [] (no filter).
+  // A blob saved when these were single-valued holds a string like "backend" or
+  // the old "all" sentinel — both are not arrays, so both land on [], which is
+  // the honest reading of "we can't trust this, filter nothing".
+  const department = coerceList(obj.department, DEPARTMENTS);
+  const severity = coerceList(obj.severity, SEVERITIES);
+  const app_name = coerceList(obj.app_name, APP_NAMES);
   const source = SOURCE_FILTERS.includes(obj.source as SourceFilter)
     ? (obj.source as SourceFilter)
     : "all";
   const level = LEVEL_FILTERS.includes(obj.level as LevelFilter)
     ? (obj.level as LevelFilter)
-    : "all";
-  const app_name = APP_NAME_FILTERS.includes(obj.app_name as AppNameFilter)
-    ? (obj.app_name as AppNameFilter)
-    : "all";
-  const severity = SEVERITY_FILTERS.includes(obj.severity as SeverityFilter)
-    ? (obj.severity as SeverityFilter)
     : "all";
   const cached = CACHED_FILTERS.includes(obj.cached as CachedFilter)
     ? (obj.cached as CachedFilter)
@@ -170,24 +219,42 @@ export function sanitizeAlertFilters(raw: unknown): AlertFilters {
   const time = TIME_FILTERS.includes(obj.time as TimeFilter)
     ? (obj.time as TimeFilter)
     : "all";
-  return { department, source, level, app_name, severity, cached, time };
+  return { department, severity, app_name, source, level, cached, time };
 }
 
 /**
  * The single source of truth for "does this alert belong in the feed under the
  * active filter?". Used both to guard live WS alerts (`alert.new`) and as the
  * mirror of the backend query — a live alert is admitted iff a re-fetch with
- * the same filters would have returned it (department AND source AND level AND
- * app_name, "all" = any). Fallback alerts have a null department, so any
- * non-"all" department filter excludes them — exactly as `Alert.department ==
- * department` does server-side.
+ * the same filters would have returned it: AND across categories, OR within a
+ * multi-select category (the server's `IN`), with an empty list meaning "any".
+ * Fallback alerts have a null department and null severity, so any non-empty
+ * department/severity filter excludes them — exactly as SQL `IN` does.
  */
 export function alertMatchesFilters(alert: ProcessedAlert, filters: AlertFilters): boolean {
-  if (filters.department !== "all" && alert.department !== filters.department) return false;
+  // Multi-select: an empty list is no filter; a non-empty one is OR-within-category
+  // and — like SQL IN — excludes nulls. So filtering by any department drops
+  // fallback alerts (they have none), matching the server exactly.
+  if (
+    filters.department.length > 0 &&
+    (alert.department === null || !filters.department.includes(alert.department as Department))
+  ) {
+    return false;
+  }
+  if (
+    filters.severity.length > 0 &&
+    (alert.severity === null || !filters.severity.includes(alert.severity as Severity))
+  ) {
+    return false;
+  }
+  if (
+    filters.app_name.length > 0 &&
+    !filters.app_name.includes(alert.app_name as AppNameFilter)
+  ) {
+    return false;
+  }
   if (filters.source !== "all" && alert.source !== filters.source) return false;
   if (filters.level !== "all" && alert.level !== filters.level) return false;
-  if (filters.app_name !== "all" && alert.app_name !== filters.app_name) return false;
-  if (filters.severity !== "all" && alert.severity !== filters.severity) return false;
   // Mirrors `Alert.cached == cached` server-side. Fallback alerts are never
   // cache hits, so "cached" excludes them and "fresh" admits them — the same
   // partition the backend applies.
@@ -206,24 +273,33 @@ export function alertMatchesFilters(alert: ProcessedAlert, filters: AlertFilters
 interface AlertFilterBarProps {
   value: AlertFilters;
   onChange: (next: AlertFilters) => void;
+  /**
+   * Per-value counts from `GET /alerts/facets`, or null while loading. Passed
+   * straight through to the three multi-selects; `undefined` there hides the
+   * count pills, so a loading bar shows plain options rather than a row of 0s.
+   */
+  facets?: AlertFacets | null;
 }
 
 // Option lists handed to FilterDropdown. Each pairs the value the filter model
 // uses with the label already defined above, so the dropdowns and the filter
 // contract cannot drift apart.
-const DEPARTMENT_OPTIONS: FilterOption[] = DEPARTMENT_FILTERS.map((d) => ({
+// The three multi-selects list concrete values only — no "All" row, because
+// clearing every tick already means "all" (and an "All" checkbox would beg the
+// question of what "All + Backend" means).
+const DEPARTMENT_OPTIONS: FilterOption[] = DEPARTMENTS.map((d) => ({
   value: d,
-  label: d === "all" ? "All Departments" : capitalize(d),
+  label: capitalize(d),
 }));
 
 // app_name has no label map — the service names ARE the labels (they are the
 // literal app_name values the backend stores).
-const APP_NAME_OPTIONS: FilterOption[] = APP_NAME_FILTERS.map((name) => ({
+const APP_NAME_OPTIONS: FilterOption[] = APP_NAMES.map((name) => ({
   value: name,
-  label: name === "all" ? "All Services" : name,
+  label: name,
 }));
 
-const SEVERITY_OPTIONS: FilterOption[] = SEVERITY_FILTERS.map((s) => ({
+const SEVERITY_OPTIONS: FilterOption[] = SEVERITIES.map((s) => ({
   value: s,
   label: SEVERITY_LABELS[s],
 }));
@@ -255,10 +331,19 @@ const TIME_OPTIONS: FilterOption[] = TIME_FILTERS.map((t) => ({
 // sliver of row two peek through.
 const COLLAPSED_MAX_PX = 36;
 
-export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
-  const isDefault = (Object.keys(DEFAULT_ALERT_FILTERS) as (keyof AlertFilters)[]).every(
-    (key) => value[key] === DEFAULT_ALERT_FILTERS[key]
-  );
+export function AlertFilterBar({ value, onChange, facets }: AlertFilterBarProps) {
+  // Spelled out rather than looped over the defaults: the three multi-selects are
+  // arrays, and `value.department === DEFAULT_ALERT_FILTERS.department` compares
+  // references — always false for a fresh [], which would leave "Reset Filters"
+  // permanently visible.
+  const isDefault =
+    value.department.length === 0 &&
+    value.severity.length === 0 &&
+    value.app_name.length === 0 &&
+    value.source === "all" &&
+    value.level === "all" &&
+    value.cached === "all" &&
+    value.time === "all";
 
   const [expanded, setExpanded] = useState(false);
   // Whether the seven controls need more than one row at the current width —
@@ -312,12 +397,12 @@ export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
           overflow: "hidden",
         }}
       >
-        <FilterDropdown
+        <MultiFilterDropdown
           label="Severity"
-          value={value.severity}
-          defaultValue={DEFAULT_ALERT_FILTERS.severity}
+          selected={value.severity}
           options={SEVERITY_OPTIONS}
-          onChange={(v) => onChange({ ...value, severity: v as SeverityFilter })}
+          counts={facets?.severity}
+          onChange={(next) => onChange({ ...value, severity: next as Severity[] })}
         />
         <FilterDropdown
           label="Level"
@@ -333,19 +418,19 @@ export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
           options={TIME_OPTIONS}
           onChange={(v) => onChange({ ...value, time: v as TimeFilter })}
         />
-        <FilterDropdown
+        <MultiFilterDropdown
           label="Service"
-          value={value.app_name}
-          defaultValue={DEFAULT_ALERT_FILTERS.app_name}
+          selected={value.app_name}
           options={APP_NAME_OPTIONS}
-          onChange={(v) => onChange({ ...value, app_name: v as AppNameFilter })}
+          counts={facets?.app_name}
+          onChange={(next) => onChange({ ...value, app_name: next as AppNameFilter[] })}
         />
-        <FilterDropdown
+        <MultiFilterDropdown
           label="Department"
-          value={value.department}
-          defaultValue={DEFAULT_ALERT_FILTERS.department}
+          selected={value.department}
           options={DEPARTMENT_OPTIONS}
-          onChange={(v) => onChange({ ...value, department: v as DepartmentFilter })}
+          counts={facets?.department}
+          onChange={(next) => onChange({ ...value, department: next as Department[] })}
         />
         <FilterDropdown
           label="Source"

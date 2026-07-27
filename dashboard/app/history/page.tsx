@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@computacenter-ro/style-guide/components";
-import { fetchAlerts, type Page } from "@/lib/api";
+import { fetchAlerts, fetchFacets, type AlertFacets, type Page } from "@/lib/api";
 import { usePagination } from "@/lib/usePagination";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
@@ -10,7 +10,7 @@ import {
   AlertFilterBar,
   DEFAULT_ALERT_FILTERS,
   sanitizeAlertFilters,
-  sinceForTimeFilter,
+  toAlertsQuery,
   type AlertFilters,
 } from "@/components/alerts/AlertFilterBar";
 import type { ProcessedAlert } from "@/lib/types";
@@ -56,26 +56,44 @@ export default function HistoryPage() {
     (cursor: string | null): Promise<Page<ProcessedAlert>> => {
       if (!filtersReady) return Promise.resolve(EMPTY_PAGE);
       return fetchAlerts({
-        department: filters.department === "all" ? undefined : filters.department,
-        source: filters.source === "all" ? undefined : filters.source,
-        level: filters.level === "all" ? undefined : filters.level,
-        app_name: filters.app_name === "all" ? undefined : filters.app_name,
-        severity: filters.severity === "all" ? undefined : filters.severity,
-        // "all" omits the param; otherwise "cached" -> true, "fresh" -> false.
-        cached: filters.cached === "all" ? undefined : filters.cached === "cached",
-        // Resolved here, per request, so the rolling window re-anchors to the
-        // current clock on every fetch — including each "Load more" page. Note
-        // this bounds `emitted_at` (when the alert fired), not `resolved_at`
-        // (what History sorts on): "Last 24h" means alerts raised in the last
-        // day, which is the same reading as on the feed.
-        since: sinceForTimeFilter(filters.time),
-        resolved: true,
+        // toAlertsQuery is shared with the facet fetch below, so the counts always
+        // describe this exact query. It resolves the rolling `since` per call, so
+        // the window re-anchors on every fetch — including each "Load more" page.
+        // Note `since` bounds `emitted_at` (when the alert fired), not
+        // `resolved_at` (what History sorts on): "Last 24h" means alerts raised in
+        // the last day, the same reading as on the feed.
+        ...toAlertsQuery(filters, true),
         sort: "resolved_at",
         cursor: cursor ?? undefined,
       });
     },
     [filters, filtersReady]
   );
+
+  // Contextual per-value counts for the three multi-select filters. Fetched with
+  // the SAME filters as the list (via toAlertsQuery), so the numbers annotate this
+  // exact query; the backend applies exclude-self per facet, which is why the
+  // current multi-select ticks are sent rather than withheld.
+  const [facets, setFacets] = useState<AlertFacets | null>(null);
+
+  useEffect(() => {
+    if (!filtersReady) return;
+    // Filters can change faster than the request returns; without this guard a
+    // slow earlier response could land last and leave stale counts on screen.
+    let current = true;
+    fetchFacets(toAlertsQuery(filters, true))
+      .then((next) => {
+        if (current) setFacets(next);
+      })
+      .catch((err) => {
+        // Counts are an enhancement — the filters and the list work without them,
+        // so a failure keeps the last known values rather than breaking the page.
+        console.error("Failed to load alert facets:", err);
+      });
+    return () => {
+      current = false;
+    };
+  }, [filters, filtersReady]);
 
   const { items, loading, hasMore, loadMore, reload } = usePagination<ProcessedAlert>(
     fetchPage,
@@ -100,7 +118,7 @@ export default function HistoryPage() {
       <p style={{ fontSize: "16px", color: "var(--cc-grey-three)", marginTop: "4px", marginBottom: "24px" }}>
         Alerts marked resolved from the Alert Feed
       </p>
-      <AlertFilterBar value={filters} onChange={setFilters} />
+      <AlertFilterBar value={filters} onChange={setFilters} facets={facets} />
       <div>
         {items.length === 0 && !loading && (
           <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet.</p>

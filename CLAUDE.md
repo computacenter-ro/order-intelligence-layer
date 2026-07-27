@@ -610,6 +610,19 @@ GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
                                         # cached=true|false is ORTHOGONAL to source:
                                         # every cached alert is source="ai", so it
                                         # narrows within AI answers, not beside them.
+                                        # department/app_name/severity are MULTI-valued:
+                                        # repeat the param to OR within the category
+                                        # (SQL IN). Omitted / empty = no filter — an
+                                        # IN () would match nothing and empty the feed.
+                                        # A non-empty list excludes NULLs, so filtering
+                                        # by department drops fallback alerts.
+GET  /alerts/facets                     # 🔒 per-value counts for the 3 multi-selects
+                                        # (severity/department/app_name). Same filter
+                                        # params as /alerts, no paging. EXCLUDE-SELF:
+                                        # each facet omits its OWN filter, so ticking
+                                        # one value never collapses that facet's list;
+                                        # the other filters still scope it. NULLs are
+                                        # skipped (no filter option to count them on).
 GET  /journeys?status=                  # 🔒 requires session
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
 GET  /stats/insights                    # 🔒 aggregate counters for the insights page
@@ -620,6 +633,12 @@ GET  /stats/insights                    # 🔒 aggregate counters for the insigh
                                         # by_severity, by_level, by_source
 WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
 ```
+
+Alert filter conditions live in ONE place — `alert_filter_conditions()` in
+`backend/api.py` returns the WHERE clauses as a list, which `build_alerts_query`
+applies wholesale and `/alerts/facets` applies minus one clause per facet. Adding
+a filter there reaches both, so the feed and its counts cannot disagree about what
+a filter means (a test pins the two endpoints' query params to the same set).
 
 Aggregation lives in **`backend/stats.py`**, split so both halves are pure and
 unit-testable like `build_alerts_query`: query builders returning `Select`s with

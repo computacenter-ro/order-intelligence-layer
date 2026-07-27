@@ -86,3 +86,27 @@ export type BadgeStatus =
   | "inactive"
   | "other"
   | "primary";
+
+export type IncidentStatus = "open" | "resolved";
+
+// Mirrors backend/schemas.py IncidentOut exactly.
+export interface Incident {
+  incident_id: string;
+  signature: string | null;
+  failure_subtype: string | null;
+  failing_service: string | null;
+  error_token: string | null;
+  title: string;
+  department: Department | null;
+  status: IncidentStatus;
+  first_ts: string;
+  last_ts: string;
+  primary_alert_id: string | null;
+  alert_count: number;
+  journey_count: number;
+}
+
+// Mirrors backend/schemas.py IncidentDetailOut — adds the full linked alert list.
+export interface IncidentDetail extends Incident {
+  alerts: ProcessedAlert[];
+}

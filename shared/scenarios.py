@@ -350,6 +350,107 @@ SCENARIOS: dict[int, Scenario] = {
         fail_at="sap",
         terminal=(OUTBOUND, BLOCKS.SUBMIT),
     ),
+        # =====================================================================
+    # CLUSTERING TEST SCENARIOS (added for the incident-clustering feature)
+    #
+    # 11-14 reuse EXISTING failure points -> NO other code changes needed.
+    # They put MULTIPLE orders through the SAME failure in a single run so you
+    # can watch clustering merge (infra) or stay-separate (order-specific):
+    #   8 + 11 + 12  -> three SPT-down orders -> ONE incident (ENRICHMENT_FAILED/SPT), journey_count=3
+    #   10 + 14      -> two SAP-down orders    -> ONE incident (SAP_SUBMISSION_FAILED), journey_count=2
+    #   6 + 13       -> two margin failures     -> TWO separate incidents (order-specific: never merged)
+    # None of these need embeddings — each resolves to a recognized subtype.
+    # =====================================================================
+    11: Scenario(
+        id=11,
+        name="Enrichment failed (SPT down) — DE order",
+        outcome="ENRICHMENT_FAILED",
+        country="DE",
+        user="MWEBER",
+        accountNumber="62011948",
+        lines=[_line("5001914", "SKU-GPU-H100-80GB")],
+        bridge_ids="order",
+        fail_at="spt",
+        terminal=(SPT, BLOCKS.SERVE),
+    ),
+    12: Scenario(
+        id=12,
+        name="Enrichment failed (SPT down) — US order",
+        outcome="ENRICHMENT_FAILED",
+        country="US",
+        user="JSMITH",
+        accountNumber="55829104",
+        lines=[_line("4788230", "SKU-APC-UPS-3000VA")],
+        bridge_ids="cart",
+        fail_at="spt",
+        terminal=(SPT, BLOCKS.SERVE),
+    ),
+    13: Scenario(
+        id=13,
+        name="Margin check failed — different account",
+        outcome="MARGIN_CHECK_FAILED",
+        country="UK",
+        user="RFLORIA",
+        accountNumber="70443219",
+        lines=[_line("5001914", "SKU-GPU-H100-80GB")],
+        bridge_ids="order",
+        fail_at="margin",
+        terminal=(CHECKER, BLOCKS.SERVE),
+    ),
+    14: Scenario(
+        id=14,
+        name="SAP submission failed (RFC failure) — DE order",
+        outcome="SAP_SUBMISSION_FAILED",
+        country="DE",
+        user="MWEBER",
+        accountNumber="62011948",
+        lines=[_line("3652269", "SKU-GPU-A100-80GB")],
+        bridge_ids="both",
+        fail_at="sap",
+        terminal=(OUTBOUND, BLOCKS.SUBMIT),
+    ),
+    # =====================================================================
+    # 15 is the NOVEL failure — the ONLY scenario here that needs EMBEDDINGS.
+    #
+    # It fails at the SETTINGS enrichment satellite with a message the backend's
+    # _FAILURE_RULES does NOT recognize, so the journey never resolves to a known
+    # subtype: it TIMES OUT with a real ERROR and must cluster via the embedding
+    # / novel path instead of a (subtype, service) signature.
+    #
+    # !!! REQUIRES a small service-code change — scenarios.py alone is NOT enough:
+    #   1) pipeline/services/settings.py must emit an ERROR failure variant for
+    #      its `serve` block when ctx.fail_at == "settings", with a NOVEL,
+    #      unfamiliar but INFRA-SHAPED message (matching flow 15 in
+    #      pipeline/data/mock-order-flows-v3.json exactly):
+    #        "[SettingsClient#getAccountSettingByOrganizationHierarchy] <--- ERROR:
+    #         settings service unavailable — connection reset while fetching
+    #         account settings (8000ms)"
+    #      Two properties MUST both hold:
+    #        (a) it must NOT match any backend _FAILURE_RULES pattern — that
+    #            unfamiliarity is what keeps it novel -> TIMED_OUT -> embeddings; and
+    #        (b) it must read as INFRA (words like "unavailable"/"connection"),
+    #            because only INFRA-class failures search for a match. A novel
+    #            failure classified order-specific would just open its own
+    #            per-order incident and NEVER exercise the embedding cosine
+    #            match — so an infra shape is required to actually test embeddings.
+    #   2) The chain truncates after (SETTINGS, SERVE) below, so the order engine
+    #      never emits its recognized "Order processing aborted" wrapper — which
+    #      is what stops it being (mis)classified as ENRICHMENT_FAILED.
+    #   Verify: the flow should end TIMED_OUT (not a recognized outcome) and,
+    #   because it carries a real ERROR, still form/join an incident via embeddings.
+    # =====================================================================
+    15: Scenario(
+        id=15,
+        name="Novel enrichment failure (SETTINGS unavailable) — NEEDS EMBEDDINGS",
+        outcome="TIMED_OUT",  # unrecognized on purpose -> novel/embedding path
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("4249751", "SKU-DELL-P7680-I9")],
+        bridge_ids="both",
+        fail_at="settings",
+        terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
 }
 
 

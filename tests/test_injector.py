@@ -17,7 +17,7 @@ from shared.models import Baton
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_build_baton_is_valid_for_every_scenario(sid):
     baton = build_baton(SCENARIOS[sid])
     assert isinstance(baton, Baton)
@@ -36,7 +36,7 @@ def test_supplied_event_id_is_used():
     assert baton.ctx.eventId == "evt-fixed-123"
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_model_B_order_ids_absent_at_injection(sid):
     # The whole point of model B: order ids are born at creation, not injection.
     baton = build_baton(SCENARIOS[sid])

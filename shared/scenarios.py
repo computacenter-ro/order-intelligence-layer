@@ -188,6 +188,8 @@ def _failing_step(fail_at: str, chain: list[tuple[str, str]]) -> int:
             target = (VALIDATOR, BLOCKS.VALIDATE)
         case "sap":
             target = (OUTBOUND, BLOCKS.SUBMIT)
+        case "settings":
+            target = (SETTINGS, BLOCKS.SERVE)
         case _:
             raise ValueError(f"unknown fail_at block: {fail_at!r}")
     try:

@@ -4,7 +4,7 @@ import { AlertActionsMenu } from "@/components/alerts/AlertActionsMenu";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
-import { formatTime, capitalize } from "@/lib/format";
+import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
@@ -52,7 +52,12 @@ export function AlertCard({ alert, onOpen, onResolve, isSelected = false }: Aler
           <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: "12px", color: "var(--cc-grey-two)" }}>
             {alert.app_name}
           </span>
-          <span style={{ marginLeft: "auto", fontSize: "12px", color: "var(--cc-grey-three)" }}>
+          {/* The compact time abbreviates (no seconds once it isn't today), so the
+              exact value is one hover away rather than lost. */}
+          <span
+            style={{ marginLeft: "auto", fontSize: "12px", color: "var(--cc-grey-three)" }}
+            title={formatTimestampFull(alert.emitted_at)}
+          >
             {formatTime(alert.emitted_at)}
           </span>
           <AlertActionsMenu

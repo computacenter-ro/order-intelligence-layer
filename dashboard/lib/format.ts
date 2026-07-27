@@ -11,12 +11,59 @@ export function levelLabel(level: LogLevel): string {
   return LEVEL_LABEL[level];
 }
 
+/**
+ * Compact timestamp for lists and feeds: "13:46:55" for today, "26 Jul, 13:46"
+ * for anything older.
+ *
+ * Backend timestamps are UTC; these render in the VIEWER's local timezone (the
+ * browser's) rather than UTC, so a user in Europe/Bucharest sees local wall
+ * time. Using the toLocale* family (not toISOString, which forces UTC) keeps
+ * this correct for any viewer's timezone, not just one hardcoded offset.
+ *
+ * "Today" is decided on LOCAL calendar fields (getFullYear/getMonth/getDate),
+ * matching the timezone the time itself is rendered in — comparing UTC dates
+ * would flip the branch a few hours early or late for viewers off UTC.
+ *
+ * Seconds are dropped on the older branch on purpose: at that distance the
+ * exact second no longer helps, and the day + time is what disambiguates.
+ * Anyone needing the full value hovers for :func:`formatTimestampFull`.
+ */
 export function formatTime(iso: string): string {
-  // Backend timestamps are UTC; render in the VIEWER's local timezone (the
-  // browser's) rather than UTC, so a user in Europe/Bucharest sees local wall
-  // time. Using toLocaleTimeString (not toISOString, which forces UTC) keeps
-  // this correct for any viewer's timezone, not just one hardcoded offset.
-  return new Date(iso).toLocaleTimeString([], {
+  const d = new Date(iso);
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) {
+    return d.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+  // Older than today → show the day, so entries across days are distinguishable
+  // (two rows an exact 24h apart used to render identically).
+  return d.toLocaleString([], {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+/**
+ * Full absolute timestamp for hover tooltips (`title` attributes) — the precise
+ * value behind the compact one `formatTime` renders. Always includes the year
+ * and seconds, so nothing is guessed from an abbreviated display.
+ */
+export function formatTimestampFull(iso: string): string {
+  return new Date(iso).toLocaleString([], {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",

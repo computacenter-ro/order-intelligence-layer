@@ -76,18 +76,53 @@ class ChatRequest(BaseModel):
 
 
 class ChatSource(BaseModel):
-    """One retrieved record, trimmed for display."""
+    """One retrieved record, trimmed for display.
+
+    ``metadata`` is passed through from the index so the caller can build links
+    and badges without a second lookup — the backend uses ``journey_id`` /
+    ``order_id`` from here to attach a dashboard URL to each citation.
+    """
 
     id: str
     kind: str
     score: float
     snippet: str
+    metadata: dict = {}
+
+
+class ChatCoverage(BaseModel):
+    """How much of the history the answer is based on — computed, never generated.
+
+    Top-k retrieval has no notion of coverage: several alerts about one incident
+    can crowd out a second, distinct incident that also matched (measured — two
+    journeys failed SAP submission, but at k=3 only one was retrieved, the other
+    ranking 6th behind four alerts). An answer built from that sample can read as
+    if it described the whole history.
+
+    The server knows these numbers exactly, so it reports them instead of asking
+    the model to. Two earlier prompt-based attempts were followed only about half
+    the time in each direction — caveats appeared on cause questions where they
+    were noise and vanished from counting questions where they mattered. A field
+    is deterministic, costs no tokens, and a UI can render it as a badge.
+
+    ``truncated`` is the one a caller should act on: True means the limit was hit
+    and other matching incidents very likely exist beyond it.
+    """
+
+    shown: int                         # records returned to the caller
+    limit: int                         # the k that was applied
+    truncated: bool                    # shown == limit, so more may exist
 
 
 class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource]
-    mode: str                          # "retrieval-only" in this phase
+    # "ai"             — the answer was composed by the LLM, grounded in sources
+    # "retrieval-only" — deterministic template (LLM down/absent, or no sources)
+    # The sources are IDENTICAL either way; only the prose differs, so a caller
+    # can always render citations regardless of mode.
+    mode: str
+    coverage: ChatCoverage
 
 
 # --- injectable dependencies -------------------------------------------------
@@ -95,6 +130,10 @@ class ChatResponse(BaseModel):
 class SummaryDeps:
     breaker: CircuitBreaker
     model: BaseChatModel | None
+    # Grounded-chat model for POST /chat. Defaulted to None so every existing
+    # construction site (and test) keeps working and simply gets the
+    # retrieval-only answer — the same degradation as an LLM outage.
+    chat: BaseChatModel | None = None
 
 
 _deps: SummaryDeps | None = None
@@ -129,6 +168,7 @@ def template_summary(req: SummaryRequest) -> str:
 # --- retrieval-only answer (deterministic, no LLM) ---------------------------
 SNIPPET_CHARS = 200
 RETRIEVAL_ONLY = "retrieval-only"
+AI_COMPOSED = "ai"
 
 NO_RESULTS_ANSWER = (
     "No related incidents found in the indexed history for that question. "
@@ -207,22 +247,54 @@ async def index(req: IndexRequest) -> IndexResponse:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    """Answer from retrieved incident history — RETRIEVAL ONLY, no LLM.
+    """Answer a question from retrieved incident history, grounded by the LLM.
 
-    Returns the retrieved records as ``sources`` plus a deterministic templated
-    ``answer``. ``mode`` names the behaviour so a caller (and a future generation
-    phase) can tell them apart without sniffing the text.
+    Retrieve top-k (phase 1) → compose an answer from those records ONLY, under
+    the SHARED circuit breaker. Degradation is layered so the endpoint is always
+    useful:
+
+    * sources + LLM ok        → ``mode="ai"``, a grounded narrative answer
+    * breaker open / LLM error → ``mode="retrieval-only"``, the phase-1 template
+    * nothing retrieved        → ``mode="retrieval-only"``, "no related incidents"
+
+    The ``sources`` are the same in every case — only the prose differs — so a UI
+    can render citations without branching on mode. This is the chatbot's share
+    of the system-wide "useful with the LLM completely down" guarantee: an
+    outage costs you the narrative, never the search.
     """
     results = ragindex.retrieve(req.query, k=req.k, filters=req.filters)
+    sources = [
+        ChatSource(
+            id=r["id"],
+            kind=r["kind"],
+            score=r["score"],
+            snippet=_snippet(r["text"]),
+            metadata=r.get("metadata") or {},
+        )
+        for r in results
+    ]
+
+    answer, mode = build_retrieval_answer(req.query, results), RETRIEVAL_ONLY
+    # Only attempt composition when there is something to ground in — with no
+    # sources the model has nothing to answer from, and the template already says
+    # so honestly. (compose_chat_answer also refuses, belt and braces.)
+    if results and _deps is not None:
+        composed = await _deps.breaker.call(
+            lambda: nodes.compose_chat_answer(req.query, results, _deps.chat),
+            fallback=None,
+        )
+        if composed:
+            answer, mode = composed, AI_COMPOSED
+
     return ChatResponse(
-        answer=build_retrieval_answer(req.query, results),
-        sources=[
-            ChatSource(
-                id=r["id"], kind=r["kind"], score=r["score"], snippet=_snippet(r["text"])
-            )
-            for r in results
-        ],
-        mode=RETRIEVAL_ONLY,
+        answer=answer,
+        sources=sources,
+        mode=mode,
+        # Computed, not generated: retrieval filling every slot it was allowed
+        # means matches were almost certainly cut off beyond the limit.
+        coverage=ChatCoverage(
+            shown=len(results), limit=req.k, truncated=len(results) >= req.k
+        ),
     )
 
 

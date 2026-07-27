@@ -118,6 +118,47 @@ _ROUTE_SYSTEM = (
     "No prose, no code fence."
 )
 
+# Grounding rules for POST /chat. The whole point of this prompt is that the
+# answer must be traceable to the retrieved records: the corpus is operational
+# incident data, and an invented order id or a made-up "resolution" is worse than
+# no answer — an agent would act on it. Hence: answer only from the context, say
+# so when the context is silent, cite the record ids used.
+_CHAT_SYSTEM = (
+    "You answer questions from an IT-support engineer about an order-management "
+    "pipeline, using ONLY the incident records provided as context.\n"
+    "Rules:\n"
+    "1. Answer strictly from the provided context. It is the only thing you know "
+    "about this system's history.\n"
+    "2. If the context does not contain the answer, say so plainly and stop. Do "
+    "NOT fall back on general knowledge about order systems.\n"
+    "3. Never invent an order id, event id, outcome, timestamp, department or "
+    "resolution. Every concrete detail must appear in the context verbatim.\n"
+    "4. Cite the record ids you used, in square brackets, e.g. [alert-123].\n"
+    "5. Be concise: 2-5 sentences for an IT-support engineer who wants the cause "
+    "and where it stopped.\n"
+    "6. The context is the top semantic matches for the question, not the complete "
+    "history — so never assert a total as if it were the whole picture, and never "
+    "say something happened 'only once'. Do NOT discuss how many records you were "
+    "given or whether the list is complete: that is reported separately, alongside "
+    "your answer. Just answer the question from these records."
+)
+
+# NOTE — why there is no coverage sentence in the prompt any more.
+#
+# Two earlier attempts put the "n of k records shown" fact in the context and asked
+# the model to surface it only for counting questions. Measured over 12 live calls
+# it obeyed that about half the time in EACH direction: cause questions ("why did
+# SAP submission fail") picked up a pointless caveat, and counting questions
+# sometimes dropped it. "Mention this only sometimes" is a conditional instruction,
+# and a small/fast deployment follows those unreliably.
+#
+# Coverage is a fact the SERVER already knows exactly — how many records were
+# retrieved, what the limit was, whether the limit was hit. Asking an LLM to
+# re-state a fact we can compute is strictly worse than returning it: it is
+# non-deterministic, it costs tokens, and prose cannot be rendered as a UI badge.
+# So it is now a structured field on the response (see api.ChatCoverage) and the
+# model is told to leave the subject alone entirely.
+
 _SUMMARY_SYSTEM = (
     "You summarize the end-to-end journey of ONE order through a microservice "
     "order-management pipeline, for an IT-support engineer. Given the journey's "
@@ -196,6 +237,65 @@ async def summarize_journey(
     text = _content_text(resp).strip()
     if not text:
         raise LLMError("summary returned empty text")
+    return text
+
+
+def build_chat_prompt(query: str, sources: list[dict]) -> str:
+    """The human-message block for :func:`compose_chat_answer` (pure, testable).
+
+    Contains the question and the retrieved records — and NOTHING else. Kept
+    separate from the I/O so a test can assert exactly what context the model was
+    shown: with a grounding prompt, "no unrelated record leaked in" is a
+    correctness property, not a style preference.
+
+    Deliberately carries NO coverage/limit information: that is computed by the
+    server and returned as a structured field (see the note above ``_CHAT_SYSTEM``).
+    """
+    blocks = []
+    for record in sources:
+        meta = record.get("metadata") or {}
+        # Only the metadata worth reasoning about — a full dump would bury the
+        # text and invite the model to quote internal keys back at the user.
+        facts = " ".join(
+            f"{key}={meta[key]}"
+            for key in ("kind", "outcome", "department", "severity", "app_name", "order_id")
+            if meta.get(key)
+        )
+        header = f"[{record['id']}] ({record.get('kind', 'record')}"
+        header += f"; {facts})" if facts else ")"
+        blocks.append(f"{header}\n{record.get('text', '')}")
+    context = "\n\n".join(blocks) if blocks else "(no records retrieved)"
+    return f"question: {query}\n\nincident records:\n{context}"
+
+
+async def compose_chat_answer(
+    query: str, sources: list[dict], model: BaseChatModel | None
+) -> str:
+    """LLM chat composition grounded in ``sources``. Raises LLMError otherwise.
+
+    Mirrors :func:`summarize_journey`: build a prompt, call the model, raise
+    ``LLMError`` on a provider failure or empty output so the SHARED breaker has
+    exactly one exception type to count. The caller (``api.chat``) runs this under
+    that breaker and falls back to the deterministic retrieval-only answer, which
+    is what keeps the chatbot useful with the LLM completely down.
+    """
+    if model is None:
+        raise LLMError("no chat model configured")
+    if not sources:
+        # Refuse to compose with nothing to ground in — that is precisely the
+        # situation where a model invents an answer. The caller already returns
+        # the "nothing found" template for this case.
+        raise LLMError("no sources to ground the answer in")
+    prompt = build_chat_prompt(query, sources)
+    try:
+        resp = await model.ainvoke(
+            [SystemMessage(content=_CHAT_SYSTEM), HumanMessage(content=prompt)]
+        )
+    except Exception as exc:
+        raise LLMError(f"chat call failed: {exc}") from exc
+    text = _content_text(resp).strip()
+    if not text:
+        raise LLMError("chat returned empty text")
     return text
 
 

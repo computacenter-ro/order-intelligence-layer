@@ -86,9 +86,14 @@ async def _run() -> None:
 
     # The summary API shares the same breaker + Redis; its model is the stronger
     # summary deployment (None with no creds → template fallback).
+    # The summary API and grounded /chat share this breaker with each other (one
+    # provider, one outage, one breaker — CLAUDE.md). chat_model() falls back to
+    # the summary deployment when AZURE_AI_FOUNDRY_DEPLOYMENT_CHAT is unset.
     api.configure(
         api.SummaryDeps(
-            breaker=CircuitBreaker(redis_client), model=llm.summary_model()
+            breaker=CircuitBreaker(redis_client),
+            model=llm.summary_model(),
+            chat=llm.chat_model(),
         )
     )
     server = uvicorn.Server(

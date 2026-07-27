@@ -61,3 +61,16 @@ def router_model() -> BaseChatModel | None:
 def summary_model() -> BaseChatModel | None:
     """The stronger model for journey summaries (api.py, slice 5)."""
     return _build(settings.AZURE_DEPLOYMENT_SUMMARY)
+
+
+def chat_model() -> BaseChatModel | None:
+    """The model for grounded chat answers (``POST /chat``).
+
+    Falls back to the SUMMARY deployment when ``AZURE_AI_FOUNDRY_DEPLOYMENT_CHAT``
+    is unset: chat composition is the same shape of job as a journey summary —
+    read some context, write a short grounded narrative — so the summary
+    deployment is the right default rather than a second thing to configure.
+    Returns ``None`` with no creds, exactly like the other three factories, and
+    ``/chat`` then serves its retrieval-only answer.
+    """
+    return _build(settings.AZURE_DEPLOYMENT_CHAT or settings.AZURE_DEPLOYMENT_SUMMARY)

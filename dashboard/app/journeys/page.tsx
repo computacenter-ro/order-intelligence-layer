@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Card, Button } from "@computacenter-ro/style-guide/components";
 import { badgeColors, radii } from "@computacenter-ro/style-guide/tokens";
 import { Badge } from "@/components/ui/Badge";
-import { formatTime } from "@/lib/format";
+import { formatTime, formatTimestampFull } from "@/lib/format";
 import { JOURNEY_STATUS_BADGE, JOURNEY_STATUS_LABEL } from "@/lib/journeyStatus";
 import { fetchJourneys } from "@/lib/api";
 import { usePagination } from "@/lib/usePagination";
@@ -239,7 +239,9 @@ function JourneysPageContent() {
                   <td className="oil-mono">{journey.cart_header_id ?? "—"}</td>
                   <td className="oil-mono">{journey.event_id ?? "—"}</td>
                   <td>{journey.outcome ?? "—"}</td>
-                  <td className="oil-mono">{formatTime(journey.last_ts)}</td>
+                  <td className="oil-mono" title={formatTimestampFull(journey.last_ts)}>
+                    {formatTime(journey.last_ts)}
+                  </td>
                 </tr>
               );
             })}

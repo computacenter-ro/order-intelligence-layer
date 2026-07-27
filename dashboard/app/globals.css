@@ -88,8 +88,10 @@ body {
   box-shadow: var(--shadow-cc-md);
 }
 
-/* Filter-bar selects — hover/focus per the Forms spec (2px Heritage Blue focus
-   simulated with border + 1px ring so the control doesn't shift on focus). */
+/* Filter-bar controls — hover/focus per the Forms spec (2px Heritage Blue focus
+   simulated with border + 1px ring so the control doesn't shift on focus). Worn
+   by the FilterDropdown trigger buttons, so every control in the bar reacts
+   identically. */
 .oil-filter-select {
   transition: border-color 200ms ease, box-shadow 200ms ease;
 }
@@ -102,4 +104,21 @@ body {
   outline: none;
   border-color: var(--cc-heritage-blue);
   box-shadow: 0 0 0 1px var(--cc-heritage-blue);
+}
+
+/* The filter bar's "More/Fewer Filters" disclosure toggle. Carries the ghost
+   button's states (transparent -> Horizon Blue hover fill, Foundation Blue focus
+   ring) as a class because it must be a plain <button> to take aria-expanded /
+   aria-controls, which the style-guide Button does not forward. */
+.oil-filter-toggle {
+  transition: background-color 200ms ease;
+}
+
+.oil-filter-toggle:hover {
+  background-color: var(--cc-btn-secondary-fill);
+}
+
+.oil-filter-toggle:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
 }

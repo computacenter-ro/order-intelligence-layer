@@ -1,8 +1,11 @@
 "use client";
 
+import { useEffect, useId, useRef, useState } from "react";
+import { CaretDownIcon, CaretUpIcon } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { radii, semanticSpacing } from "@computacenter-ro/style-guide/tokens";
 import { capitalize } from "@/lib/format";
+import { FilterDropdown, type FilterOption } from "@/components/alerts/FilterDropdown";
 import type { Department, ProcessedAlert } from "@/lib/types";
 
 // --- filter model ------------------------------------------------------------
@@ -22,6 +25,12 @@ export type SeverityFilter = "all" | "critical" | "high" | "medium" | "low";
 // source="ai" — so this narrows within AI answers rather than competing with it.
 // "all" is the same UI-only sentinel; the page maps it to `undefined`.
 export type CachedFilter = "all" | "cached" | "fresh";
+// A ROLLING window, not an absolute range: the selection names a span, and the
+// `since` bound is recomputed from `Date.now()` on every fetch (see
+// `sinceForTimeFilter`). Storing a resolved timestamp instead would freeze the
+// window at selection time, so a tab left open would slowly stop showing recent
+// alerts.
+export type TimeFilter = "all" | "1h" | "24h" | "7d";
 
 export interface AlertFilters {
   department: DepartmentFilter;
@@ -30,6 +39,7 @@ export interface AlertFilters {
   app_name: AppNameFilter;
   severity: SeverityFilter;
   cached: CachedFilter;
+  time: TimeFilter;
 }
 
 export const DEFAULT_ALERT_FILTERS: AlertFilters = {
@@ -39,6 +49,7 @@ export const DEFAULT_ALERT_FILTERS: AlertFilters = {
   app_name: "all",
   severity: "all",
   cached: "all",
+  time: "all",
 };
 
 const DEPARTMENTS: Department[] = ["networking", "devops", "backend", "database", "general"];
@@ -70,6 +81,30 @@ const APP_NAME_FILTERS: AppNameFilter[] = ["all", ...APP_NAMES];
 const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 const SEVERITY_FILTERS: SeverityFilter[] = ["all", ...SEVERITIES];
 const CACHED_FILTERS: CachedFilter[] = ["all", "cached", "fresh"];
+const TIME_FILTERS: TimeFilter[] = ["all", "1h", "24h", "7d"];
+
+/** Span of each rolling window, in ms. "all" has no span — hence the Exclude. */
+const TIME_WINDOW_MS: Record<Exclude<TimeFilter, "all">, number> = {
+  "1h": 3_600_000,
+  "24h": 86_400_000,
+  "7d": 604_800_000,
+};
+
+/**
+ * The `?since=` bound for a time filter, or `undefined` for "all time" (the
+ * param is then omitted entirely).
+ *
+ * Lives here, beside the type and the spans, rather than being copied into each
+ * page: the feed and History must agree on what "Last 24h" means, and two
+ * copies of the table are two things to drift apart.
+ *
+ * Call it INSIDE the fetch (not in render or a memo) — the point is that every
+ * request re-anchors the window to the current clock.
+ */
+export function sinceForTimeFilter(time: TimeFilter): string | undefined {
+  if (time === "all") return undefined;
+  return new Date(Date.now() - TIME_WINDOW_MS[time]).toISOString();
+}
 
 // Labels spelled out where capitalize() would mangle them ("ai" -> "Ai").
 const SOURCE_LABELS: Record<SourceFilter, string> = {
@@ -88,6 +123,13 @@ const CACHED_LABELS: Record<CachedFilter, string> = {
   all: "All Answers",
   cached: "Cached",
   fresh: "Freshly analyzed",
+};
+
+const TIME_LABELS: Record<TimeFilter, string> = {
+  all: "All time",
+  "1h": "Last 1h",
+  "24h": "Last 24h",
+  "7d": "Last 7 days",
 };
 
 const SEVERITY_LABELS: Record<SeverityFilter, string> = {
@@ -123,7 +165,12 @@ export function sanitizeAlertFilters(raw: unknown): AlertFilters {
   const cached = CACHED_FILTERS.includes(obj.cached as CachedFilter)
     ? (obj.cached as CachedFilter)
     : "all";
-  return { department, source, level, app_name, severity, cached };
+  // A filter bar persisted before `time` existed has no such key — it coerces to
+  // "all", which is exactly the pre-feature behaviour.
+  const time = TIME_FILTERS.includes(obj.time as TimeFilter)
+    ? (obj.time as TimeFilter)
+    : "all";
+  return { department, source, level, app_name, severity, cached, time };
 }
 
 /**
@@ -145,6 +192,12 @@ export function alertMatchesFilters(alert: ProcessedAlert, filters: AlertFilters
   // cache hits, so "cached" excludes them and "fresh" admits them — the same
   // partition the backend applies.
   if (filters.cached !== "all" && alert.cached !== (filters.cached === "cached")) return false;
+  // `filters.time` is deliberately NOT checked, and adding it would be a bug.
+  // This function guards LIVE alerts arriving over the WebSocket, which are by
+  // definition "now" — and every window is `[now - span, now]`, so it always
+  // includes the present. The iff-a-re-fetch-would-return-it property therefore
+  // still holds: a re-fetch re-anchors `since` to the current clock, and a
+  // just-emitted alert is inside every one of those windows.
   return true;
 }
 
@@ -155,170 +208,229 @@ interface AlertFilterBarProps {
   onChange: (next: AlertFilters) => void;
 }
 
-const labelStyle: React.CSSProperties = {
-  fontSize: "14px",
-  fontWeight: 500,
-  lineHeight: "18px",
-  color: "var(--cc-grey-one)",
-  marginBottom: semanticSpacing.xs,
-};
+// Option lists handed to FilterDropdown. Each pairs the value the filter model
+// uses with the label already defined above, so the dropdowns and the filter
+// contract cannot drift apart.
+const DEPARTMENT_OPTIONS: FilterOption[] = DEPARTMENT_FILTERS.map((d) => ({
+  value: d,
+  label: d === "all" ? "All Departments" : capitalize(d),
+}));
 
-const selectStyle: React.CSSProperties = {
-  height: "32px",
-  minWidth: "150px",
-  padding: `0 ${semanticSpacing.md}`,
-  fontSize: "14px",
-  fontFamily: "inherit",
-  color: "var(--cc-grey-one)",
-  backgroundColor: "var(--cc-cloud-white)",
-  border: "1px solid var(--cc-grey-four)",
-  borderRadius: radii.md,
-  cursor: "pointer",
-};
+// app_name has no label map — the service names ARE the labels (they are the
+// literal app_name values the backend stores).
+const APP_NAME_OPTIONS: FilterOption[] = APP_NAME_FILTERS.map((name) => ({
+  value: name,
+  label: name === "all" ? "All Services" : name,
+}));
+
+const SEVERITY_OPTIONS: FilterOption[] = SEVERITY_FILTERS.map((s) => ({
+  value: s,
+  label: SEVERITY_LABELS[s],
+}));
+
+const LEVEL_OPTIONS: FilterOption[] = LEVEL_FILTERS.map((l) => ({
+  value: l,
+  label: LEVEL_LABELS[l],
+}));
+
+const SOURCE_OPTIONS: FilterOption[] = SOURCE_FILTERS.map((s) => ({
+  value: s,
+  label: SOURCE_LABELS[s],
+}));
+
+const CACHED_OPTIONS: FilterOption[] = CACHED_FILTERS.map((c) => ({
+  value: c,
+  label: CACHED_LABELS[c],
+}));
+
+const TIME_OPTIONS: FilterOption[] = TIME_FILTERS.map((t) => ({
+  value: t,
+  label: TIME_LABELS[t],
+}));
+
+// Height of the collapsed filter row. The FilterDropdown triggers are 32px and
+// the container's row-gap is 8px, so the second row starts at y=40 — any cap in
+// [32, 40) shows row one whole and row two not at all. 36px sits in the middle,
+// leaving a little tolerance for font-rendering differences without letting a
+// sliver of row two peek through.
+const COLLAPSED_MAX_PX = 36;
 
 export function AlertFilterBar({ value, onChange }: AlertFilterBarProps) {
-  // Already-default selection → nothing to reset, so the button is disabled
-  // rather than looking actionable for a no-op.
   const isDefault = (Object.keys(DEFAULT_ALERT_FILTERS) as (keyof AlertFilters)[]).every(
     (key) => value[key] === DEFAULT_ALERT_FILTERS[key]
   );
 
+  const [expanded, setExpanded] = useState(false);
+  // Whether the seven controls need more than one row at the current width —
+  // i.e. whether collapsing actually hides anything. Drives the toggle's
+  // existence, so on a wide screen where everything fits there is no toggle.
+  const [overflows, setOverflows] = useState(false);
+  const filtersRef = useRef<HTMLDivElement>(null);
+  const filtersId = useId();
+
+  useEffect(() => {
+    const el = filtersRef.current;
+    if (!el) return;
+    // ResizeObserver fires once immediately on observe(), so the first
+    // measurement and every later resize take the same path — no setState in
+    // the effect body.
+    //
+    // Re-created when `value` changes because a filter becoming active widens
+    // its trigger (the dot plus its gap), which can push a control onto a
+    // second row without the container itself resizing — so the observer alone
+    // would never hear about it.
+    const observer = new ResizeObserver(() => {
+      // Compared against the cap rather than clientHeight: scrollHeight is the
+      // full content height in BOTH states (the maxHeight cap doesn't shrink
+      // it), whereas `scrollHeight > clientHeight` degenerates to false once
+      // expanded — which would make the "Fewer Filters" button disappear the
+      // moment it was needed.
+      setOverflows(el.scrollHeight > COLLAPSED_MAX_PX);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [value]);
+
+  // Nothing hidden, nothing to toggle.
+  const showToggle = overflows;
+
   return (
-    <div
-      style={{
-        display: "flex",
-        gap: semanticSpacing.md,
-        flexWrap: "wrap",
-        alignItems: "flex-end",
-        marginBottom: semanticSpacing.lg,
-      }}
-    >
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        <label htmlFor="alert-filter-severity" style={labelStyle}>
-          Severity
-        </label>
-        <select
-          id="alert-filter-severity"
-          className="oil-filter-select"
-          style={selectStyle}
-          value={value.severity}
-          onChange={(e) => onChange({ ...value, severity: e.target.value as SeverityFilter })}
-        >
-          {SEVERITY_FILTERS.map((sev) => (
-            <option key={sev} value={sev}>
-              {SEVERITY_LABELS[sev]}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        <label htmlFor="alert-filter-level" style={labelStyle}>
-          Level
-        </label>
-        <select
-          id="alert-filter-level"
-          className="oil-filter-select"
-          style={selectStyle}
-          value={value.level}
-          onChange={(e) => onChange({ ...value, level: e.target.value as LevelFilter })}
-        >
-          {LEVEL_FILTERS.map((lvl) => (
-            <option key={lvl} value={lvl}>
-              {LEVEL_LABELS[lvl]}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        <label htmlFor="alert-filter-app-name" style={labelStyle}>
-          Service
-        </label>
-        <select
-          id="alert-filter-app-name"
-          className="oil-filter-select"
-          style={selectStyle}
-          value={value.app_name}
-          onChange={(e) => onChange({ ...value, app_name: e.target.value as AppNameFilter })}
-        >
-          <option value="all">All Services</option>
-          {APP_NAMES.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        <label htmlFor="alert-filter-department" style={labelStyle}>
-          Department
-        </label>
-        <select
-          id="alert-filter-department"
-          className="oil-filter-select"
-          style={selectStyle}
-          value={value.department}
-          onChange={(e) => onChange({ ...value, department: e.target.value as DepartmentFilter })}
-        >
-          <option value="all">All Departments</option>
-          {DEPARTMENTS.map((dept) => (
-            <option key={dept} value={dept}>
-              {capitalize(dept)}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        <label htmlFor="alert-filter-source" style={labelStyle}>
-          Source
-        </label>
-        <select
-          id="alert-filter-source"
-          className="oil-filter-select"
-          style={selectStyle}
-          value={value.source}
-          onChange={(e) => onChange({ ...value, source: e.target.value as SourceFilter })}
-        >
-          {SOURCE_FILTERS.map((src) => (
-            <option key={src} value={src}>
-              {SOURCE_LABELS[src]}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        <label htmlFor="alert-filter-cached" style={labelStyle}>
-          Answer
-        </label>
-        <select
-          id="alert-filter-cached"
-          className="oil-filter-select"
-          style={selectStyle}
-          value={value.cached}
-          onChange={(e) => onChange({ ...value, cached: e.target.value as CachedFilter })}
-        >
-          {CACHED_FILTERS.map((c) => (
-            <option key={c} value={c}>
-              {CACHED_LABELS[c]}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Aligns to the bottom of the bar (parent alignItems: flex-end), level
-          with the selects. Resets every filter to "all" in one click; the
-          page's onChange re-fetches and persists. */}
-      <Button
-        variant="secondary"
-        onClick={() => onChange(DEFAULT_ALERT_FILTERS)}
-        disabled={isDefault}
+    <div style={{ marginBottom: semanticSpacing.lg }}>
+      {/* flex-wrap makes the row count follow the viewport on its own; the cap
+          below is what turns "wraps onto more rows" into "hidden behind a
+          toggle". Ordered by triage relevance: what an on-call agent reaches
+          for first (how bad / what kind / how recent) comes before the
+          narrowing-down filters. */}
+      <div
+        ref={filtersRef}
+        id={filtersId}
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: semanticSpacing.sm,
+          maxHeight: expanded ? "none" : `${COLLAPSED_MAX_PX}px`,
+          overflow: "hidden",
+        }}
       >
-        Reset filters
-      </Button>
+        <FilterDropdown
+          label="Severity"
+          value={value.severity}
+          defaultValue={DEFAULT_ALERT_FILTERS.severity}
+          options={SEVERITY_OPTIONS}
+          onChange={(v) => onChange({ ...value, severity: v as SeverityFilter })}
+        />
+        <FilterDropdown
+          label="Level"
+          value={value.level}
+          defaultValue={DEFAULT_ALERT_FILTERS.level}
+          options={LEVEL_OPTIONS}
+          onChange={(v) => onChange({ ...value, level: v as LevelFilter })}
+        />
+        <FilterDropdown
+          label="Time"
+          value={value.time}
+          defaultValue={DEFAULT_ALERT_FILTERS.time}
+          options={TIME_OPTIONS}
+          onChange={(v) => onChange({ ...value, time: v as TimeFilter })}
+        />
+        <FilterDropdown
+          label="Service"
+          value={value.app_name}
+          defaultValue={DEFAULT_ALERT_FILTERS.app_name}
+          options={APP_NAME_OPTIONS}
+          onChange={(v) => onChange({ ...value, app_name: v as AppNameFilter })}
+        />
+        <FilterDropdown
+          label="Department"
+          value={value.department}
+          defaultValue={DEFAULT_ALERT_FILTERS.department}
+          options={DEPARTMENT_OPTIONS}
+          onChange={(v) => onChange({ ...value, department: v as DepartmentFilter })}
+        />
+        <FilterDropdown
+          label="Source"
+          value={value.source}
+          defaultValue={DEFAULT_ALERT_FILTERS.source}
+          options={SOURCE_OPTIONS}
+          onChange={(v) => onChange({ ...value, source: v as SourceFilter })}
+        />
+        <FilterDropdown
+          label="Answer"
+          value={value.cached}
+          defaultValue={DEFAULT_ALERT_FILTERS.cached}
+          options={CACHED_OPTIONS}
+          onChange={(v) => onChange({ ...value, cached: v as CachedFilter })}
+        />
+      </div>
+
+      {/* Actions row. Rendered only when it would hold something, so a default,
+          fits-on-one-row bar carries no chrome at all. */}
+      {(showToggle || !isDefault) && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: semanticSpacing.sm,
+            marginTop: semanticSpacing.sm,
+          }}
+        >
+          {showToggle && (
+            // A plain <button> rather than the style-guide Button: a disclosure
+            // control needs aria-expanded / aria-controls, which that component
+            // does not forward. The ghost variant's look and states come from
+            // the shared .oil-filter-toggle class, so it stays consistent.
+            <button
+              type="button"
+              className="oil-filter-toggle"
+              onClick={() => setExpanded((prev) => !prev)}
+              aria-expanded={expanded}
+              aria-controls={filtersId}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: semanticSpacing.xs,
+                height: "32px",
+                padding: `0 ${semanticSpacing.md}`,
+                background: "transparent",
+                border: "none",
+                borderRadius: radii.md,
+                color: "var(--cc-heritage-blue)",
+                fontSize: "14px",
+                fontWeight: 600,
+                fontFamily: "inherit",
+                cursor: "pointer",
+              }}
+            >
+              {expanded ? "Fewer Filters" : "More Filters"}
+              {expanded ? (
+                <CaretUpIcon size={16} aria-hidden="true" />
+              ) : (
+                <CaretDownIcon size={16} aria-hidden="true" />
+              )}
+            </button>
+          )}
+
+          {showToggle && !isDefault && (
+            <span
+              aria-hidden="true"
+              style={{
+                width: "1px",
+                height: "20px",
+                background: "var(--cc-grey-five)",
+                flexShrink: 0,
+              }}
+            />
+          )}
+
+          {/* Shown only when something is set (phase 1): the button's presence
+              is itself the signal that there is something to clear. */}
+          {!isDefault && (
+            <Button variant="secondary" size="compact" onClick={() => onChange(DEFAULT_ALERT_FILTERS)}>
+              Reset Filters
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

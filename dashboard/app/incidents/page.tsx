@@ -5,8 +5,10 @@ import { Button } from "@computacenter-ro/style-guide/components";
 import { radii, semanticSpacing } from "@computacenter-ro/style-guide/tokens";
 import { fetchIncidents, resolveIncident } from "@/lib/api";
 import { usePagination } from "@/lib/usePagination";
+import { useWebSocket } from "@/lib/useWebSocket";
 import { IncidentCard } from "@/components/incidents/IncidentCard";
-import type { Incident, IncidentStatus } from "@/lib/types";
+import { NewIncidentsBanner } from "@/components/incidents/NewIncidentsBanner";
+import type { Incident, IncidentStatus, WsEvent } from "@/lib/types";
 
 type StatusFilter = IncidentStatus | "all";
 
@@ -31,6 +33,7 @@ const selectStyle: React.CSSProperties = {
 
 export default function IncidentsPage() {
   const [status, setStatus] = useState<StatusFilter>("open");
+  const [pending, setPending] = useState<Incident[]>([]);
 
   // The server sorts last_ts DESC and applies the status filter; "all" omits it.
   const fetchPage = useCallback(
@@ -39,7 +42,7 @@ export default function IncidentsPage() {
     [status]
   );
 
-  const { items, loading, hasMore, loadMore, reload, remove } = usePagination<Incident>(
+  const { items, loading, hasMore, loadMore, reload, prepend, remove } = usePagination<Incident>(
     fetchPage,
     (i) => i.incident_id
   );
@@ -54,6 +57,35 @@ export default function IncidentsPage() {
     }
     reload();
   }, [status, reload]);
+
+  const handleStatusChange = useCallback((next: StatusFilter) => {
+    setStatus(next);
+    // Drop live incidents captured under the previous filter, same as the
+    // Alert Feed does on a filter change.
+    setPending([]);
+  }, []);
+
+  const handleEvent = useCallback(
+    (event: WsEvent) => {
+      if (event.type !== "incident.new") return;
+      // A freshly created incident is always "open" — it only belongs in the
+      // live feed under the "open"/"all" filters, never under "resolved".
+      if (status === "resolved") return;
+      setPending((prev) =>
+        prev.some((i) => i.incident_id === event.data.incident_id) ? prev : [event.data, ...prev]
+      );
+    },
+    [status]
+  );
+
+  useWebSocket(handleEvent);
+
+  const handleReveal = useCallback(() => {
+    // pending is newest-first; prepend inserts at the top, so replay
+    // oldest-first to leave the newest incident on top. The hook dedups.
+    [...pending].reverse().forEach(prepend);
+    setPending([]);
+  }, [pending, prepend]);
 
   const handleResolve = useCallback(
     (incident: Incident) => {
@@ -107,7 +139,7 @@ export default function IncidentsPage() {
           id="incident-status-filter"
           style={selectStyle}
           value={status}
-          onChange={(e) => setStatus(e.target.value as StatusFilter)}
+          onChange={(e) => handleStatusChange(e.target.value as StatusFilter)}
         >
           {STATUS_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>
@@ -116,6 +148,7 @@ export default function IncidentsPage() {
           ))}
         </select>
       </div>
+      <NewIncidentsBanner count={pending.length} onReveal={handleReveal} />
       {items.length === 0 && !loading && (
         <p style={{ color: "var(--cc-grey-three)" }}>No incidents match this filter</p>
       )}

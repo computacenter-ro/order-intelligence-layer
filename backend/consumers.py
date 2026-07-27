@@ -274,7 +274,7 @@ class RawEventsConsumer(_QueueConsumer):
             completions = await self._assembler.ingest(session, [log], on_event=self._on_event)
             for completion in completions:
                 try:
-                    await process_completion(session, completion)
+                    await process_completion(session, completion, on_event=self._on_event)
                 except Exception as exc:  # noqa: BLE001 — a clustering blip must not drop this log/journey completion
                     print(f"[incident-clustering] ERROR (continuing): {exc}", flush=True)
 
@@ -307,7 +307,7 @@ async def _sweep_stalled_loop(
                 async with SessionLocal() as session:
                     completions = await assembler.sweep_stalled(session, on_event=on_event)
                     for completion in completions:
-                        await process_completion(session, completion)
+                        await process_completion(session, completion, on_event=on_event)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[stalled-sweep] ERROR (continuing): {exc}", flush=True)
     except asyncio.CancelledError:
@@ -316,7 +316,7 @@ async def _sweep_stalled_loop(
         raise
 
 
-async def _sweep_incidents_loop() -> None:
+async def _sweep_incidents_loop(on_event: OnEvent | None = None) -> None:
     """Periodically close incidents that have gone quiet past
     INCIDENT_QUIET_TIMEOUT (the safety-net closing mechanism — manual dashboard
     resolve is the primary one, added in Plan 2's API work), and retry
@@ -324,7 +324,16 @@ async def _sweep_incidents_loop() -> None:
     completion, detected via raw.events, can be persisted before its own
     alerts — bound by the LLM and ALERT_CONCURRENCY via processed.alerts —
     exist yet; see backend.incidents.retry_unclustered_completions). Runs on
-    the same cadence as the stalled-journey sweep."""
+    the same cadence as the stalled-journey sweep.
+
+    ``on_event`` is threaded into the retry path so a newly-created incident
+    that only clustered on this catch-up pass still gets its ``incident.new``
+    push — the retry exists precisely because the first (synchronous) attempt
+    can miss, and a live incident that never appears on screen because it
+    happened to cluster one sweep late would defeat the point of pushing it
+    live at all. ``sweep_stale_incidents`` (closing) is not wired to any event —
+    out of scope; only NEW incidents are pushed, mirroring ``alert.new``.
+    """
     import asyncio
 
     from backend.db import SessionLocal
@@ -335,7 +344,7 @@ async def _sweep_incidents_loop() -> None:
             try:
                 async with SessionLocal() as session:
                     await sweep_stale_incidents(session)
-                    await retry_unclustered_completions(session)
+                    await retry_unclustered_completions(session, on_event=on_event)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[incident-sweep] ERROR (continuing): {exc}", flush=True)
     except asyncio.CancelledError:
@@ -382,7 +391,7 @@ async def run_consumers(
             alerts.run(),
             raw.run(),
             _sweep_stalled_loop(assembler, on_event=on_event),
-            _sweep_incidents_loop(),
+            _sweep_incidents_loop(on_event=on_event),
         )
 
 

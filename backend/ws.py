@@ -11,7 +11,10 @@ Every pushed message uses one consistent envelope::
     {"type": <str>, "data": <dict>}
 
 with ``type`` one of ``alert.new`` / ``journey.updated`` / ``journey.completed``
-(CLAUDE.md: ``alert.new | journey.updated | journey.completed``).
+(CLAUDE.md: ``alert.new | journey.updated | journey.completed``) plus
+``incident.new`` (a newly-created incident — mirrors ``alert.new``'s "push the
+just-created row" shape; incidents growing in place or resolving are not
+pushed live, same as an alert never gets an in-place WS update).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from backend.auth import COOKIE_NAME, decode_token
 EVENT_ALERT_NEW = "alert.new"
 EVENT_JOURNEY_UPDATED = "journey.updated"
 EVENT_JOURNEY_COMPLETED = "journey.completed"
+EVENT_INCIDENT_NEW = "incident.new"
 
 
 def make_event(type_: str, data: dict) -> dict:

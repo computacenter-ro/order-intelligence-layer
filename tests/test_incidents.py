@@ -499,6 +499,81 @@ async def test_failed_journey_creates_incident_links_all_alerts_and_journey():
     assert all(a.incident_id == incident.incident_id for a in alerts)
 
 
+# --- on_event: incident.new (WebSocket push), mirrors alert.new ------------------
+
+
+async def test_new_incident_emits_incident_new_via_on_event():
+    """Creating a fresh incident pushes exactly one incident.new event, with a
+    payload matching the IncidentOut REST shape (same contract as alert.new)."""
+    alerts = [
+        Alert(alert_id="a1", emitted_at=NOW, log_id="l1", level="ERROR",
+              app_name="cc-order-engine", logger="c.c.orderengine.client.SptClient",
+              message=(
+                  "[SptClient#getSptPriceListCode] <--- ERROR "
+                  "java.net.SocketTimeoutException: connect timed out (10014ms)"
+              ),
+              source="fallback", department=None, embedding=None, journey_id="j1"),
+    ]
+    session = _FakeSession([
+        _RowResult(None),               # not yet clustered
+        _FakeResult(items=alerts),        # causal-candidate fetch
+        _FakeResult(items=[]),            # no open incident with this signature -> creates
+        _FakeResult(items=alerts),         # journey's full alert set, for linking
+        _FakeResult(items=[]),             # closing UPDATE journeys — return value unused
+    ])
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    incident = await process_completion(
+        session, _completion(JourneyStatus.FAILED), on_event=on_event
+    )
+    assert incident is not None
+    assert len(events) == 1
+    assert events[0]["type"] == "incident.new"
+    assert events[0]["data"]["incident_id"] == incident.incident_id
+    assert events[0]["data"]["failure_subtype"] == "ENRICHMENT_FAILED"
+
+
+async def test_joining_existing_incident_does_not_emit_incident_new():
+    """Joining an already-open incident must NOT push incident.new — only the
+    newly-created case does (mirrors alert.new: a push per new row, never an
+    in-place update as an incident's counts grow)."""
+    existing = Incident(
+        incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
+        failing_service="SPT", error_token=None, title="ENRICHMENT_FAILED — SPT",
+        department="devops", status="open", first_ts=NOW, last_ts=NOW,
+        primary_alert_id="a0", alert_count=4, journey_count=1,
+    )
+    alerts = [
+        Alert(alert_id="a1", emitted_at=NOW, log_id="l1", level="ERROR",
+              app_name="cc-order-engine", logger="c.c.orderengine.client.SptClient",
+              message=(
+                  "[SptClient#getSptPriceListCode] <--- ERROR "
+                  "java.net.SocketTimeoutException: connect timed out (10014ms)"
+              ),
+              source="fallback", department=None, embedding=None, journey_id="j1"),
+    ]
+    session = _FakeSession([
+        _RowResult(None),                       # not yet clustered
+        _FakeResult(items=alerts),               # causal-candidate fetch
+        _FakeResult(items=[existing]),           # matches the existing open incident
+        _FakeResult(items=alerts),               # journey's full alert set, for linking
+        _FakeResult(items=[]),                   # closing UPDATE journeys — return value unused
+    ])
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    incident = await process_completion(
+        session, _completion(JourneyStatus.FAILED), on_event=on_event
+    )
+    assert incident is existing
+    assert events == []  # joined, not created — no push
+
+
 from backend.incidents import INCIDENT_QUIET_TIMEOUT, sweep_stale_incidents
 
 

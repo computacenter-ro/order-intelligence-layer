@@ -441,7 +441,22 @@ async def _fetch_causal_candidates(session, journey_id: str) -> list[CausalCandi
     ]
 
 
-async def process_completion(session, completion, *, now: datetime | None = None):
+# --- WebSocket event builders --------------------------------------------------
+# Mirrors backend/journeys.py's builders: the "data" payload uses the API
+# response schema (backend/schemas.py) so the dashboard sees exactly the REST
+# shape. Import lazily to keep this module's import path free of the web layer.
+
+
+def _incident_new_event(incident) -> dict:
+    """An ``incident.new`` envelope for a freshly created incident."""
+    from backend.schemas import IncidentOut
+    from backend.ws import EVENT_INCIDENT_NEW, make_event
+
+    data = IncidentOut.model_validate(incident).model_dump(mode="json")
+    return make_event(EVENT_INCIDENT_NEW, data)
+
+
+async def process_completion(session, completion, *, now: datetime | None = None, on_event=None):
     """Cluster one journey's completion into an incident, or return ``None``
     if ineligible (source spec §4 Eligibility):
 
@@ -453,6 +468,12 @@ async def process_completion(session, completion, *, now: datetime | None = None
     Idempotent on ``journey_id``: a journey whose ``incident_id`` is already
     set is a no-op (handles at-least-once redelivery / a re-evaluated
     completion safely).
+
+    When ``on_event`` is given (e.g. the WebSocket hub's ``broadcast``, same as
+    ``backend/journeys.py``'s ``on_event`` wiring), emits ``incident.new`` —
+    but ONLY when this call actually created a fresh incident, never when it
+    joined an existing one. Mirrors ``alert.new``: a push for the newly-created
+    row, not an in-place update as an incident's counts grow.
     """
     from sqlalchemy import select, update
     from backend.db import Alert, Journey
@@ -490,6 +511,10 @@ async def process_completion(session, completion, *, now: datetime | None = None
     incident = await assign_incident(
         session, signature=signature, infra_class=infra_class, causal=causal, now=now
     )
+    # A freshly created incident starts at alert_count=0 (see assign_incident);
+    # a matched existing one is already >0. Capture this BEFORE the bump below,
+    # since that's the only way to tell "created" from "joined" apart afterward.
+    is_new = incident.alert_count == 0
 
     result = await session.execute(
         select(Alert).where(Alert.journey_id == completion.journey_id)
@@ -507,6 +532,9 @@ async def process_completion(session, completion, *, now: datetime | None = None
         .values(incident_id=incident.incident_id)
     )
     await session.commit()
+
+    if on_event is not None and is_new:
+        await on_event(_incident_new_event(incident))
     return incident
 
 
@@ -541,7 +569,7 @@ async def sweep_stale_incidents(session, now: datetime | None = None) -> list:
 # --- lifecycle: retry journeys whose completion outran their alerts (DB) --------
 
 
-async def retry_unclustered_completions(session, now: datetime | None = None) -> list:
+async def retry_unclustered_completions(session, now: datetime | None = None, on_event=None) -> list:
     """Re-attempt clustering for terminal journeys still missing an incident.
 
     ``process_completion`` runs exactly once, synchronously, the instant
@@ -587,7 +615,7 @@ async def retry_unclustered_completions(session, now: datetime | None = None) ->
             status=JourneyStatus(journey.status),
             outcome=journey.outcome,
         )
-        incident = await process_completion(session, completion, now=now)
+        incident = await process_completion(session, completion, now=now, on_event=on_event)
         if incident is not None:
             incidents.append(incident)
     return incidents

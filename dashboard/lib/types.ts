@@ -75,7 +75,8 @@ export interface Journey {
 export type WsEvent =
   | { type: "alert.new"; data: ProcessedAlert }
   | { type: "journey.updated"; data: Journey }
-  | { type: "journey.completed"; data: Journey };
+  | { type: "journey.completed"; data: Journey }
+  | { type: "incident.new"; data: Incident };
 
 export type BadgeStatus =
   | "error"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Card } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
@@ -42,6 +42,19 @@ export function IncidentCard({ incident, onResolve }: IncidentCardProps) {
     },
     [detail, loading, incident.incident_id]
   );
+
+  // The header count above is kept live by the parent's WS patch (incident.updated),
+  // but that patch only touches the `incident` prop, not this already-fetched
+  // per-order breakdown. Re-fetch it whenever the counts move so an incident
+  // absorbing another journey while expanded doesn't strand a stale order list.
+  useEffect(() => {
+    if (expanded && detail) {
+      fetchIncident(incident.incident_id)
+        .then(setDetail)
+        .catch((err) => console.error("Failed to refresh incident detail:", err));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incident.journey_count, incident.alert_count]);
 
   return (
     <div

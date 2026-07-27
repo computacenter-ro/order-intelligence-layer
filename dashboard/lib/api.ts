@@ -1,4 +1,10 @@
-import type { Journey, OverviewStats, ProcessedAlert } from "@/lib/types";
+import type {
+  ChatRequest,
+  ChatResponse,
+  Journey,
+  OverviewStats,
+  ProcessedAlert,
+} from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -132,4 +138,31 @@ export function fetchJourney(journeyId: string): Promise<Journey> {
 /** Aggregate counters for the Insights page (backend GET /stats/insights). */
 export function fetchStats(): Promise<OverviewStats> {
   return getJson<OverviewStats>("/stats/insights");
+}
+
+// --- chat --------------------------------------------------------------------
+
+/**
+ * POST a question to the backend's authenticated chat proxy.
+ *
+ * `getJson` is GET-only, so this mirrors its contract for a body-carrying call:
+ * same `credentials: "include"` (the httpOnly session cookie must ride along
+ * cross-origin :3000 -> :8000) and the same `UnauthorizedError` on 401, so the
+ * caller handles an expired session exactly as every other API call does.
+ *
+ * Non-streaming by design for now: one request, one answer. The backend already
+ * degrades internally (an LLM outage returns `mode: "retrieval-only"` rather
+ * than an error), so a rejected promise here means a transport/auth failure —
+ * not "the assistant had nothing to say".
+ */
+export async function sendChat(body: ChatRequest): Promise<ChatResponse> {
+  const res = await fetch(`${API_URL}/chat`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`/chat failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<ChatResponse>;
 }

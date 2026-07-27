@@ -8,24 +8,42 @@ import type { BaseNavItem, SideNavItem } from "@computacenter-ro/style-guide/com
 import {
   BellIcon,
   ChartBarIcon,
+  ChatCircleDotsIcon,
   ClockCounterClockwiseIcon,
   MapTrifoldIcon,
   SignOutIcon,
 } from "@phosphor-icons/react";
 import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
 import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-mark.png";
+import { ChatPanel } from "@/components/chat/ChatPanel";
 import { useAuth } from "@/lib/auth";
+import { ChatProvider, useChat } from "@/lib/chat";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
+
+// The assistant is a drawer, not a page, but SideNavItem requires an href. This
+// sentinel is intercepted in onItemClick and never routed to — so the item sits
+// with the others (icons are required on every side-nav item) without adding a
+// route that would 404.
+const ASSISTANT_HREF = "#assistant";
 
 interface AppShellProps {
   children: React.ReactNode;
 }
 
 export function AppShell({ children }: AppShellProps) {
+  return (
+    <ChatProvider>
+      <AppShellInner>{children}</AppShellInner>
+    </ChatProvider>
+  );
+}
+
+function AppShellInner({ children }: AppShellProps) {
   const router = useRouter();
   const pathname = usePathname();
   const { user, logout } = useAuth();
+  const { open: chatOpen, scope, scopeLabel, openChat, closeChat } = useChat();
   const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
@@ -63,9 +81,23 @@ export function AppShell({ children }: AppShellProps) {
       icon: <ChartBarIcon size={20} />,
       active: pathname === "/insights",
     },
+    {
+      label: "Assistant",
+      href: ASSISTANT_HREF,
+      icon: <ChatCircleDotsIcon size={20} />,
+      // Never "active": it is an overlay, not a location. Marking it active
+      // would break the one-active-item-at-a-time rule against the real page
+      // underneath it.
+      active: false,
+    },
   ];
 
   const handleItemClick = (item: BaseNavItem) => {
+    // The assistant opens the drawer over the current page instead of navigating.
+    if (item.href === ASSISTANT_HREF) {
+      openChat(null);
+      return;
+    }
     router.push(item.href);
   };
 
@@ -152,6 +184,19 @@ export function AppShell({ children }: AppShellProps) {
       >
         {children}
       </main>
+      {/* Mounted once at the shell so every entry point drives the same drawer.
+          The `key` makes a change of scope remount it, discarding the previous
+          conversation — carrying turns about a different record over would
+          mislead, since every request from this panel is scoped to `context`.
+          Doing it with a key rather than a reset-in-effect keeps the state
+          derivation declarative (and satisfies react-hooks/set-state-in-effect). */}
+      <ChatPanel
+        key={scope ? `${scope.kind}:${scope.id}` : "global"}
+        open={chatOpen}
+        onClose={closeChat}
+        context={scope}
+        contextLabel={scopeLabel}
+      />
     </div>
   );
 }

@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { ChatCircleDotsIcon } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { fetchAlerts, fetchJourney } from "@/lib/api";
+import { useChat } from "@/lib/chat";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { OutcomeBanner } from "@/components/journeys/OutcomeBanner";
 import { AiSummaryPanel } from "@/components/journeys/AiSummaryPanel";
@@ -14,6 +16,7 @@ import type { Journey, ProcessedAlert, WsEvent } from "@/lib/types";
 export default function JourneyDetailPage() {
   const params = useParams<{ journeyId: string }>();
   const router = useRouter();
+  const { openChat } = useChat();
   const [journey, setJourney] = useState<Journey | null>(null);
   const [journeyAlerts, setJourneyAlerts] = useState<ProcessedAlert[]>([]);
   const [loading, setLoading] = useState(true);
@@ -79,9 +82,33 @@ export default function JourneyDetailPage() {
           ← Back to Journeys
         </Button>
       </div>
-      <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: "0 0 16px" }}>
-        Journey {journey.order_id ?? journey.event_id}
-      </h1>
+      {/* H1 and the page's single primary action share a row. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "16px",
+          flexWrap: "wrap",
+          margin: "0 0 16px",
+        }}
+      >
+        <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: 0 }}>
+          Journey {journey.order_id ?? journey.event_id}
+        </h1>
+        <Button
+          variant="primary"
+          leftIcon={<ChatCircleDotsIcon size={20} />}
+          onClick={() =>
+            openChat(
+              { kind: "journey", id: journey.journey_id },
+              `journey ${journey.order_id ?? journey.event_id ?? journey.journey_id}`
+            )
+          }
+        >
+          Ask About This Journey
+        </Button>
+      </div>
       <OutcomeBanner journey={journey} />
       <AiSummaryPanel summary={journey.summary} />
       <h2 style={{ fontSize: "16px", fontWeight: 500, color: "var(--cc-grey-two)", margin: "0 0 8px" }}>

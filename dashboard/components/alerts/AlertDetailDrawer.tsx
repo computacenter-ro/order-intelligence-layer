@@ -1,9 +1,11 @@
 import { useEffect } from "react";
 import Link from "next/link";
-import { XIcon } from "@phosphor-icons/react";
+import { ChatCircleDotsIcon, XIcon } from "@phosphor-icons/react";
+import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
+import { useChat } from "@/lib/chat";
 import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
@@ -48,6 +50,7 @@ function KeyValueRow({ label, value }: { label: string; value: string }) {
 }
 
 export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
+  const { openChat } = useChat();
 
   useEffect(() => {
     if (!alert) return;
@@ -185,13 +188,29 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
         </pre>
 
         <SectionLabel>Related</SectionLabel>
-        <Link
-          href={alert.journey_id ? `/journeys?highlight=${alert.journey_id}` : "/journeys"}
-          onClick={onClose}
-          style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
-        >
-          → View Full Order Journey
-        </Link>
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px", alignItems: "flex-start" }}>
+          <Link
+            href={alert.journey_id ? `/journeys?highlight=${alert.journey_id}` : "/journeys"}
+            onClick={onClose}
+            style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
+          >
+            → View Full Order Journey
+          </Link>
+          {/* Secondary, not primary: this drawer has no primary action, and the
+              guidelines allow at most one per page. Closing first avoids two
+              stacked overlays fighting for Escape. */}
+          <Button
+            variant="secondary"
+            size="compact"
+            leftIcon={<ChatCircleDotsIcon size={20} />}
+            onClick={() => {
+              onClose();
+              openChat({ kind: "alert", id: alert.alert_id }, `alert ${alert.app_name}`);
+            }}
+          >
+            Ask About This
+          </Button>
+        </div>
       </aside>
     </>
   );

@@ -119,3 +119,57 @@ export interface OverviewStats {
   journeys: JourneyStats;
   alerts: AlertStats;
 }
+
+// --- chat (POST /chat) -------------------------------------------------------
+//
+// Mirrors backend/schemas.py ChatRequest/ChatResponse. The backend is an
+// authenticated proxy in front of the AI service, which does the retrieval and
+// (when its LLM is up) the grounded composition.
+
+/** Scope a question to one record — the "Ask about this" buttons. */
+export interface ChatContext {
+  kind: "alert" | "journey";
+  id: string;
+}
+
+export interface ChatRequest {
+  query: string;
+  k?: number;
+  filters?: Record<string, string> | null;
+  context?: ChatContext | null;
+}
+
+/** One cited incident record. `link` is null when DASHBOARD_URL is unset. */
+export interface ChatSource {
+  id: string;
+  kind: string;
+  score: number;
+  snippet: string;
+  link: string | null;
+}
+
+/**
+ * How much of the history the answer drew on — computed by the AI service, not
+ * written by the LLM. `truncated` means retrieval hit its limit, so other
+ * matching incidents likely exist beyond the ones cited.
+ */
+export interface ChatCoverage {
+  shown: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/**
+ * `mode` mirrors the alert feed's AI/fallback distinction: "ai" = the LLM
+ * composed the answer from the sources; "retrieval-only" = the LLM was
+ * unavailable and the answer is a deterministic template over the same sources.
+ * Sources are identical either way.
+ */
+export type ChatMode = "ai" | "retrieval-only";
+
+export interface ChatResponse {
+  answer: string;
+  sources: ChatSource[];
+  mode: ChatMode;
+  coverage: ChatCoverage;
+}

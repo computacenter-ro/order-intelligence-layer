@@ -474,6 +474,26 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
   enums — an out-of-range value is an `LLMError` → fallback, never coerced.
   Severity is per-log *technical* urgency judged from the log alone (not
   business impact, not journey-level).
+
+  **Department semantics (`_DEPARTMENT_GUIDE` + `_ROUTE_EXAMPLES` in `nodes.py`).**
+  The prompt's ALLOWED list is generated from the `Department` enum, but the
+  definitions and few-shot examples are hand-written — **adding a department
+  updates the list automatically and silently leaves it undefined**. A test
+  (`test_route_prompt_defines_every_department`) fails if the two drift.
+
+  The load-bearing distinction is **`backend` vs `general`**:
+  - `backend` = an application/integration **defect** — the service behaved wrongly.
+  - `general` = **not an engineering fault**: the pipeline worked as designed and
+    correctly *rejected* an order (margin below threshold, missing `costCenter`
+    UDF, disabled JAM account, unmapped product). Nobody changes code. This holds
+    even though the log is `ERROR`, came from a service, and says FAILED/aborted.
+
+  Roughly half the alertable corpus is this business-rule class. Without the
+  distinction the model routes on surface association (log came from a service →
+  services are code → `backend`) and dumps them all on the backend team as phantom
+  work — the misroute this guide exists to prevent. Note `general` is also where
+  `source="fallback"` alerts land, so `#general-logs` mixes business rejections
+  with unprocessed pass-throughs (distinguishable by the `AI`/`fallback` badge).
 - **Fallback is a pass-through, NOT rule-based**: when the LLM is down, the
   log is sent down the pipe unexplained and unrouted (`source: "fallback"`).
   The backend routes those to the **general** Teams channel. There is no

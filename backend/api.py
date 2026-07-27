@@ -36,9 +36,17 @@ from sqlalchemy import Select, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user
-from backend.db import Alert, Journey, JourneyEvent, get_session
+from backend.db import Alert, Incident, Journey, JourneyEvent, get_session
 from backend.pagination import apply_keyset, build_page
-from backend.schemas import AlertOut, JourneyDetailOut, JourneyEventOut, JourneyOut, Page
+from backend.schemas import (
+    AlertOut,
+    IncidentDetailOut,
+    IncidentOut,
+    JourneyDetailOut,
+    JourneyEventOut,
+    JourneyOut,
+    Page,
+)
 from shared.models import Department
 
 
@@ -86,6 +94,14 @@ def build_journeys_query(status: str | None) -> Select:
     stmt = select(Journey)
     if status is not None:
         stmt = stmt.where(Journey.status == status)
+    return stmt
+
+
+def build_incidents_query(status: str | None) -> Select:
+    """Select incidents, optionally filtered by ``status`` ('open'/'resolved')."""
+    stmt = select(Incident)
+    if status is not None:
+        stmt = stmt.where(Incident.status == status)
     return stmt
 
 
@@ -239,3 +255,73 @@ async def get_journey(
         **JourneyOut.model_validate(journey).model_dump(),
         events=[JourneyEventOut.model_validate(e) for e in events],
     )
+
+
+@router.get("/incidents", response_model=Page[IncidentOut])
+async def list_incidents(
+    status: Annotated[Literal["open", "resolved"] | None, Query()] = None,
+    limit: Annotated[int, Query()] = 16,
+    cursor: Annotated[str | None, Query()] = None,
+    session: AsyncSession = Depends(get_session),
+) -> Page[IncidentOut]:
+    limit = max(1, min(limit, 100))
+    stmt = apply_keyset(
+        build_incidents_query(status),
+        Incident.last_ts,
+        Incident.incident_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    items, next_cursor = build_page(
+        rows, limit, lambda i: i.last_ts, lambda i: i.incident_id
+    )
+    return Page[IncidentOut](
+        items=[IncidentOut.model_validate(i) for i in items],
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/incidents/{incident_id}", response_model=IncidentDetailOut)
+async def get_incident(
+    incident_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> IncidentDetailOut:
+    result = await session.execute(
+        select(Incident).where(Incident.incident_id == incident_id)
+    )
+    incident = result.scalar_one_or_none()
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"incident {incident_id!r} not found")
+
+    alerts_result = await session.execute(
+        select(Alert).where(Alert.incident_id == incident_id).order_by(Alert.emitted_at.asc())
+    )
+    alerts = alerts_result.scalars().all()
+
+    return IncidentDetailOut(
+        **IncidentOut.model_validate(incident).model_dump(),
+        alerts=[AlertOut.model_validate(a) for a in alerts],
+    )
+
+
+@router.patch("/incidents/{incident_id}/resolve", response_model=IncidentOut)
+async def resolve_incident(
+    incident_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Incident:
+    """Manual close — the PRIMARY lifecycle mechanism (source spec §4 step 7);
+    the quiet-timeout sweep in backend/incidents.py is only the fallback."""
+    stmt = (
+        update(Incident)
+        .where(Incident.incident_id == incident_id)
+        .values(status="resolved")
+        .returning(Incident)
+    )
+    result = await session.execute(stmt)
+    incident = result.scalar_one_or_none()
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"incident {incident_id!r} not found")
+    await session.commit()
+    return incident

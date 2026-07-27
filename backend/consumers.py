@@ -40,6 +40,7 @@ import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractIncomingMessage
 
 from shared.models import LogLine, ProcessedAlert
+from backend.incidents import process_completion, sweep_stale_incidents
 from backend.journeys import JourneyAssembler, OnEvent
 
 # --- Config (env-driven, matching ai_service/settings.py conventions) --------
@@ -270,7 +271,12 @@ class RawEventsConsumer(_QueueConsumer):
         # journeys, and commits — so raw-event consumption is idempotent too. It
         # also emits journey.updated / journey.completed via on_event (if set).
         async with self._factory()() as session:
-            await self._assembler.ingest(session, [log], on_event=self._on_event)
+            completions = await self._assembler.ingest(session, [log], on_event=self._on_event)
+            for completion in completions:
+                try:
+                    await process_completion(session, completion)
+                except Exception as exc:  # noqa: BLE001 — a clustering blip must not drop this log/journey completion
+                    print(f"[incident-clustering] ERROR (continuing): {exc}", flush=True)
 
 
 # --- run both ----------------------------------------------------------------
@@ -286,7 +292,9 @@ async def _sweep_stalled_loop(
     fills that gap: every ``STALLED_SWEEP_INTERVAL`` seconds it opens a session
     and runs ``assembler.sweep_stalled`` on the **same** assembler instance the
     raw consumer uses, so the in-memory journeys are visible. Finalized journeys
-    are broadcast as ``journey.completed`` via ``on_event`` (if set).
+    are broadcast as ``journey.completed`` via ``on_event`` (if set), and handed
+    to ``backend.incidents.process_completion`` (a TIMED_OUT journey with a real
+    linked ERROR alert is incident-eligible via the novel path).
     """
     import asyncio
 
@@ -297,12 +305,36 @@ async def _sweep_stalled_loop(
             await asyncio.sleep(STALLED_SWEEP_INTERVAL)
             try:
                 async with SessionLocal() as session:
-                    await assembler.sweep_stalled(session, on_event=on_event)
+                    completions = await assembler.sweep_stalled(session, on_event=on_event)
+                    for completion in completions:
+                        await process_completion(session, completion)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[stalled-sweep] ERROR (continuing): {exc}", flush=True)
     except asyncio.CancelledError:
         # Clean shutdown: stop looping, let the cancellation propagate.
         print("[stalled-sweep] cancelled — stopping", flush=True)
+        raise
+
+
+async def _sweep_incidents_loop() -> None:
+    """Periodically close incidents that have gone quiet past
+    INCIDENT_QUIET_TIMEOUT (the safety-net closing mechanism — manual dashboard
+    resolve is the primary one, added in Plan 2's API work). Runs on the same
+    cadence as the stalled-journey sweep."""
+    import asyncio
+
+    from backend.db import SessionLocal
+
+    try:
+        while True:
+            await asyncio.sleep(STALLED_SWEEP_INTERVAL)
+            try:
+                async with SessionLocal() as session:
+                    await sweep_stale_incidents(session)
+            except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
+                print(f"[incident-sweep] ERROR (continuing): {exc}", flush=True)
+    except asyncio.CancelledError:
+        print("[incident-sweep] cancelled — stopping", flush=True)
         raise
 
 
@@ -345,6 +377,7 @@ async def run_consumers(
             alerts.run(),
             raw.run(),
             _sweep_stalled_loop(assembler, on_event=on_event),
+            _sweep_incidents_loop(),
         )
 
 

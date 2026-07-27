@@ -1,0 +1,177 @@
+# GitHub issues — incident clustering
+
+Five issues, grouped by area. Copy each block into a new GitHub issue. Task
+numbers reference `2026-07-26-incident-clustering-engine-plan.md`.
+
+Dependency order: **#1 → #2 → #3**, then **#5 → #4** (both need #2).
+
+---
+
+## Issue 1 — ai_service: attach a per-alert embedding to every ProcessedAlert
+
+**Labels:** `area:ai-service` · `type:feature` · `plan:1`
+
+**Context**
+The incident-clustering engine needs a per-alert semantic vector to group
+*unrecognized* failures (the novel path). Recognized failures don't use it, but
+every alert must carry one so clustering keeps working even when the LLM breaker
+is open. Reuse the sentence-transformers encoder already loaded by
+`ai_service/semcache.py` — no second model.
+
+**Scope** (plan Tasks 1–3)
+- Add `embedding: list[float] | None` to `ProcessedAlert` (`shared/models.py`).
+- Add `SemanticCache.embed(message) -> list[float] | None` reusing the loaded
+  encoder + `normalize()` (`ai_service/semcache.py`). Note: this is a real
+  `encode()` call per alert — the cache's fast exact-match path does **not**
+  already produce a vector.
+- Attach the embedding to every emitted `ProcessedAlert` on **all** paths —
+  cache-hit, AI, and fallback (`ai_service/graph.py`), off the fetch path.
+
+**Acceptance criteria**
+- [ ] `ProcessedAlert` round-trips `embedding` over the `processed.alerts` queue.
+- [ ] Every non-suppressed WARN/ERROR alert carries an embedding, including
+      `source="fallback"` (LLM down).
+- [ ] Embedding is computed from the **normalized** message (masked ids/numbers),
+      same `normalize()` the cache uses.
+- [ ] No second model instance is loaded; unit tests for `embed()` and
+      attachment (`tests/test_models.py`, `tests/test_semcache.py`).
+
+**Out of scope:** anything in the backend; storage of the vector.
+
+---
+
+## Issue 2 — backend: incident clustering engine + schema + consumer wiring
+
+**Labels:** `area:backend` · `type:feature` · `plan:1`
+
+**Context**
+The core engine. On each journey completion, cluster the failure into an
+incident: collapse one order's alerts into one episode, and — for
+infrastructure-class failures only — group the same failure across orders into
+one systemic incident. Deterministic and LLM-free; embeddings only for the
+novel path.
+
+**Scope** (plan Tasks 4–12)
+- Migration: `incidents` table; `embedding` (plain JSON/array) + `incident_id`
+  on `alerts`; `incident_id` on `journeys`.
+- Pure logic: `pick_causal_line` (first ERROR, else first WARN — supplies
+  logger/token/embedding, **not** subtype); `build_signature(failure_subtype,
+  logger, app_name, message)` where **subtype comes from the journey outcome**
+  (`completion.outcome` when `FAILED`, else `None`) and `failing_service` from
+  the logger; `classify_infra_or_order_specific(failure_subtype, message)` —
+  **subtype-based** (map), message-shape only as the novel fallback; cosine +
+  `diverges()` veto.
+- DB orchestration: `assign_incident` (recognized→exact signature; novel→cosine
+  match on same `failing_service`; order-specific→never search, own incident);
+  `process_completion`; `sweep_stale_incidents`.
+- Wire into `backend/consumers.py`: call `process_completion` on every journey
+  completion (raw-events path **and** stalled sweep); add the incident
+  quiet-timeout sweep loop.
+
+**Acceptance criteria**
+- [ ] Each of the 10 v3 scenarios clusters to the correct
+      `(failure_subtype, failing_service)`; the generic `OrderProcessingService`
+      abort is never the causal line.
+- [ ] `AUTH_FAILED` classifies as **order-specific** (not infra) despite its
+      `JamClient` logger.
+- [ ] Same infra failure across 3 orders → one incident, `journey_count=3`;
+      order-specific failures never merge across orders.
+- [ ] A `TIMED_OUT` journey with a real ERROR clusters via the novel path; with
+      no ERROR, forms no incident.
+- [ ] Idempotent on redelivery / re-completion; incidents close only on manual
+      resolve or `INCIDENT_QUIET_TIMEOUT`; a later match opens a fresh incident.
+
+**Out of scope:** REST API (#3), WS events, Teams, dashboard. Multiplicity
+escalation of order-specific failures (deferred — source spec §12).
+
+**Depends on:** #1 (novel path needs the embedding; recognized paths work
+without it).
+
+---
+
+## Issue 3 — backend: incidents REST API (list / detail / resolve)
+
+**Labels:** `area:backend` · `area:api` · `type:feature` · `plan:1`
+
+**Context**
+Read access to incidents and the **manual resolve** action that is the primary
+way an incident closes.
+
+**Scope** (plan Tasks 13–14)
+- `IncidentOut` schema (`backend/schemas.py`).
+- `GET /incidents` (filter by status), `GET /incidents/{id}` (incident + its
+  journeys + their alerts — the layered shape), `PATCH /incidents/{id}/resolve`.
+
+**Acceptance criteria**
+- [ ] `GET /incidents?status=open` returns open incidents with
+      `journey_count`/`alert_count`/`title`/`failing_service`.
+- [ ] `GET /incidents/{id}` returns the layered incident → orders → alerts view.
+- [ ] `PATCH .../resolve` sets status to `resolved`; a later matching failure
+      opens a new incident rather than reopening.
+- [ ] Endpoint tests in `tests/test_api.py`.
+
+**Depends on:** #2.
+
+---
+
+## Issue 4 — notifications: one Teams card per incident, updated in place
+
+**Labels:** `area:notifications` · `type:feature` · `plan:2`
+
+**Context**
+Cut Teams noise: instead of one card per alert, post a single Adaptive Card per
+incident and update it as the incident grows.
+
+**Scope**
+- Consume `incident.new` / `incident.updated` / `incident.resolved` from the
+  existing `{type,data}` fan-out; extend `channel_for(event)` to route incident
+  events (incident `department`, else `general`).
+- Post one Adaptive Card per incident and **patch it in place** as
+  `journey_count`/status change. Requires the **Power Automate / Graph** path
+  (Incoming Webhooks can only post new messages) — store the Teams message id.
+- **Suppress the per-alert cards for collapsed members** — only the incident
+  card posts (otherwise Teams noise isn't actually reduced).
+- Keep the fail-isolated-sink behaviour (a failing Teams post never breaks
+  consumers or the WS hub).
+
+**Acceptance criteria**
+- [ ] An outage across N orders produces exactly one Teams card, updated to show
+      the current blast radius, not N cards.
+- [ ] Collapsed member alerts do not post their own cards.
+- [ ] Card routes to the incident's department, else `general`.
+- [ ] If the update-capable transport is unconfigured, fall back to posting a
+      fresh card on significant change (and/or print to stdout), never crash.
+
+**Depends on:** #2, and the incident event emission in #5.
+
+---
+
+## Issue 5 — dashboard: layered incident view + WebSocket incident events
+
+**Labels:** `area:frontend` · `area:backend` · `type:feature` · `plan:2`
+
+**Context**
+Show incidents in the dashboard as a live, layered view, and emit the events
+that feed both it and Teams.
+
+**Scope**
+- Backend: emit `incident.new` / `incident.updated` / `incident.resolved` onto
+  the existing WS + Teams fan-out (this is the shared prerequisite Teams depends
+  on).
+- Frontend: an incident feed and a **layered view** — incident → affected orders
+  → each order's alerts (primary highlighted, retries collapsed). Live updates
+  via the new WS events; handle progressive fill-in (journeys/alerts may arrive
+  after the incident appears). Single-order (order-specific) incidents render as
+  just the episode, not a scary outage card.
+- A resolve action wired to `PATCH /incidents/{id}/resolve`.
+
+**Acceptance criteria**
+- [ ] Backend emits the three incident events; existing WS + Teams fan-out
+      delivers them.
+- [ ] Dashboard shows open incidents with blast radius and updates live as more
+      orders join.
+- [ ] Expanding an incident shows its orders; expanding an order shows its
+      alerts with the primary ERROR as the headline.
+- [ ] Resolve from the UI closes the incident.
+
+**Depends on:** #2 (and #3 for the resolve endpoint).

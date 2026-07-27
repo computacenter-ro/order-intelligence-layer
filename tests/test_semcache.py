@@ -14,6 +14,7 @@ Design points asserted here (CLAUDE.md [3] "semantic cache"):
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -79,6 +80,7 @@ def _log(
     order_id: str | None = "ORD-6001",
     cart: str | None = "1840927365018240001",
     event_id: str | None = None,
+    account: str | None = "81036533",
     log_id: str = "log-1",
 ) -> LogLine:
     return LogLine(
@@ -93,6 +95,7 @@ def _log(
         eventId=event_id,
         orderId=order_id,
         cartHeaderId=cart,
+        accountNumber=account,
         message=message,
     )
 
@@ -204,6 +207,65 @@ def test_refill_mines_ids_from_message_text():
     assert "ORD-6001" in out and "1840927365018240001" in out
 
 
+def test_normalize_masks_account_but_not_product_id():
+    # Accounts are exactly 8 digits; product ids are 7 and are meaning-bearing
+    # (the SKU-mapping alert is *about* that id). Masking product ids would both
+    # merge distinct alerts and make refill() substitute an accountNumber there.
+    n = semcache.normalize("No internal SKU mapping found for product 9999999")
+    assert "9999999" in n
+    assert "<ACC>" not in n
+    assert semcache.normalize("Retrying SPT price list call for account 81036533") == (
+        "Retrying SPT price list call for account <ACC>"
+    )
+
+
+def test_two_different_unmappable_products_do_not_collapse():
+    # Consequence of the above: distinct product ids must stay distinct keys.
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    cache.store("No internal SKU mapping found for product 9999999", _payload())
+    assert cache.lookup("No internal SKU mapping found for product 4788230") is None
+
+
+def test_refill_substitutes_account_number():
+    # Regression: <ACC> was masked by normalize() but never re-filled, so the
+    # placeholder leaked verbatim into the agent-facing explanation
+    # ("...retrying an SPT price list API call for account <ACC>").
+    normalized = "Retrying the SPT price list call for account <ACC>"
+    log = _log(message="Retrying price list for account 81036533", account="81036533")
+    out = semcache.refill(normalized, log)
+    assert "81036533" in out
+    assert "<ACC>" not in out
+
+
+def test_refill_leaves_no_mask_token_in_output():
+    # No mask token normalize() can emit may survive refill, for ANY log —
+    # a leaked "<ORD>"/"<ACC>" is visible internals in the dashboard/Teams card.
+    normalized = "Event <EVT> order <ORD> cart <CART> account <ACC> failed"
+    bare = _log(message="something with no ids at all",
+                order_id=None, cart=None, event_id=None, account=None)
+    out = semcache.refill(normalized, bare)
+    for token in ("<EVT>", "<ORD>", "<CART>", "<ACC>"):
+        assert token not in out
+    # ...and it degrades to readable prose rather than dropping the reference.
+    assert "the account" in out and "the order" in out
+
+
+def test_refill_never_mines_a_cart_header_as_the_account():
+    # The <ACC> pattern is \d{6,}, which also matches a 19-digit cart header.
+    # Mining must apply normalize()'s precedence so a cart id is never printed
+    # where the explanation says "account".
+    normalized = "Order <ORD> (cart <CART>) for account <ACC>"
+    log = _log(
+        message="Generated order number ORD-6001 for cart header 1840927365018240001",
+        order_id=None,
+        cart=None,
+        account=None,
+    )
+    out = semcache.refill(normalized, log)
+    assert "1840927365018240001" in out          # re-filled as the CART
+    assert "for account the account" in out      # account unknown → prose, not the cart id
+
+
 # =============================================================================
 # SemanticCache — exact / cosine / threshold
 # =============================================================================
@@ -275,6 +337,37 @@ def test_load_tolerates_garbage():
     cache.load("not json")          # no raise
     cache.load(None)                # no raise
     assert len(cache) == 0
+
+
+# =============================================================================
+# embed() — incident-clustering support (independent of lookup/store)
+# =============================================================================
+def test_embed_returns_vector_for_a_message():
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    vector = cache.embed("Timeout calling SPT for order ORD-6001")
+    assert vector is not None
+    assert len(vector) == FakeEncoder._DIMS
+
+
+def test_embed_returns_none_when_cache_disabled():
+    cache = SemanticCache(None, threshold=0.95, max_entries=10)
+    assert cache.embed("anything") is None
+
+
+def test_embed_normalizes_so_different_orders_collide():
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    v1 = cache.embed("Timeout calling SPT for order ORD-6001, account 81036533")
+    v2 = cache.embed("Timeout calling SPT for order ORD-9999, account 12345678")
+    assert v1 == v2  # same normalized text -> identical vector with FakeEncoder
+
+
+def test_embed_does_not_affect_lookup_or_store():
+    """embed() must be side-effect-free w.r.t. the cache's own lookup/store
+    state — it's a parallel capability, not a hook into the cache lifecycle."""
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    cache.embed("SPT price list unavailable")
+    assert len(cache) == 0  # embed() must not have stored anything
+    assert cache.lookup("SPT price list unavailable") is None  # still a miss
 
 
 # =============================================================================
@@ -385,6 +478,65 @@ async def test_fallback_result_is_not_cached(install_cache):
 
 def get_deps_from(mod):
     return mod.get()
+
+
+# =============================================================================
+# embedding attachment — every ProcessedAlert path (cache-hit, AI, fallback)
+# =============================================================================
+async def test_cache_hit_alert_carries_embedding(install_cache):
+    install_cache()
+    explainer = CountingModel("SPT pricing for order ORD-6001 was unreachable.")
+    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    await process(_log(message="SPT price list unavailable", order_id="ORD-6001", log_id="L1"), deps)
+    hit = await process(
+        _log(message="SPT price list unavailable", order_id="ORD-8888", log_id="L2"), deps
+    )
+    assert hit.cached is True
+    assert hit.embedding is not None
+    assert len(hit.embedding) == FakeEncoder._DIMS
+
+
+async def test_ai_alert_carries_embedding(install_cache):
+    install_cache()
+    explainer = CountingModel("expl")
+    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
+    assert alert.source == "ai"
+    assert alert.embedding is not None
+    assert len(alert.embedding) == FakeEncoder._DIMS
+
+
+async def test_fallback_alert_carries_embedding(install_cache):
+    """Embedding attachment must not depend on the LLM/breaker being up — it's
+    entirely local, so a fallback (LLM-down) alert still gets one."""
+    install_cache()
+    deps = PipelineDeps(breaker=_breaker(FakeRedis(), FakeClock()), explainer=None, router=None)
+
+    alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
+    assert alert.source == "fallback"
+    assert alert.embedding is not None
+
+
+async def test_no_encoder_configured_yields_none_embedding(install_cache):
+    """When the cache is disabled (no encoder), embedding degrades to None
+    rather than raising — same graceful-degradation contract as the cache
+    itself."""
+    redis, _cache = install_cache()
+    # Reconfigure with encoder=None to simulate sentence-transformers missing.
+    disabled_cache = SemanticCache(None, threshold=0.95, max_entries=500)
+    semcache.configure(
+        SemCacheDeps(cache=disabled_cache, redis=redis, dump_key="k", hits_key="h", misses_key="m")
+    )
+    explainer = CountingModel("expl")
+    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
+    assert alert.embedding is None
 
 
 # =============================================================================
@@ -516,3 +668,169 @@ async def test_guard_forces_llm_on_meaning_flip(install_cache):
     # The flipped outcome must NOT be served from cache → LLM runs again.
     await process(_log(message="SAP submission failed for order ORD-1", log_id="L2"), deps)
     assert explainer.calls == 2
+
+
+# =============================================================================
+# Single flight — concurrent identical logs must not each call the LLM
+#
+# The cache is populated only AFTER both LLM calls return, so without in-flight
+# coalescing every log in a concurrent burst of one type misses and duplicates
+# the work. The poller runs alerts concurrently (ALERT_CONCURRENCY) and failure
+# bursts emit byte-identical lines, so this is the common case, not a corner.
+# =============================================================================
+class SlowCountingModel(CountingModel):
+    """A CountingModel that yields control, so concurrent calls really overlap.
+
+    Without a suspension point the first task would run to completion before the
+    others start, and the race these tests target could never occur.
+    """
+
+    async def ainvoke(self, messages):
+        await asyncio.sleep(0.01)
+        return await super().ainvoke(messages)
+
+
+async def test_concurrent_identical_logs_call_llm_once(install_cache):
+    install_cache()
+    explainer = SlowCountingModel("SPT pricing for order ORD-6001 failed")
+    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    logs = [
+        _log(message="SPT price list unavailable", order_id=f"ORD-700{i}", log_id=f"L{i}")
+        for i in range(4)
+    ]
+    alerts = await asyncio.gather(*(process(l, deps) for l in logs))
+
+    # ONE leader ran the pipeline; the other three coalesced onto its answer.
+    assert explainer.calls == 1, f"expected 1 explainer call, got {explainer.calls}"
+    assert router.calls == 1
+    assert sum(1 for a in alerts if a.cached) == 3
+    assert sum(1 for a in alerts if not a.cached) == 1
+    # Every alert is still a complete AI answer.
+    assert all(a.source == "ai" and a.department is Department.backend for a in alerts)
+
+
+async def test_follower_refills_its_own_ids_not_the_leaders(install_cache):
+    """A follower reuses the leader's NORMALIZED payload, so it must show its own
+    ids — never the id of whichever log happened to win the race."""
+    install_cache()
+    # The leader's explanation names ORD-6001 explicitly.
+    explainer = SlowCountingModel("Pricing for order ORD-6001 failed")
+    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    logs = [
+        _log(message="SPT price list unavailable", order_id=f"ORD-900{i}", log_id=f"L{i}")
+        for i in range(3)
+    ]
+    alerts = await asyncio.gather(*(process(l, deps) for l in logs))
+
+    # The leader keeps the LLM's verbatim text (nothing is being reused there);
+    # re-fill applies only to the FOLLOWERS, which reuse the stored payload.
+    followers = [(i, a) for i, a in enumerate(alerts) if a.cached]
+    assert len(followers) == 2
+    for i, alert in followers:
+        assert f"ORD-900{i}" in alert.explanation, alert.explanation
+        # Never the leader's id, nor a sibling's.
+        assert "ORD-6001" not in alert.explanation
+        for j in range(3):
+            if j != i:
+                assert f"ORD-900{j}" not in alert.explanation
+
+
+async def test_followers_do_not_inherit_a_failed_leader(install_cache):
+    """If the leader produces nothing reusable (LLM down), followers must run the
+    pipeline themselves — the cache still fails toward a miss, never a bad hit."""
+    _, cache = install_cache()
+
+    class FailingModel(SlowCountingModel):
+        async def ainvoke(self, messages):
+            await asyncio.sleep(0.01)
+            self.calls += 1
+            raise RuntimeError("LLM down")
+
+    explainer = FailingModel("unused")
+    router = FailingModel("unused")
+    deps = _healthy_deps(explainer, router)
+
+    logs = [_log(message="SPT price list unavailable", log_id=f"L{i}") for i in range(3)]
+    alerts = await asyncio.gather(*(process(l, deps) for l in logs))
+
+    # Clean fallbacks for everyone; no follower inherited a bogus "ai" answer.
+    assert all(a.source == "fallback" for a in alerts)
+    assert all(a.explanation is None and a.department is None for a in alerts)
+    assert all(a.cached is False for a in alerts)
+    assert len(cache) == 0  # fallbacks are never cached
+
+
+async def test_fallback_leader_never_hands_followers_a_lookalike(install_cache):
+    """A leader that stored nothing must resolve its followers with None — NOT a
+    cosine neighbour. Regression: resolving via the fuzzy lookup() could serve an
+    unrelated cached answer as cached=True/source="ai" (a false hit)."""
+    _, cache = install_cache()
+
+    class FailingModel(SlowCountingModel):
+        async def ainvoke(self, messages):
+            await asyncio.sleep(0.01)
+            self.calls += 1
+            raise RuntimeError("LLM down")
+
+    deps = _healthy_deps(FailingModel("x"), FailingModel("x"))
+    logs = [_log(message="Brand new failure type beta", log_id=f"L{i}") for i in range(3)]
+    alerts = await asyncio.gather(*(process(l, deps) for l in logs))
+
+    # The leader stored nothing (fallbacks are never cached), so every follower
+    # must have been resolved with None and run the pipeline itself.
+    for a in alerts:
+        assert a.source == "fallback"
+        assert a.explanation is None
+        assert a.cached is False
+    assert len(cache) == 0
+
+
+def test_peek_exact_skips_the_cosine_path():
+    cache = SemanticCache(ConstantEncoder(), threshold=0.95, max_entries=10)
+    cache.store("Totally unrelated error alpha", _payload())
+    # lookup() would fall through to cosine (ConstantEncoder ⇒ similarity 1.0);
+    # peek_exact must return None for a key that was never stored.
+    assert cache.peek_exact("Brand new failure type beta") is None
+    assert cache.peek_exact("Totally unrelated error alpha") is not None
+
+
+async def test_inflight_registry_is_empty_after_work_settles(install_cache):
+    """The in-flight map must not leak keys — including when the leader raises."""
+    install_cache()
+    explainer = SlowCountingModel("Pricing for order ORD-6001 failed")
+    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    await asyncio.gather(
+        *(process(_log(message="SPT price list unavailable", log_id=f"L{i}"), deps)
+          for i in range(4))
+    )
+    # Distinct types concurrently, too (each gets its own key).
+    await asyncio.gather(
+        *(process(_log(message=f"Distinct failure number {i}", log_id=f"M{i}"), deps)
+          for i in range(3))
+    )
+    assert len(semcache.get().inflight) == 0
+
+
+async def test_concurrent_distinct_types_each_call_the_llm(install_cache):
+    """Coalescing must key on the normalized message — different types must NOT
+    be merged just because they raced."""
+    install_cache()
+    explainer = SlowCountingModel("some explanation")
+    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    logs = [
+        _log(message="SPT price list unavailable", log_id="A"),
+        _log(message="Order blocked by margin check", log_id="B"),
+        _log(message="SAP submission aborted", log_id="C"),
+    ]
+    alerts = await asyncio.gather(*(process(l, deps) for l in logs))
+
+    assert explainer.calls == 3          # no false coalescing
+    assert all(not a.cached for a in alerts)

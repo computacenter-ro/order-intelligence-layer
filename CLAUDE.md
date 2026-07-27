@@ -46,6 +46,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 ├── docker-compose.yml            # rabbitmq (5672/15672), redis (6379), postgres (5432)
 ├── alembic.ini                   # DB migrations config (backend/migrations)
 ├── requirements.txt
+├── requirements-ml.txt           # optional: semantic-cache deps (sentence-transformers + CPU torch)
 ├── shared/                       # cross-cutting: used by pipeline/, ai_service/, and backend/
 │   ├── models.py                 # Pydantic: LogLine, Baton, ProcessedAlert
 │   ├── log_client.py             # POST log lines to the collector (all services use this)
@@ -66,6 +67,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   └── data/                     # reference fixtures (mock-order-flows-v2.json / -v3.json)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
+│   ├── semcache.py               # semantic cache (normalize + embed + LRU) — skips LLM on repeat log types
 ├── backend/                      # [5] :8000
 │   ├── main.py  consumers.py  journeys.py  stitching.py  linking.py  teams.py  ws.py  db.py
 │   ├── auth.py  summarizer.py    # session auth; LLM journey-summary client
@@ -310,10 +312,19 @@ tells the next service "your turn to emit", carrying the flow context.
 | 10 | `SAP_SUBMISSION_FAILED` | sap | both |
 
 ### Injector (`pipeline/injector/inject.py`)
-Creates fresh ids (`eventId` = new UUID, `orderId` = `ORD-<seq>`,
-`cartHeaderId` = unique 19-digit), compiles the scenario's step chain into a
-baton, publishes it to `sim.step.inbound`.
+Mints **only** `eventId` (= `evt-<uuid>`) — per the correlation model the order
+ids do not exist yet — compiles the scenario's step chain into a baton, and
+publishes it to `sim.step.inbound`.
 `--scenario N` | `--all` (10 staggered) | `--mode continuous --interval S`.
+
+`orderId` / `cartHeaderId` are born later, in `order_engine._mint_ids`, and
+**must be unique** (`ORD-<seq>` from a counter; `cartHeaderId` = 13-digit prefix
++ 6-digit counter = **exactly 19 digits**). Uniqueness is load-bearing for
+correlation, not cosmetic: two flows sharing an `orderId` get merged into one
+journey, and the loser — starved of further logs — is swept as `TIMED_OUT`. Use a
+counter, never `random.randint` over a small range (the original 999-value
+random orderId collided within a few dozen flows). The 19-digit width is fixed by
+`backend/stitching.py`'s `\b\d{19}\b` mining pattern, anchored at both ends.
 
 ---
 
@@ -373,9 +384,88 @@ await gather(process(l) for l in alertable)                # LLM off the fetch p
 > (journeys then `TIMED_OUT`). Do not reintroduce a `now`-anchored window or
 > inline LLM calls on the fetch path.
 
+### Semantic cache (`semcache.py`) — runs BEFORE the pipeline
+The alert corpus is highly repetitive: the same handful of WARN/ERROR *types*
+recur constantly, differing only by volatile ids. So before the explainer+router
+runs, `process()` consults a local semantic cache; a hit reuses the cached
+AI answer and **skips BOTH LLM calls**. Warm hit rate on the canonical scenarios
+is ~90%+ (measured).
+
+- **Normalization is the key trick.** The cache key is the message with volatile
+  ids masked (reusing the stitcher's id shapes): `ORD-\d+`→`<ORD>`,
+  `evt-…`→`<EVT>`, 19-digit→`<CART>`, **exactly-8-digit** account→`<ACC>`. So two
+  same-type logs differing only by ids collapse to one key. Semantically
+  meaningful tokens (retry counters `2/3`, percentages, thresholds, **7-digit
+  product ids**) are **deliberately NOT masked** — masking them would merge
+  alerts that must stay distinct. The account pattern is `\d{8}`, not `\d{6,}`,
+  precisely so it cannot swallow a product id: `"No internal SKU mapping found
+  for product 9999999"` is *about* that id, and masking it both merged distinct
+  SKU-mapping alerts and made re-fill substitute the log's `accountNumber` where
+  a product id belonged. (Accounts are 8 digits and product ids 7 in
+  `shared/scenarios.py` — if that ever changes, this pattern changes with it.)
+- **Lookup order.** normalize → exact-match on normalized text (fast path, the
+  overwhelming majority of hits) → else cosine over local `all-MiniLM-L6-v2`
+  embeddings (CPU, loaded once at startup, injected like `api.py`'s deps) vs
+  stored vectors, taking the best only if similarity `>= SEMCACHE_THRESHOLD`
+  (default 0.95). Otherwise a miss.
+- **Divergence guard (cosine path only).** Cosine is blind to a *small but
+  meaning-flipping* difference — `"submission succeeded"` vs `"…failed"` score
+  ~0.95 on MiniLM yet must NOT share an answer. So a cosine candidate is accepted
+  only if the two normalized messages also agree on their **salient tokens**
+  (anything with a digit, plus configured outcome/polarity/negation words:
+  failed/succeeded/passed/aborted/blocked/timeout/not/… — extend via
+  `SEMCACHE_SALIENT_EXTRA`). Any salient disagreement vetoes the hit → miss. The
+  exact-match path never needs the guard. **The cache always fails toward a miss:
+  a false miss costs one LLM call; a false hit would serve a wrong AI-labelled
+  answer. Every uncertain path (guard veto, encoder load failure, corrupt
+  payload) degrades to a miss.**
+- **Id re-fill on hit.** The explanation is stored NORMALIZED (ids masked); on a
+  hit the CURRENT log's ids are substituted back in, so the reused explanation
+  shows the right order id, never the cached one. **Every mask token
+  `normalize()` can emit must be re-fillable** — `<EVT>`/`<ORD>`/`<CART>` from
+  their fields (or mined from text), **`<ACC>` from `accountNumber`** — or the
+  placeholder leaks verbatim into the agent-facing explanation. A token with no
+  value on this log degrades to neutral prose ("the account"), never the raw
+  mask. Mining applies `_MASKS` precedence, so the account pattern can never
+  mine a 19-digit cart header and print it as an account.
+  (Re-filling `<ACC>` is display-only and does not make `accountNumber`
+  a correlation key — stitching still never consults it.)
+- **Single flight — concurrent identical logs.** The store happens only AFTER both
+  LLM calls return, so there is a multi-second window where an answer is being
+  computed but nothing records it. The poller runs alerts **concurrently**
+  (`ALERT_CONCURRENCY`) and a failure burst emits **byte-identical** lines
+  milliseconds apart — so without coalescing every log in the burst misses and
+  duplicates both LLM calls (measured: 4 identical logs → **8** LLM calls where 2
+  suffice; on the canonical scenarios this cost ~60% of the achievable hits). The
+  first caller for a normalized key is the **leader** and computes; concurrent
+  callers are **followers** that await its `CachePayload` and re-fill ids from
+  their OWN log (the payload is shared, never the leader's finished alert — that
+  is what keeps a follower from showing the leader's order id). If the leader
+  produces nothing reusable (fallback / breaker open / LLM error) followers are
+  woken with `None` and run the pipeline themselves — **still failing toward a
+  miss**. This is a cost optimization only: it never changes which answer a log
+  gets. Per-process (there is one AI service), no new infra.
+- **Provenance.** A hit keeps `source="ai"` (it *is* an AI answer, reused) so the
+  backend's source-based Teams routing is untouched; it sets `cached=true` on the
+  `ProcessedAlert` (the only field added to `shared/models.py`). Only `source="ai"`
+  results are cached — fallbacks are never stored, so LLM-down behavior is
+  unchanged.
+- **Store — no new infra.** In-memory LRU (cap `SEMCACHE_MAX_ENTRIES`, default
+  500) of `{normalized_text, vector, payload}`, persisted to the existing Redis
+  (`ai:semcache`). Hit/miss counters (`ai:semcache:hits` / `:misses`) drive the
+  hit rate on **`GET /semcache/stats`**. Cosine lookup is a linear scan — fine at
+  the ≤500 cap; an ANN index would be needed only at much larger scale.
+- **Deps.** Needs `sentence-transformers` + CPU `torch` (pinned in
+  `requirements-ml.txt`, separate from `requirements.txt`). If the package is
+  absent or the model can't load, the cache **disables itself** (deferred import)
+  and the pipeline runs exactly as before — every lookup misses.
+
 ### LangGraph pipeline (`graph.py`, `nodes.py`)
 ```
-input_queue → Explainer Node ──LLM call 1 (plain-English explanation)──► Router Node ──LLM call 2 (team)──► ProcessedAlert → processed.alerts
+input_queue → [semantic cache lookup] ──hit──► reuse cached answer (skip both LLM calls), source="ai" cached=true
+                   │ miss (runs the pipeline unchanged, then stores an "ai" result)
+                   ▼
+              Explainer Node ──LLM call 1 (plain-English explanation)──► Router Node ──LLM call 2 (team)──► ProcessedAlert → processed.alerts
                    │ circuit breaker wraps the LLM calls
                    └── breaker open / LLM error ──► ProcessedAlert with explanation=null, department=null,
                                                     source="fallback"  (raw log passed straight through)
@@ -388,6 +478,26 @@ input_queue → Explainer Node ──LLM call 1 (plain-English explanation)─�
   enums — an out-of-range value is an `LLMError` → fallback, never coerced.
   Severity is per-log *technical* urgency judged from the log alone (not
   business impact, not journey-level).
+
+  **Department semantics (`_DEPARTMENT_GUIDE` + `_ROUTE_EXAMPLES` in `nodes.py`).**
+  The prompt's ALLOWED list is generated from the `Department` enum, but the
+  definitions and few-shot examples are hand-written — **adding a department
+  updates the list automatically and silently leaves it undefined**. A test
+  (`test_route_prompt_defines_every_department`) fails if the two drift.
+
+  The load-bearing distinction is **`backend` vs `general`**:
+  - `backend` = an application/integration **defect** — the service behaved wrongly.
+  - `general` = **not an engineering fault**: the pipeline worked as designed and
+    correctly *rejected* an order (margin below threshold, missing `costCenter`
+    UDF, disabled JAM account, unmapped product). Nobody changes code. This holds
+    even though the log is `ERROR`, came from a service, and says FAILED/aborted.
+
+  Roughly half the alertable corpus is this business-rule class. Without the
+  distinction the model routes on surface association (log came from a service →
+  services are code → `backend`) and dumps them all on the backend team as phantom
+  work — the misroute this guide exists to prevent. Note `general` is also where
+  `source="fallback"` alerts land, so `#general-logs` mixes business rejections
+  with unprocessed pass-throughs (distinguishable by the `AI`/`fallback` badge).
 - **Fallback is a pass-through, NOT rule-based**: when the LLM is down, the
   log is sent down the pipe unexplained and unrouted (`source: "fallback"`).
   The backend routes those to the **general** Teams channel. There is no
@@ -414,6 +524,8 @@ class ProcessedAlert(BaseModel):
     severity: Severity | None           # per-log technical severity; None when source="fallback"
     confidence: float | None            # 0..1; None when source="fallback"
     source: Literal["ai", "fallback"]
+    cached: bool = False                 # True when served from the semantic cache
+                                         # (still source="ai"; routing unchanged)
 ```
 
 ### Journey summary API (`api.py`)
@@ -487,6 +599,7 @@ possibly later than the alert that referenced it.
 ```
 alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
        event_id, order_id, cart_header_id, account_number,
+       explanation, department, severity, confidence, source, cached, journey_id FK NULL)
        explanation, department, severity, confidence, source, journey_id FK NULL,
        is_resolved, resolved_at NULL)
 journeys(journey_id PK, status, outcome NULL, first_ts, last_ts,
@@ -499,6 +612,16 @@ hand-editing tables — see "Gotchas" below.
 
 ### API
 ```
+POST /auth/login                        # {username,password} -> sets httpOnly session cookie
+POST /auth/logout                       # clears the cookie
+GET  /auth/me                           # current user (401 if no valid session) — the frontend guard
+GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
+                                        # cached=true|false is ORTHOGONAL to source:
+                                        # every cached alert is source="ai", so it
+                                        # narrows within AI answers, not beside them.
+GET  /journeys?status=                  # 🔒 requires session
+GET  /journeys/{id}                     # 🔒 journey + its events + summary
+WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
 POST  /auth/login                        # {username,password} -> sets httpOnly session cookie
 POST  /auth/logout                       # clears the cookie
 GET   /auth/me                           # current user (401 if no valid session) — the frontend guard
@@ -566,7 +689,11 @@ failing sink so one never stops the other or the consumers.
 
 Connects to backend WS + REST. Feature contract:
 - Real-time alert feed with plain-English explanations.
-- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**
+- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**, plus a
+  **`Cached` badge alongside `AI-analyzed`** when `ProcessedAlert.cached` is set
+  (a cache hit is the same AI answer reused — a modifier, never a replacement, so
+  the two badges show together). An "Answer" filter (`all` / `cached` / `fresh`)
+  maps to `?cached=`.
   (from `ProcessedAlert.source`).
 - Order journey timeline view: complete path — services touched, where it
   stopped, why; per-step alert explanations where they exist; LLM journey
@@ -595,6 +722,8 @@ Connects to backend WS + REST. Feature contract:
 | `dedup:{log_id}` | string | 1h | AI-service poller SETNX dedup |
 | `ai:last_to` | string | — | poller watermark — `to` of the last fetched window; makes windows contiguous (see [3]). **Load-bearing, not optional.** |
 | `ai:breaker:state` | hash | — | circuit breaker state |
+| `ai:semcache` | string | — | semantic-cache dump (LRU entries persisted across restarts). Rebuildable — safe to drop. |
+| `ai:semcache:hits` / `:misses` | string | — | semantic-cache hit/miss counters (the demo number; `GET /semcache/stats`) |
 
 Journey state lives in Postgres — the backend owns journeys.
 
@@ -605,6 +734,10 @@ Journey state lives in Postgres — the backend owns journeys.
 ```bash
 docker compose up -d                          # rabbitmq, redis, postgres
 pip install -r requirements.txt
+# Optional — enables the AI-service semantic cache (CPU torch + embeddings).
+# Without it the cache disables itself and the pipeline runs unchanged.
+# Windows: enable long paths first (see requirements-ml.txt) or torch fails to unpack.
+pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
 alembic upgrade head                          # apply DB migrations (backend/migrations)
 uvicorn pipeline.mock_es.app:app --port 9200  # [2]
 python -m pipeline.services.run_all           # [1] all mock services (baton consumers)
@@ -621,6 +754,9 @@ Env defaults: `ES_URL=http://localhost:9200`,
 `WINDOW_END_OFFSET=5`, `MAX_WINDOW_SPAN=120` (poller catch-up cap),
 `ALERT_CONCURRENCY=4` (concurrent alert LLM calls), `STALLED_TIMEOUT=90`,
 `STALLED_SWEEP_INTERVAL=15`, `DASHBOARD_URL` (dashboard base for journey links),
+`SEMCACHE_ENABLED=1`, `SEMCACHE_THRESHOLD=0.95` (cosine floor),
+`SEMCACHE_MAX_ENTRIES=500`, `SEMCACHE_MODEL=all-MiniLM-L6-v2`, `SEMCACHE_GUARD=1`,
+`SEMCACHE_SALIENT_EXTRA` (comma-sep extra guard words),
 plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 
 ---
@@ -642,6 +778,20 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
   failures; fallback alerts have null explanation/department,
   `source="fallback"`, and land in the general Teams channel; router output is
   always one of the 5 departments.
+- **Semantic cache**: a hit reuses the cached answer WITHOUT calling the LLM
+  (assert the model isn't invoked); two same-type logs with different ids hit
+  (normalization); different error types miss (no false collapse); a
+  retry-counter difference (`2/3` vs `3/3`) misses (meaningful tokens unmasked);
+  **concurrent identical logs call the LLM ONCE** (single flight: one leader, the
+  rest `cached=true`) while concurrent *distinct* types each still call it; a
+  follower shows its OWN ids, never the leader's; a failed leader does not poison
+  its followers (all get clean `source="fallback"`, nothing cached);
+  id re-fill puts the CURRENT log's id in the reused explanation; **no mask
+  token (`<ORD>`/`<ACC>`/…) ever survives re-fill, for any log** — including a
+  log missing every id; a cart header is never re-filled as the account; a log
+  just below `SEMCACHE_THRESHOLD` misses; the divergence guard vetoes a high-cosine
+  meaning-flip (`succeeded` vs `failed`) → miss; hit/miss counters increment;
+  fallbacks are never cached.
 - **Journey rules**: each of the 10 scenarios ends with its expected outcome;
   killing the chain mid-flow (drop the baton) produces `TIMED_OUT` after 90s.
 - **End-to-end**: `injector --all` → 10 journeys with the exact outcomes
@@ -673,7 +823,20 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
   hand-edit the tables in `backend/db.py` without a matching migration.
 - The system must remain useful with the LLM completely down (breaker +
   pass-through alerts + template journey summaries). Test this path.
-- All LLM/provider wiring stays in one module (Azure AI Foundry today).
+- The semantic cache must **fail toward a miss**, never a false hit: a false miss
+  costs one LLM call, a false hit serves a wrong AI-labelled answer. Never cache a
+  `source="fallback"` result. `normalize()` masks ONLY volatile ids — never mask
+  retry counters/percentages/thresholds/**7-digit product ids** (that would merge
+  distinct alerts). **Anything `normalize()` masks, `refill()` must be able to put
+  back**, or the mask either shows up verbatim in the explanation or — worse — gets
+  a wrong value substituted in its place. A
+  cosine hit must pass the divergence guard. `normalize()` reuses the same id
+  shapes as `backend/stitching.py`'s mining patterns — changing one means
+  changing both. A hit keeps `source="ai"` (backend Teams routing depends on it);
+  only `cached=true` distinguishes it.
+- All LLM/provider wiring stays in one module (Azure AI Foundry today). The
+  semantic-cache embedding model (sentence-transformers) is local, not a provider
+  — it lives in `ai_service/semcache.py`, not `llm.py`.
 - All datetimes ae UTC and timezone aware (timestamptz in Postgres,
   datetime.now(timezone.utc) in Python - never utcnow(), never naive
   datetimes). The 90s stalled journey arithmetic depends on this.

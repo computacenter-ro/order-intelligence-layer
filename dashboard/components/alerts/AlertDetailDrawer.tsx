@@ -129,6 +129,12 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
           {alert.source === "ai" ? (
             <>
               <Badge status="other">AI-analyzed</Badge>
+              {/* Same pairing as AlertCard: cached modifies AI-analyzed. */}
+              {alert.cached && (
+                <span title="Reused from a previous identical alert — no new LLM call">
+                  <Badge status="primary">Cached</Badge>
+                </span>
+              )}
               {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
               {alert.confidence != null && <ConfidenceBar confidence={alert.confidence} />}
             </>
@@ -143,6 +149,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
         <KeyValueRow label="cartHeaderId" value={alert.cart_header_id ?? "—"} />
         <KeyValueRow label="accountNumber" value={alert.account_number ?? "—"} />
         <KeyValueRow label="source" value={alert.source} />
+        <KeyValueRow label="cached" value={alert.cached ? "yes" : "no"} />
 
         <SectionLabel>Raw log line</SectionLabel>
         <pre

@@ -71,6 +71,9 @@ export interface AlertsFilter {
   app_name?: string;
   severity?: string;
   resolved?: boolean;
+  // Semantic-cache provenance; orthogonal to `source` (cached alerts are all
+  // source="ai"). Omitted = both.
+  cached?: boolean;
   // Cursor pagination (backend/pagination.py). `cursor` from a prior page's
   // next_cursor; `sort` picks the keyset column (feed=emitted_at,
   // history=resolved_at).
@@ -99,6 +102,7 @@ export function fetchAlerts(filter: AlertsFilter = {}): Promise<Page<ProcessedAl
   if (filter.app_name) params.set("app_name", filter.app_name);
   if (filter.severity) params.set("severity", filter.severity);
   if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
+  if (filter.cached !== undefined) params.set("cached", String(filter.cached));
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.cursor) params.set("cursor", filter.cursor);
   if (filter.sort) params.set("sort", filter.sort);

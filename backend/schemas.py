@@ -73,6 +73,15 @@ class AlertOut(BaseModel):
     severity: str | None = None
     confidence: float | None = None
     source: str
+    # True when the AI service served this from its semantic cache. Modifies
+    # source="ai" (the answer is still AI-authored, just reused); never set on a
+    # fallback.
+    #
+    # ``None`` is coerced to False rather than rejected: the column's default is
+    # DB-side, so an ``Alert`` serialized before it is flushed (the ``alert.new``
+    # WebSocket envelope does exactly this) still reads None. Absent/None both
+    # mean "not a cache hit", which is the correct reading for every such row.
+    cached: Annotated[bool, BeforeValidator(lambda v: False if v is None else v)] = False
     journey_id: str | None = None
     is_resolved: bool = False
     resolved_at: UtcDatetime | None = None

@@ -42,7 +42,20 @@ The design (CLAUDE.md "semantic cache"), in order:
 
 6. **Id re-fill on hit.** The explanation is stored in NORMALIZED form (ids
    masked); on a hit the CURRENT log's ids are substituted back in, so the
-   returned explanation shows the right order id, never the cached one.
+   returned explanation shows the right order id, never the cached one. EVERY
+   mask token normalize() can emit must be re-fillable — including ``<ACC>``
+   from ``accountNumber`` — otherwise the placeholder leaks verbatim into the
+   agent-facing explanation. A token with no value on this log degrades to
+   neutral prose ("the account"), never the raw ``<ACC>``.
+
+7. **Single flight (:class:`InFlight`).** The store happens only AFTER both LLM
+   calls return, leaving a multi-second window where an answer is being computed
+   but nothing records it. Since the poller processes alerts CONCURRENTLY and a
+   failure burst emits byte-identical lines milliseconds apart, that window let
+   every log in a burst miss and duplicate the work (measured: 4 identical logs
+   → 8 LLM calls). The first caller for a key computes; concurrent callers await
+   its payload and re-fill their OWN ids. Cost-only — it never changes which
+   answer a log gets.
 
 The cache holds only successful AI answers (a hit is still an AI answer, just
 reused). Misses — including every miss while the breaker is open — fall through
@@ -51,27 +64,34 @@ guarantee is untouched.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from shared.models import Department, Severity
 
 # --- id masking (mirrors backend/stitching.py id shapes) ----------------------
 # Each family has a mask token and the pattern that recognizes it. ORDER
-# MATTERS: the 19-digit cart id is masked before the generic 6+-digit account
-# run, so a cart header is never mis-masked as an account. The account pattern
-# needs >= 6 digits precisely so it can NOT swallow a retry counter ("2/3"),
-# a percentage ("12%"), an attempt number or a small threshold — those stay
-# visible and keep distinct alerts distinct.
+# MATTERS: the 19-digit cart id is masked before the 8-digit account run, so a
+# cart header is never mis-masked as an account. The account pattern is 8 digits
+# exactly so it can NOT swallow a retry counter ("2/3"), a percentage ("12%"), a
+# threshold, or a 7-digit product id — those stay visible and keep distinct
+# alerts distinct.
 _MASKS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("<EVT>", re.compile(r"evt-[0-9a-f-]{8,}")),
     ("<ORD>", re.compile(r"\bORD-\d+\b")),
     ("<CART>", re.compile(r"\b\d{19}\b")),
-    ("<ACC>", re.compile(r"\b\d{6,}\b")),  # account numbers (>=6 digits)
+    # Account numbers are EXACTLY 8 digits (shared/scenarios.py). The old \d{6,}
+    # also swallowed 7-digit PRODUCT ids, which are meaning-bearing, not volatile:
+    # "No internal SKU mapping found for product 9999999" is *about* that id, and
+    # masking it both merged distinct SKU-mapping alerts and made refill()
+    # substitute the log's accountNumber where a product id belonged. Product ids
+    # therefore stay visible, like retry counters and thresholds.
+    ("<ACC>", re.compile(r"\b\d{8}\b")),
 )
 
 
@@ -79,9 +99,10 @@ def normalize(message: str) -> str:
     """Mask volatile ids in ``message`` so same-type logs share one cache key.
 
     Masks ``evt-...`` → ``<EVT>``, ``ORD-N`` → ``<ORD>``, a 19-digit cart id →
-    ``<CART>``, and any remaining 6+-digit run (an account number) → ``<ACC>``.
-    Leaves everything else — including retry counters, percentages and
-    thresholds — untouched, so semantically distinct alerts do not collapse.
+    ``<CART>``, and a remaining 8-digit run (an account number) → ``<ACC>``.
+    Leaves everything else — including retry counters, percentages, thresholds
+    and 7-digit product ids — untouched, so semantically distinct alerts do not
+    collapse.
     """
     text = message or ""
     for token, pattern in _MASKS:
@@ -136,6 +157,28 @@ def diverges(a_norm: str, b_norm: str, salient_words: frozenset[str]) -> bool:
     return _salient_tokens(a_norm, salient_words) != _salient_tokens(b_norm, salient_words)
 
 
+# Every mask token normalize() can produce, paired with the LogLine field that
+# holds the concrete value. accountNumber is included here for re-fill ONLY —
+# that is a display concern and says nothing about correlation, which never
+# consults accountNumber (see backend/stitching.py).
+_REFILL_FIELDS: tuple[tuple[str, str], ...] = (
+    ("<EVT>", "eventId"),
+    ("<ORD>", "orderId"),
+    ("<CART>", "cartHeaderId"),
+    ("<ACC>", "accountNumber"),
+)
+
+# Fallback wording for a mask token with no concrete value on this log — an
+# unfilled "<ACC>" is leaked internals in an agent-facing explanation, so the
+# text degrades to a neutral phrase instead of showing the placeholder.
+_MASK_FALLBACK: dict[str, str] = {
+    "<EVT>": "the event",
+    "<ORD>": "the order",
+    "<CART>": "the cart header",
+    "<ACC>": "the account",
+}
+
+
 def _current_ids(log) -> dict[str, str]:
     """The concrete ids to re-fill into a normalized explanation for ``log``.
 
@@ -144,16 +187,21 @@ def _current_ids(log) -> dict[str, str]:
     Returns only the mask tokens that have a concrete value for this log.
     """
     ids: dict[str, str] = {}
-    for token, field in (("<EVT>", "eventId"), ("<ORD>", "orderId"), ("<CART>", "cartHeaderId")):
-        value = getattr(log, field, None)
+    for token, attr in _REFILL_FIELDS:
+        value = getattr(log, attr, None)
         if value:
-            ids[token] = value
-    message = log.message or ""
+            ids[token] = str(value)
+    # Mining fallback. _MASKS order is load-bearing here exactly as it is in
+    # normalize(): each family is masked out of the text before the next pattern
+    # runs, so the generic 6+-digit account pattern can never mine a 19-digit
+    # cart header (or the digits inside an ORD-N) and mislabel it as an account.
+    remaining = log.message or ""
     for token, pattern in _MASKS:
-        if token in ("<EVT>", "<ORD>", "<CART>") and token not in ids:
-            match = pattern.search(message)
+        if token not in ids:
+            match = pattern.search(remaining)
             if match:
                 ids[token] = match.group(0)
+        remaining = pattern.sub(token, remaining)
     return ids
 
 
@@ -162,11 +210,14 @@ def refill(normalized_text: str, log) -> str:
 
     Each mask token (``<ORD>`` …) is replaced with this log's actual id, so a
     reused explanation reads with the right order id — never the cached one. A
-    token with no concrete id for this log is left as-is (rare; still readable).
+    token with no concrete value for this log degrades to neutral prose ("the
+    order") rather than leaking the placeholder into agent-facing text.
     """
     text = normalized_text
-    for token, value in _current_ids(log).items():
-        text = text.replace(token, value)
+    ids = _current_ids(log)
+    for token, _attr in _REFILL_FIELDS:
+        replacement = ids.get(token) or _MASK_FALLBACK[token]
+        text = text.replace(token, replacement)
     return text
 
 
@@ -335,6 +386,18 @@ class SemanticCache:
         return self._entries[best_key].payload
 
     # --- store ----------------------------------------------------------------
+    def peek_exact(self, message: str) -> CachePayload | None:
+        """The payload stored under ``message``'s EXACT normalized key, or None.
+
+        Deliberately skips the cosine path: single flight uses this to hand the
+        leader's own answer to its followers, and a fuzzy neighbour is not the
+        leader's answer. If the leader stored nothing (fallback / breaker open),
+        followers must get ``None`` and run the pipeline — never a lookalike.
+        Does not touch LRU recency or the hit/miss counters.
+        """
+        entry = self._entries.get(normalize(message))
+        return entry.payload if entry is not None else None
+
     def store(self, message: str, payload: CachePayload) -> None:
         """Cache the AI answer for ``message``'s type (LRU, idempotent per key)."""
         if not self.enabled:
@@ -345,6 +408,21 @@ class SemanticCache:
         self._entries.move_to_end(key)
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)  # evict least-recently-used
+
+    # --- clustering support (backend/incidents.py) ----------------------------
+    def embed(self, message: str) -> list[float] | None:
+        """A masked-message embedding for the incident-clustering feature.
+
+        Independent of this cache's lookup/store lifecycle — never reads or
+        writes ``_entries``. Uses the same ``normalize()`` masking and the same
+        loaded encoder, but this is a genuinely NEW ``encode()`` call every
+        time: the exact-match cache-hit path in :meth:`lookup` skips embedding
+        entirely, so there is nothing to reuse for free here. Returns ``None``
+        when no encoder is configured (cache disabled).
+        """
+        if not self.enabled:
+            return None
+        return _as_floats(self._encoder.encode(normalize(message)))
 
     # --- persistence (to the existing Redis, no new infra) --------------------
     def dump(self) -> str:
@@ -382,6 +460,64 @@ class SemanticCache:
                 continue  # skip a malformed entry, keep the rest
 
 
+# --- single-flight (in-flight coalescing) ------------------------------------
+class InFlight:
+    """Coalesces concurrent work on the SAME normalized key ("single flight").
+
+    The cache is only populated AFTER the two LLM calls return, so between a
+    miss and the store there is a multi-second window in which the answer is
+    being computed but nothing records that. The poller processes alerts
+    CONCURRENTLY (``ALERT_CONCURRENCY``), and a burst of a single failure type
+    emits byte-identical lines milliseconds apart — so without this, every log
+    in the burst misses, calls the LLM, and stores the same answer. Measured: 4
+    identical logs → 8 LLM calls where 2 suffice.
+
+    This registry closes that window. The first caller for a key becomes the
+    LEADER and computes; concurrent callers become FOLLOWERS and await the
+    leader's :class:`CachePayload`. Followers re-fill ids from their OWN log, so
+    a shared payload never leaks the leader's ids (the payload is normalized —
+    that is precisely why the leader shares the payload, not its finished
+    alert).
+
+    Failure handling preserves "fail toward a miss": if the leader produces no
+    reusable payload (fallback, breaker open, LLM error), followers are woken
+    with ``None`` and run the pipeline themselves rather than inheriting a
+    failure. Correctness never depends on this class — it only removes
+    duplicate work.
+    """
+
+    def __init__(self) -> None:
+        # normalized key -> the future carrying that key's payload (or None).
+        self._waiters: dict[str, "asyncio.Future[CachePayload | None]"] = {}
+
+    def leader(self, key: str) -> "asyncio.Future[CachePayload | None] | None":
+        """Claim ``key``, or return the in-flight future to await as a follower.
+
+        ``None`` means the caller is the leader and must compute, then call
+        :meth:`resolve` exactly once. A returned future means another task is
+        already computing this key.
+        """
+        existing = self._waiters.get(key)
+        if existing is not None:
+            return existing
+        self._waiters[key] = asyncio.get_running_loop().create_future()
+        return None
+
+    def resolve(self, key: str, payload: CachePayload | None) -> None:
+        """Publish the leader's result to followers and release the key.
+
+        Always called by the leader (in a ``finally``), so an exception can
+        never leave followers waiting forever — they get ``None`` and fall
+        through to their own pipeline run.
+        """
+        future = self._waiters.pop(key, None)
+        if future is not None and not future.done():
+            future.set_result(payload)
+
+    def __len__(self) -> int:
+        return len(self._waiters)
+
+
 # --- module-level dependency holder (same pattern as api.configure) ----------
 @dataclass
 class SemCacheDeps:
@@ -390,6 +526,9 @@ class SemCacheDeps:
     dump_key: str
     hits_key: str
     misses_key: str
+    # Single-flight registry, per process. Defaulted so existing construction
+    # sites (and tests) need no change.
+    inflight: InFlight = field(default_factory=InFlight)
 
 
 _deps: SemCacheDeps | None = None

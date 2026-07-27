@@ -25,6 +25,7 @@ is phase 2 (both order ids, never eventId).
 """
 from __future__ import annotations
 
+import itertools
 import random
 
 from pipeline.services.blocklib import emit_line, phase1_ids, phase2_ids
@@ -54,6 +55,19 @@ _LOG_FEE_ITEM = "c.c.orderengine.service.FeeItemService"
 _LOG_CART_SOURCING = "c.c.orderengine.service.CartSourcingService"
 _LOG_JWT = "c.c.orderengine.service.JwtTokenService"
 _LOG_PROCESSING = "c.c.orderengine.service.OrderProcessingService"
+
+# --- id minting (see _mint_ids: uniqueness is load-bearing for correlation) ---
+# Counters give uniqueness WITHIN a process run; the random bases only space
+# successive runs apart (the counters restart at 0, but Postgres keeps the older
+# run's journeys, so identical ids across runs would collide just the same).
+# Order numbers keep the familiar ORD-6xxx..ORD-9xxx look of the reference data.
+_ORDER_SEQ = itertools.count(random.randint(6000, 9000))
+# cartHeaderId must be EXACTLY 19 digits (backend/stitching.py mines \b\d{19}\b).
+# 13-digit prefix + 6-digit sequence = 19. The prefix keeps the reference data's
+# leading "1840927365018" so the ids still look like the real system's.
+_CART_PREFIX = "1840927365018"
+assert len(_CART_PREFIX) == 13, "cartHeaderId must stay 19 digits: 13 + 6"
+_CART_SEQ = itertools.count(random.randint(0, 999_999))
 
 # Client (Feign) loggers per satellite. Checker is deliberately absent: in the
 # reference dataset the margin check is invoked in-process (the checker service
@@ -136,15 +150,34 @@ async def create(baton: Baton, emit: EmitFn) -> bool:
 
 
 def _mint_ids(ctx: BatonContext) -> None:
-    """Assign a realistic orderId + 19-digit cartHeaderId into ctx if absent.
+    """Assign a unique orderId + 19-digit cartHeaderId into ctx if absent.
 
     The injector leaves these None (they are born here). If they were pre-seeded
     (e.g. a deterministic test), keep them.
+
+    **Uniqueness is load-bearing, not cosmetic.** The backend correlates journeys
+    by an alias set of ids, so two flows sharing an orderId are merged into ONE
+    journey: the loser stops receiving logs, never reaches a terminal marker, and
+    is swept as ``TIMED_OUT`` after ``STALLED_TIMEOUT``. The previous
+    ``random.randint(1, 999)`` had only 999 possible order numbers, so by the
+    birthday bound a few dozen flows collided in practice.
+
+    So the counter — not randomness — provides uniqueness: every call takes the
+    next value, and all services run as asyncio tasks in ONE process
+    (``run_all.py``), so ``next()`` needs no lock. The random *base* only spaces
+    successive process runs apart, since the counter restarts at zero while
+    Postgres keeps the previous run's journeys.
+
+    ``cartHeaderId`` must stay EXACTLY 19 digits: ``backend/stitching.py`` mines
+    it with ``\\b\\d{19}\\b`` (anchored both ends), so a 20-digit value would
+    silently stop correlating. Hence the fixed 19-digit width below — the prefix
+    shrinks to make room for the 6-digit sequence.
     """
     if ctx.orderId is None:
-        ctx.orderId = f"ORD-{6000 + random.randint(1, 999)}"
+        ctx.orderId = f"ORD-{next(_ORDER_SEQ)}"
     if ctx.cartHeaderId is None:
-        ctx.cartHeaderId = f"18409273650182{random.randint(0, 99999):05d}"
+        # 13-digit prefix + 6-digit sequence = 19 digits exactly.
+        ctx.cartHeaderId = f"{_CART_PREFIX}{next(_CART_SEQ) % 1_000_000:06d}"
 
 
 async def _create_failure(emit: EmitFn, ctx: BatonContext) -> bool:

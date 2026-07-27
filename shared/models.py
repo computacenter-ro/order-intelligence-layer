@@ -116,3 +116,8 @@ class ProcessedAlert(BaseModel):
     # call. ``source`` stays "ai" on a cache hit so backend routing is unchanged
     # — this flag is purely informational (dashboard/metrics).
     cached: bool = False
+    # The masked-message vector for incident clustering (backend/incidents.py).
+    # None when no encoder is configured (ai_service/semcache.py cache disabled)
+    # — clustering's novel/embedding path just has nothing to compare, same as
+    # any other missing optional signal.
+    embedding: list[float] | None = None

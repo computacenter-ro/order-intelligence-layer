@@ -152,6 +152,7 @@ export default function IncidentDetailPage() {
           key={group.journeyId ?? group.outcome.alert_id}
           group={group}
           defaultExpanded
+          incidentId={incident.incident_id}
         />
       ))}
     </div>

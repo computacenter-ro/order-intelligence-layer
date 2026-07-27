@@ -20,12 +20,19 @@ interface OrderGroupRowProps {
   /** Detail page passes true so the breakdown reads fully expanded on load;
    * the card's inline accordion defaults to collapsed. */
   defaultExpanded?: boolean;
+  /** The incident this row is shown under. Threaded onto the journey link so
+   * that page's back button can return here instead of the generic journeys
+   * list — see app/journeys/[journeyId]/page.tsx. */
+  incidentId?: string;
 }
 
-export function OrderGroupRow({ group, defaultExpanded = false }: OrderGroupRowProps) {
+export function OrderGroupRow({ group, defaultExpanded = false, incidentId }: OrderGroupRowProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const router = useRouter();
   const clickable = group.journeyId !== null;
+  const journeyHref = incidentId
+    ? `/journeys/${group.journeyId}?from=incident&incidentId=${incidentId}`
+    : `/journeys/${group.journeyId}`;
 
   return (
     <div
@@ -40,11 +47,11 @@ export function OrderGroupRow({ group, defaultExpanded = false }: OrderGroupRowP
         role={clickable ? "button" : undefined}
         tabIndex={clickable ? 0 : undefined}
         onClick={() => {
-          if (clickable) router.push(`/journeys/${group.journeyId}`);
+          if (clickable) router.push(journeyHref);
         }}
         onKeyDown={(e) => {
           if (clickable && (e.key === "Enter" || e.key === " ")) {
-            router.push(`/journeys/${group.journeyId}`);
+            router.push(journeyHref);
           }
         }}
         style={{

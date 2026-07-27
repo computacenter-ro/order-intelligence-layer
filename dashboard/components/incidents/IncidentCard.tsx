@@ -106,7 +106,11 @@ export function IncidentCard({ incident, onResolve }: IncidentCardProps) {
             )}
             {detail &&
               groupAlertsByOrder(detail.alerts).map((group) => (
-                <OrderGroupRow key={group.journeyId ?? group.outcome.alert_id} group={group} />
+                <OrderGroupRow
+                  key={group.journeyId ?? group.outcome.alert_id}
+                  group={group}
+                  incidentId={incident.incident_id}
+                />
               ))}
           </div>
         )}

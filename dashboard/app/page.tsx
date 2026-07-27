@@ -13,6 +13,7 @@ import {
   DEFAULT_ALERT_FILTERS,
   alertMatchesFilters,
   sanitizeAlertFilters,
+  sinceForTimeFilter,
   type AlertFilters,
 } from "@/components/alerts/AlertFilterBar";
 import type { ProcessedAlert, WsEvent } from "@/lib/types";
@@ -70,6 +71,9 @@ export default function AlertFeedPage() {
         severity: filters.severity === "all" ? undefined : filters.severity,
         // "all" omits the param; otherwise "cached" -> true, "fresh" -> false.
         cached: filters.cached === "all" ? undefined : filters.cached === "cached",
+        // Resolved here, per request, so the rolling window re-anchors to the
+        // current clock on every fetch — including each "Load more" page.
+        since: sinceForTimeFilter(filters.time),
         resolved: false,
         sort: "emitted_at",
         cursor: cursor ?? undefined,

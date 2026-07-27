@@ -1,4 +1,4 @@
-import type { Journey, ProcessedAlert } from "@/lib/types";
+import type { Journey, OverviewStats, ProcessedAlert } from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -127,4 +127,9 @@ export function fetchJourneys(filter: JourneysFilter = {}): Promise<Page<Journey
 
 export function fetchJourney(journeyId: string): Promise<Journey> {
   return getJson<Journey>(`/journeys/${encodeURIComponent(journeyId)}`);
+}
+
+/** Aggregate counters for the Insights page (backend GET /stats/insights). */
+export function fetchStats(): Promise<OverviewStats> {
+  return getJson<OverviewStats>("/stats/insights");
 }

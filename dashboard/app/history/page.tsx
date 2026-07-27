@@ -10,6 +10,7 @@ import {
   AlertFilterBar,
   DEFAULT_ALERT_FILTERS,
   sanitizeAlertFilters,
+  sinceForTimeFilter,
   type AlertFilters,
 } from "@/components/alerts/AlertFilterBar";
 import type { ProcessedAlert } from "@/lib/types";
@@ -62,6 +63,12 @@ export default function HistoryPage() {
         severity: filters.severity === "all" ? undefined : filters.severity,
         // "all" omits the param; otherwise "cached" -> true, "fresh" -> false.
         cached: filters.cached === "all" ? undefined : filters.cached === "cached",
+        // Resolved here, per request, so the rolling window re-anchors to the
+        // current clock on every fetch — including each "Load more" page. Note
+        // this bounds `emitted_at` (when the alert fired), not `resolved_at`
+        // (what History sorts on): "Last 24h" means alerts raised in the last
+        // day, which is the same reading as on the feed.
+        since: sinceForTimeFilter(filters.time),
         resolved: true,
         sort: "resolved_at",
         cursor: cursor ?? undefined,
@@ -96,7 +103,7 @@ export default function HistoryPage() {
       <AlertFilterBar value={filters} onChange={setFilters} />
       <div>
         {items.length === 0 && !loading && (
-          <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet</p>
+          <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet.</p>
         )}
         {items.map((alert) => (
           <AlertCard

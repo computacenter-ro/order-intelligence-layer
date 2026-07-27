@@ -24,6 +24,12 @@ Endpoints:
 * ``GET /journeys?status=`` — journeys filtered by ``status``.
 * ``GET /journeys/{journey_id}`` — one journey + its events (ordered by ``ts``)
   + summary; 404 if the journey does not exist.
+* ``GET /stats/insights`` — aggregate counters for the dashboard insights page.
+  Query building and the folding of the group-by results both live in
+  ``backend/stats.py`` (pure + unit-tested); this route only executes them.
+* ``POST /chat`` — the authenticated front door for the AI service's grounded
+  chat (:8100 is loopback + unauthenticated by design). Forwards to its
+  ``/chat`` and decorates each cited source with a dashboard link.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.auth import get_current_user
 from backend.db import Alert, Journey, JourneyEvent, get_session
 from backend.pagination import apply_keyset, build_page
+from backend import stats
 from backend.schemas import (
     AlertOut,
     ChatCoverage,
@@ -47,6 +54,7 @@ from backend.schemas import (
     JourneyDetailOut,
     JourneyEventOut,
     JourneyOut,
+    OverviewStats,
     Page,
 )
 from shared.models import Department
@@ -362,4 +370,42 @@ async def chat(
         # retrieval, and the dashboard renders it (a badge on counting answers)
         # rather than reading it out of the prose.
         coverage=ChatCoverage(**(result.get("coverage") or {})),
+    )
+
+
+@router.get("/stats/insights", response_model=OverviewStats)
+async def get_overview_stats(
+    session: AsyncSession = Depends(get_session),
+) -> OverviewStats:
+    """Aggregate counters for the insights page. Read-only.
+
+    Runs the ``backend/stats.py`` builders and hands the raw group-by rows to
+    :func:`~backend.stats.assemble_overview`. The statements execute one after
+    another (one AsyncSession is not safe to use concurrently) and this route
+    holds no logic of its own — everything derived lives in the assembler.
+    """
+    journey_total, journey_avg_duration = (
+        await session.execute(stats.journey_totals())
+    ).one()
+    by_status = (await session.execute(stats.journeys_by_status())).all()
+    by_outcome = (await session.execute(stats.journeys_by_outcome())).all()
+
+    alert_total = (await session.execute(stats.alert_total())).scalar_one()
+    resolution = (await session.execute(stats.alerts_resolution_counts())).all()
+    by_department = (await session.execute(stats.alerts_by("department"))).all()
+    by_severity = (await session.execute(stats.alerts_by("severity"))).all()
+    by_level = (await session.execute(stats.alerts_by("level"))).all()
+    by_source = (await session.execute(stats.alerts_by("source"))).all()
+
+    return stats.assemble_overview(
+        journeys_by_status=by_status,
+        journeys_by_outcome=by_outcome,
+        journey_total=journey_total,
+        journey_avg_duration=journey_avg_duration,
+        alerts_by_department=by_department,
+        alerts_by_severity=by_severity,
+        alerts_by_level=by_level,
+        alerts_by_source=by_source,
+        alerts_resolution=resolution,
+        alert_total=alert_total,
     )

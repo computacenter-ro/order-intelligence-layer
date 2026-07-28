@@ -46,6 +46,7 @@ from typing import Any
 # The embedding stack is shared with the semantic cache — one model, one cosine
 # implementation, one self-disabling convention. Importing (not copying) is what
 # keeps "no new ML dependencies" true and the two paths consistent.
+from ai_service import settings
 from ai_service.semcache import Encoder, as_floats, cosine, load_encoder
 
 __all__ = [
@@ -100,6 +101,14 @@ class RagRecord:
             vector=[float(x) for x in data["vector"]],
             metadata=dict(data.get("metadata") or {}),
         )
+
+
+# The boost assumed for a record with no usable feedback. MUST match
+# ``backend.feedback.NEUTRAL``: the whole point is that an unvoted record is
+# neither rewarded nor punished, so silence and a perfectly even split score the
+# same. Duplicated rather than imported because ai_service must not depend on
+# backend (the two are separate services); the value is pinned by a test.
+NEUTRAL_BOOST = 0.5
 
 
 def _matches(metadata: dict[str, Any], filters: dict[str, Any] | None) -> bool:
@@ -171,7 +180,12 @@ class RagIndex:
 
     # --- read -----------------------------------------------------------------
     def retrieve(
-        self, query_text: str, k: int = 5, filters: dict | None = None
+        self,
+        query_text: str,
+        k: int = 5,
+        filters: dict | None = None,
+        boosts: dict[str, float] | None = None,
+        feedback_weight: float = 0.0,
     ) -> list[dict]:
         """Top-``k`` records by cosine against ``query_text``, best first.
 
@@ -179,17 +193,44 @@ class RagIndex:
         below ``min_score``. Returns ``[]`` when the index is disabled, empty, or
         nothing clears the floor — an empty result is a normal answer here, not an
         error: ``/chat`` says so plainly rather than inventing a source.
+
+        ``boosts`` maps record id -> a feedback score in (0, 1) (see
+        ``backend/feedback.py``), blended into the ranking as::
+
+            final = cosine * (1 - w) + boost * w
+
+        with ``w = feedback_weight``. Three properties are load-bearing:
+
+        * **The floor is applied to COSINE, not to the blend.** Feedback re-orders
+          what already matched; it can never lift an irrelevant record over the
+          relevance floor. No amount of likes can put an unrelated incident in
+          front of an agent.
+        * **A missing id counts as NEUTRAL (0.5), not zero.** Most records are
+          never voted on, and treating silence as a zero score would penalise
+          everything nobody happened to click — the single worst failure mode of
+          feedback-aware ranking.
+        * **``w`` is small (default 0.15) and ``w=0`` is an exact no-op**, so the
+          feature can be switched off and the ranking is provably unchanged.
+
+        Both the raw ``score`` and the blended ``final_score`` are returned so the
+        effect is inspectable rather than invisible.
         """
         if not self.enabled or not self._records or not query_text or not query_text.strip():
             return []
         query_vector = as_floats(self._encoder.encode(query_text))
+        weight = min(max(feedback_weight, 0.0), 1.0)
+        boosts = boosts or {}
         scored: list[dict] = []
         for record in self._records.values():
             if not _matches(record.metadata, filters):
                 continue
             score = cosine(query_vector, record.vector)
+            # Deliberately gate on the RAW cosine: relevance decides admission,
+            # feedback only decides order among the admitted.
             if score < self._min_score:
                 continue
+            boost = boosts.get(record.id, NEUTRAL_BOOST)
+            final = score * (1.0 - weight) + boost * weight if weight else score
             scored.append(
                 {
                     "id": record.id,
@@ -197,11 +238,13 @@ class RagIndex:
                     "text": record.text,
                     "metadata": dict(record.metadata),
                     "score": score,
+                    "final_score": final,
+                    "boost": boost,
                 }
             )
-        # Sort by score desc; id as a tiebreaker so equal-scoring records come
-        # back in a stable order (tests and the UI both depend on determinism).
-        scored.sort(key=lambda r: (-r["score"], r["id"]))
+        # Sort by the blended score; id as a tiebreaker so equal-scoring records
+        # come back in a stable order (tests and the UI both depend on determinism).
+        scored.sort(key=lambda r: (-r["final_score"], r["id"]))
         return scored[: max(0, k)]
 
     # --- persistence (the existing Redis, no new infra) -----------------------
@@ -261,11 +304,27 @@ async def index_record(
     return stored
 
 
-def retrieve(query_text: str, k: int = 5, filters: dict | None = None) -> list[dict]:
-    """Top-k related records for ``query_text`` (empty when unconfigured)."""
+def retrieve(
+    query_text: str,
+    k: int = 5,
+    filters: dict | None = None,
+    boosts: dict[str, float] | None = None,
+    feedback_weight: float | None = None,
+) -> list[dict]:
+    """Top-k related records for ``query_text`` (empty when unconfigured).
+
+    ``feedback_weight`` defaults to ``settings.RAGINDEX_FEEDBACK_WEIGHT``; pass 0
+    to rank on relevance alone. ``boosts`` comes from the caller (the backend owns
+    the votes, this service owns the index), so the AI service stays DB-free.
+    """
     if _deps is None:
         return []
-    return _deps.index.retrieve(query_text, k=k, filters=filters)
+    weight = (
+        settings.RAGINDEX_FEEDBACK_WEIGHT if feedback_weight is None else feedback_weight
+    )
+    return _deps.index.retrieve(
+        query_text, k=k, filters=filters, boosts=boosts, feedback_weight=weight
+    )
 
 
 async def persist() -> None:

@@ -27,10 +27,15 @@ Endpoints:
   single-valued, likewise 422 on anything else. ``cached=true|false`` narrows by
   semantic-cache provenance; it is orthogonal to ``source`` (every cached alert is
   ``source="ai"``), so it filters *within* AI answers rather than beside them.
+
+  ``search=`` is a free-text, case-insensitive substring match (``ILIKE``) over
+  ``message`` OR ``explanation``, ANDed with every other filter. Any text is
+  valid; blank/whitespace-only is treated as absent.
 * ``GET /alerts/facets`` — takes the same filter params as ``GET /alerts`` (no
   paging) and returns per-value counts for the three multi-select filters. Each
   facet is counted with every active filter EXCEPT its own, so ticking one value
-  never collapses that facet's own list. Filter conditions come from the shared
+  never collapses that facet's own list — but ``search`` has no facet of its own,
+  so it scopes all three. Filter conditions come from the shared
   :func:`alert_filter_conditions`, so the feed and its counts cannot disagree.
 * ``GET /journeys?status=`` — journeys filtered by ``status``.
 * ``GET /journeys/{journey_id}`` — one journey + its events (ordered by ``ts``)
@@ -49,7 +54,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import ColumnElement, Select, func, select, update
+from sqlalchemy import ColumnElement, Select, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user
@@ -90,6 +95,20 @@ _FACET_COLUMNS = {
 }
 
 
+def _like_term(search: str) -> str:
+    """Wrap a search string as a ``%substring%`` LIKE pattern, wildcards escaped.
+
+    ``%`` and ``_`` are LIKE metacharacters, and the alert corpus is full of both
+    — margin messages quote percentages, and logger/service names are peppered
+    with underscores. Passing them through raw makes ``12%`` match every alert and
+    ``order_engine`` match ``orderXengine``, so a literal search silently returns
+    the wrong rows. Escaped here (with the escape char itself first, or escaping
+    would corrupt its own output), paired with ``escape="\\\\"`` at the call site.
+    """
+    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def alert_filter_conditions(
     since: datetime | None,
     department: list[str] | None,
@@ -99,6 +118,7 @@ def alert_filter_conditions(
     severity: list[str] | None = None,
     resolved: bool | None = None,
     cached: bool | None = None,
+    search: str | None = None,
 ) -> list[ColumnElement[bool]]:
     """The WHERE clauses for a set of alert filters — the one place they live.
 
@@ -119,6 +139,14 @@ def alert_filter_conditions(
     department. That is the same behaviour the single-value ``==`` had.
 
     ``level`` / ``source`` / ``resolved`` / ``cached`` stay single-valued.
+
+    ``search`` is a case-insensitive **substring** match (``ILIKE``) across
+    ``message`` OR ``explanation`` — the raw log line and the AI's plain-English
+    take on it, which is where an agent's search terms actually live. Whitespace
+    is stripped and a blank string is treated as absent, so a cleared search box
+    is "no filter" rather than a match-everything ``%%``. ``explanation`` is NULL
+    on fallback alerts; ``ILIKE`` on NULL is NULL (not true), so those still match
+    on ``message`` alone and are never wrongly excluded by the OR.
     """
     conditions: list[ColumnElement[bool]] = []
     if since is not None:
@@ -137,6 +165,14 @@ def alert_filter_conditions(
         conditions.append(Alert.severity.in_(severity))
     if cached is not None:
         conditions.append(Alert.cached == cached)
+    if search and search.strip():
+        term = _like_term(search.strip())
+        conditions.append(
+            or_(
+                Alert.message.ilike(term, escape="\\"),
+                Alert.explanation.ilike(term, escape="\\"),
+            )
+        )
     return conditions
 
 
@@ -149,6 +185,7 @@ def build_alerts_query(
     severity: list[str] | None = None,
     resolved: bool | None = None,
     cached: bool | None = None,
+    search: str | None = None,
 ) -> Select:
     """Select alerts matching the given filters (see :func:`alert_filter_conditions`).
 
@@ -166,6 +203,7 @@ def build_alerts_query(
             severity=severity,
             resolved=resolved,
             cached=cached,
+            search=search,
         )
     )
 
@@ -260,6 +298,10 @@ async def list_alerts(
     # source="ai", so ?cached=true narrows within AI answers rather than being an
     # alternative to them. Omitted = both.
     cached: Annotated[bool | None, Query()] = None,
+    # Free-text substring search over message OR explanation, case-insensitive.
+    # A free string by nature — no value to validate, and a blank one is treated
+    # as absent by alert_filter_conditions.
+    search: Annotated[str | None, Query()] = None,
     # Cursor pagination (see backend/pagination.py). limit is clamped to 1..100
     # rather than 422'd so a caller can pass anything and still get a sane page.
     limit: Annotated[int, Query()] = 16,
@@ -282,6 +324,7 @@ async def list_alerts(
             severity=list(severity) if severity else None,
             resolved=resolved,
             cached=cached,
+            search=search,
         ),
         sort_col,
         Alert.alert_id,
@@ -316,6 +359,7 @@ async def get_alert_facets(
         list[Literal["critical", "high", "medium", "low"]] | None, Query()
     ] = None,
     cached: Annotated[bool | None, Query()] = None,
+    search: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> AlertFacets:
     """Per-value alert counts for the three multi-select filters. Read-only.
@@ -337,6 +381,10 @@ async def get_alert_facets(
             severity=None if facet == "severity" else severities,
             resolved=resolved,
             cached=cached,
+            # Never excluded: search is not a facet (there is no list of values to
+            # count), so it scopes every facet. The counts therefore describe the
+            # search results, which is what makes them usable while searching.
+            search=search,
         )
 
     counts: dict[str, dict[str, int]] = {}

@@ -2,6 +2,11 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { fetchStats } from "@/lib/api";
+<<<<<<< Updated upstream
+=======
+import { useWebSocket } from "@/lib/useWebSocket";
+import { NewAlertsBanner } from "@/components/alerts/NewAlertsBanner";
+>>>>>>> Stashed changes
 import { formatDuration, humanizeKey } from "@/lib/format";
 import {
   OUTCOME_FAILED,

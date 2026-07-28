@@ -8,6 +8,7 @@ import { capitalize } from "@/lib/format";
 import type { AlertFacets, AlertsFilter } from "@/lib/api";
 import { FilterDropdown, type FilterOption } from "@/components/alerts/FilterDropdown";
 import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
+import { SearchInput } from "@/components/alerts/SearchInput";
 import type { Department, ProcessedAlert, Severity } from "@/lib/types";
 
 // --- filter model ------------------------------------------------------------
@@ -47,6 +48,10 @@ export interface AlertFilters {
   level: LevelFilter;
   cached: CachedFilter;
   time: TimeFilter;
+  // Free-text substring search over message OR explanation, matched server-side
+  // (ILIKE). "" = no filter. Deliberately NOT restored from localStorage — see
+  // the rehydration comment in the pages.
+  search: string;
 }
 
 export const DEFAULT_ALERT_FILTERS: AlertFilters = {
@@ -57,6 +62,7 @@ export const DEFAULT_ALERT_FILTERS: AlertFilters = {
   level: "all",
   cached: "all",
   time: "all",
+  search: "",
 };
 
 const DEPARTMENTS: Department[] = ["networking", "devops", "backend", "database", "general"];
@@ -140,6 +146,10 @@ export function toAlertsQuery(filters: AlertFilters, resolved: boolean): AlertsF
     // "all" omits the param; otherwise "cached" -> true, "fresh" -> false.
     cached: filters.cached === "all" ? undefined : filters.cached === "cached",
     since: sinceForTimeFilter(filters.time),
+    // Trimmed, and blank collapses to undefined so the param is omitted rather
+    // than sent as an empty string (the backend ignores blanks either way, but a
+    // clean URL makes the request log readable).
+    search: filters.search.trim() || undefined,
     resolved,
   };
 }
@@ -219,7 +229,11 @@ export function sanitizeAlertFilters(raw: unknown): AlertFilters {
   const time = TIME_FILTERS.includes(obj.time as TimeFilter)
     ? (obj.time as TimeFilter)
     : "all";
-  return { department, severity, app_name, source, level, cached, time };
+  // Coerced to a string, defaulting to "". Note the pages force this back to ""
+  // when rehydrating, so a persisted search never reappears — this coercion is
+  // about not letting a non-string into the model, not about restoring it.
+  const search = typeof obj.search === "string" ? obj.search : "";
+  return { department, severity, app_name, source, level, cached, time, search };
 }
 
 /**
@@ -259,6 +273,22 @@ export function alertMatchesFilters(alert: ProcessedAlert, filters: AlertFilters
   // cache hits, so "cached" excludes them and "fresh" admits them — the same
   // partition the backend applies.
   if (filters.cached !== "all" && alert.cached !== (filters.cached === "cached")) return false;
+  // Mirrors the server's ILIKE over message OR explanation. Case-insensitive on
+  // both sides, and a live alert that doesn't contain the term is excluded — a
+  // search result set must not gain rows that don't match just because they
+  // arrived over the WebSocket. `explanation` is null on fallback alerts, so it
+  // contributes nothing and the message alone decides, exactly as `ILIKE` on NULL
+  // does server-side.
+  const term = filters.search.trim().toLowerCase();
+  if (term !== "") {
+    // Each field tested separately, NOT against a joined string: concatenating
+    // them would let a term straddle the boundary (message ending "…failed" plus
+    // an explanation starting "The …" would match "failed the"), which the
+    // server's OR-of-two-ILIKEs never would.
+    const inMessage = alert.message.toLowerCase().includes(term);
+    const inExplanation = (alert.explanation ?? "").toLowerCase().includes(term);
+    if (!inMessage && !inExplanation) return false;
+  }
   // `filters.time` is deliberately NOT checked, and adding it would be a bug.
   // This function guards LIVE alerts arriving over the WebSocket, which are by
   // definition "now" — and every window is `[now - span, now]`, so it always
@@ -331,6 +361,29 @@ const TIME_OPTIONS: FilterOption[] = TIME_FILTERS.map((t) => ({
 // sliver of row two peek through.
 const COLLAPSED_MAX_PX = 36;
 
+<<<<<<< Updated upstream
+=======
+/**
+ * True when any filter is set away from its default. Spelled out rather than
+ * looped over the defaults: the three multi-selects are arrays, and
+ * `value.department === DEFAULT_ALERT_FILTERS.department` compares references —
+ * always false for a fresh []. Exported so pages can tell "no results because
+ * of filters" apart from "no data at all" in their empty states.
+ */
+export function hasActiveFilters(value: AlertFilters): boolean {
+  return (
+    value.department.length > 0 ||
+    value.severity.length > 0 ||
+    value.app_name.length > 0 ||
+    value.source !== "all" ||
+    value.level !== "all" ||
+    value.cached !== "all" ||
+    value.time !== "all" ||
+    value.search.trim() !== ""
+  );
+}
+
+>>>>>>> Stashed changes
 export function AlertFilterBar({ value, onChange, facets }: AlertFilterBarProps) {
   // Spelled out rather than looped over the defaults: the three multi-selects are
   // arrays, and `value.department === DEFAULT_ALERT_FILTERS.department` compares
@@ -381,6 +434,16 @@ export function AlertFilterBar({ value, onChange, facets }: AlertFilterBarProps)
 
   return (
     <div style={{ marginBottom: semanticSpacing.lg }}>
+      {/* Search sits OUTSIDE the collapsible container on purpose: inside it, a
+          narrow window could push it onto the hidden second row, leaving the box
+          the user is typing in behind a "More Filters" toggle. */}
+      <div style={{ marginBottom: semanticSpacing.sm }}>
+        <SearchInput
+          value={value.search}
+          onChange={(search) => onChange({ ...value, search })}
+        />
+      </div>
+
       {/* flex-wrap makes the row count follow the viewport on its own; the cap
           below is what turns "wraps onto more rows" into "hidden behind a
           toggle". Ordered by triage relevance: what an on-call agent reaches

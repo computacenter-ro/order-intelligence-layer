@@ -704,6 +704,184 @@ def test_facets_is_not_shadowed_by_the_resolve_route():
     assert TestClient(app).get("/alerts/facets").status_code == 200
 
 
+# --- free-text search (ILIKE over message OR explanation) --------------------
+
+
+def _search_where(**kwargs) -> str:
+    sql = _compiled(build_alerts_query(None, None, None, **kwargs))
+    return sql.split("WHERE")[1] if "WHERE" in sql else ""
+
+
+def test_search_matches_message_or_explanation():
+    where = _search_where(search="timeout")
+    # An OR across both columns: the raw log line and the AI's plain-English take
+    # on it. Either hit is a match.
+    assert "message ILIKE" in where and "explanation ILIKE" in where
+    assert " OR " in where
+
+
+def test_search_is_a_substring_match():
+    stmt = build_alerts_query(None, None, None, search="timeout")
+    params = _params(stmt)
+    # %term% on BOTH columns — same pattern, so neither column is searched
+    # differently from the other.
+    assert params["message_1"] == "%timeout%"
+    assert params["explanation_1"] == "%timeout%"
+
+
+def test_search_is_case_insensitive():
+    """ILIKE, not LIKE — an agent typing "sap" must find "SAP submission failed"."""
+    where = _search_where(search="SaP")
+    assert "ILIKE" in where and "message LIKE" not in where
+    # The term is passed through verbatim; the case-insensitivity is the operator's
+    # job, so nothing is lowercased (which would break the ESCAPE handling).
+    assert _params(build_alerts_query(None, None, None, search="SaP"))["message_1"] == "%SaP%"
+
+
+def test_search_combines_with_another_filter():
+    stmt = build_alerts_query(None, ["backend"], None, search="margin")
+    where = _compiled(stmt).split("WHERE")[1]
+    # ANDed with the department IN, and the OR is parenthesised so it cannot
+    # swallow the other predicate (`dept IN (..) AND a OR b` would match every
+    # explanation hit regardless of department).
+    assert "department IN (" in where
+    assert "AND (" in where and "message ILIKE" in where
+
+
+def test_search_or_is_grouped_not_flattened():
+    """The precedence bug this guards: an unparenthesised OR turns
+    `A AND (m OR e)` into `(A AND m) OR e`, quietly ignoring every other filter
+    for rows that match on explanation.
+
+    Compiled with literal binds so the assertion reads the real SQL text — the
+    default paramstyle renders `%(message_1)s`, whose parens would make any
+    bracket-matching check meaningless.
+    """
+    sql = str(
+        build_alerts_query(None, None, "ai", level="ERROR", search="x").compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    where = " ".join(sql.split("WHERE")[1].split())
+    # The OR group opens right after an AND and closes at the end of the clause,
+    # so it binds as one unit rather than splitting the surrounding predicates.
+    assert "AND (alerts.message ILIKE" in where
+    assert "OR alerts.explanation ILIKE" in where
+    assert where.endswith(")")
+
+
+@pytest.mark.parametrize("search", ["", "   ", "\t\n", None])
+def test_blank_search_applies_no_filter(search):
+    """A cleared search box is "no filter", never a match-everything %%."""
+    assert _search_where(search=search) == ""
+    assert alert_filter_conditions(None, None, None, search=search) == []
+
+
+def test_search_escapes_like_wildcards():
+    """% and _ are LIKE metacharacters and both occur in this corpus (margin
+    percentages, snake_case names). Unescaped, "12%" would match every alert."""
+    params = _params(build_alerts_query(None, None, None, search="12% order_id"))
+    assert params["message_1"] == r"%12\% order\_id%"
+
+
+def test_search_escapes_the_escape_character_first():
+    """A literal backslash must be doubled BEFORE % and _ get their own, or the
+    escaping corrupts its own output."""
+    params = _params(build_alerts_query(None, None, None, search=r"a\b"))
+    assert params["message_1"] == r"%a\\b%"
+
+
+def test_search_strips_surrounding_whitespace():
+    params = _params(build_alerts_query(None, None, None, search="  sap  "))
+    assert params["message_1"] == "%sap%"
+
+
+# --- search over HTTP --------------------------------------------------------
+
+
+def test_get_alerts_search_param_reaches_the_query():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"search": "aborted"})
+    assert r.status_code == 200
+    stmt = session.statements[0]
+    assert "message ILIKE" in _compiled(stmt)
+    assert _params(stmt)["message_1"] == "%aborted%"
+
+
+def test_get_alerts_search_is_a_free_string_not_422():
+    """Any text is a valid search — including one that matches nothing."""
+    _use([_FakeResult(items=[])])
+    for term in ["cc-future-service", "%%%", "'; DROP TABLE alerts; --", "ünïcødé"]:
+        _use([_FakeResult(items=[])])
+        assert TestClient(app).get("/alerts", params={"search": term}).status_code == 200
+
+
+def test_get_alerts_search_is_bound_not_interpolated():
+    """The term travels as a bound parameter, so quotes/semicolons are data."""
+    session = _use([_FakeResult(items=[])])
+    hostile = "'; DROP TABLE alerts; --"
+    TestClient(app).get("/alerts", params={"search": hostile})
+    stmt = session.statements[0]
+    assert "DROP TABLE" not in _compiled(stmt)
+    assert _params(stmt)["message_1"] == f"%{hostile}%"
+
+
+def test_get_alerts_blank_search_applies_no_filter():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"search": "   "})
+    assert r.status_code == 200
+    assert "ILIKE" not in _compiled(session.statements[0])
+
+
+def test_get_alerts_search_combines_with_filters_over_http():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get(
+        "/alerts", params={"search": "margin", "department": "backend", "level": "ERROR"}
+    )
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "message ILIKE" in sql and "department IN (" in sql and "level =" in sql
+
+
+def test_facets_respect_the_search():
+    """Search is not a facet — there is no list of values to count — so it scopes
+    EVERY facet. Counts while searching must describe the search results."""
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets", params={"search": "timeout"})
+    assert r.status_code == 200
+    assert len(session.statements) == 3
+    for stmt in session.statements:
+        sql = _compiled(stmt)
+        assert "message ILIKE" in sql and "explanation ILIKE" in sql
+        assert _params(stmt)["message_1"] == "%timeout%"
+
+
+def test_facets_search_is_never_excluded_by_the_exclude_self_rule():
+    """Exclude-self drops a facet's OWN filter; search has no facet of its own, so
+    it must survive on all three even when every other filter is ticked."""
+    session = _facet_session()
+    r = TestClient(app).get(
+        "/alerts/facets",
+        params={
+            "search": "sap",
+            "severity": ["critical"],
+            "department": ["backend"],
+            "app_name": ["cc-outbound-osw"],
+        },
+    )
+    assert r.status_code == 200
+    for stmt in session.statements:
+        assert "message ILIKE" in _compiled(stmt)
+
+
+def test_facets_blank_search_applies_no_filter():
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets", params={"search": ""})
+    assert r.status_code == 200
+    assert "ILIKE" not in _compiled(session.statements[0])
+
+
 # --- filter-condition helper (shared by /alerts and /alerts/facets) ----------
 
 

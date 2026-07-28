@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { Suspense, useCallback, useEffect, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { ChatCircleDotsIcon } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { fetchAlerts, fetchJourney } from "@/lib/api";
@@ -14,12 +14,29 @@ import { JourneyTimeline } from "@/components/journeys/JourneyTimeline";
 import type { Journey, ProcessedAlert, WsEvent } from "@/lib/types";
 
 export default function JourneyDetailPage() {
+  return (
+    <Suspense fallback={null}>
+      <JourneyDetailPageContent />
+    </Suspense>
+  );
+}
+
+function JourneyDetailPageContent() {
   const params = useParams<{ journeyId: string }>();
   const router = useRouter();
   const { openChat } = useChat();
+  const searchParams = useSearchParams();
   const [journey, setJourney] = useState<Journey | null>(null);
   const [journeyAlerts, setJourneyAlerts] = useState<ProcessedAlert[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Set when this page was reached from an incident's order list (see
+  // OrderGroupRow), so "back" returns to that incident instead of the
+  // generic journeys list.
+  const fromIncidentId =
+    searchParams.get("from") === "incident" ? searchParams.get("incidentId") : null;
+  const backHref = fromIncidentId ? `/incidents/${fromIncidentId}` : "/journeys";
+  const backLabel = fromIncidentId ? "← Back to Incident" : "← Back to Journeys";
 
   useEffect(() => {
     // Reset loading when journeyId changes (e.g. navigating between journeys) —
@@ -37,6 +54,8 @@ export default function JourneyDetailPage() {
 
   const handleEvent = useCallback(
     (event: WsEvent) => {
+      // this page has no use for incident events
+      if (event.type === "incident.new" || event.type === "incident.updated") return;
       if (event.data.journey_id !== params.journeyId) return;
       if (event.type === "journey.completed") {
         setJourney(event.data);
@@ -61,8 +80,8 @@ export default function JourneyDetailPage() {
     return (
       <div>
         <div style={{ marginBottom: "16px" }}>
-          <Button variant="ghost" onClick={() => router.push("/journeys")}>
-            ← Back to Journeys
+          <Button variant="ghost" onClick={() => router.push(backHref)}>
+            {backLabel}
           </Button>
         </div>
         <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: 0 }}>
@@ -78,8 +97,8 @@ export default function JourneyDetailPage() {
   return (
     <div>
       <div style={{ marginBottom: "16px" }}>
-        <Button variant="ghost" onClick={() => router.push("/journeys")}>
-          ← Back to Journeys
+        <Button variant="ghost" onClick={() => router.push(backHref)}>
+          {backLabel}
         </Button>
       </div>
       {/* H1 and the page's single primary action share a row. */}

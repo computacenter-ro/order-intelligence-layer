@@ -183,6 +183,8 @@ def _alert_from_payload(log: LogLine, payload: semcache.CachePayload) -> Process
         except (ValueError, TypeError):
             severity = None
     explanation = semcache.refill(payload.normalized_explanation, log)
+    deps_sc = semcache.get()
+    embedding = deps_sc.cache.embed(log.message) if deps_sc is not None else None
     return ProcessedAlert(
         alert_id=str(uuid.uuid4()),
         emitted_at=datetime.now(timezone.utc),
@@ -193,6 +195,7 @@ def _alert_from_payload(log: LogLine, payload: semcache.CachePayload) -> Process
         confidence=payload.confidence,
         source="ai",       # a cache hit is still an AI answer (routing unchanged)
         cached=True,
+        embedding=embedding,
     )
 
 
@@ -222,13 +225,19 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
     """Assemble the ProcessedAlert from the final pipeline state.
 
     AI only when we have BOTH an explanation and a department; otherwise a
-    fully-null fallback pass-through.
+    fully-null fallback pass-through. The embedding is attached on BOTH
+    branches — it's entirely local (no LLM involved), so it must keep working
+    even when everything else fell back (CLAUDE.md: "must remain useful with
+    the LLM completely down").
     """
     explanation = state.get("explanation")
     department = state.get("department")
     severity = state.get("severity")
     confidence = state.get("confidence")
     is_ai = not state.get("failed") and explanation is not None and department is not None
+
+    deps_sc = semcache.get()
+    embedding = deps_sc.cache.embed(log.message) if deps_sc is not None else None
 
     if is_ai:
         return ProcessedAlert(
@@ -240,6 +249,7 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
             severity=severity,
             confidence=confidence,
             source="ai",
+            embedding=embedding,
         )
     return ProcessedAlert(
         alert_id=str(uuid.uuid4()),
@@ -250,4 +260,5 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
         severity=None,
         confidence=None,
         source="fallback",
+        embedding=embedding,
     )

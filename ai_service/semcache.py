@@ -420,6 +420,21 @@ class SemanticCache:
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)  # evict least-recently-used
 
+    # --- clustering support (backend/incidents.py) ----------------------------
+    def embed(self, message: str) -> list[float] | None:
+        """A masked-message embedding for the incident-clustering feature.
+
+        Independent of this cache's lookup/store lifecycle — never reads or
+        writes ``_entries``. Uses the same ``normalize()`` masking and the same
+        loaded encoder, but this is a genuinely NEW ``encode()`` call every
+        time: the exact-match cache-hit path in :meth:`lookup` skips embedding
+        entirely, so there is nothing to reuse for free here. Returns ``None``
+        when no encoder is configured (cache disabled).
+        """
+        if not self.enabled:
+            return None
+        return _as_floats(self._encoder.encode(normalize(message)))
+
     # --- persistence (to the existing Redis, no new infra) --------------------
     def dump(self) -> str:
         """Serialize the whole cache to a JSON string (for Redis)."""

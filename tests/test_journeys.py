@@ -33,6 +33,7 @@ from backend.journeys import (
     ENRICHMENT_FAILED,
     AUTH_FAILED,
     SAP_SUBMISSION_FAILED,
+    STALLED_TIMEOUT,
 )
 
 import pytest
@@ -284,7 +285,7 @@ from backend.stitching import Stitcher  # noqa: F401 — used via JourneyAssembl
 
 FIXTURE = (
     Path(__file__).resolve().parent.parent
-    / "pipeline" / "data" / "mock-order-flows-v3.json"
+    / "pipeline" / "data" / "mock-order-flows-v4.json"
 )
 
 # The order-creation-response ack: inbound's ResponseListener line. In v3 it
@@ -333,19 +334,41 @@ BRIDGE_FLOWS = [f for f in FLOWS if f["bridge_idx"] is not None]
 BRIDGE_FLOW_IDS = [f"scenario-{f['scenario']}-{f['outcome']}" for f in BRIDGE_FLOWS]
 
 
-def _assemble(batches: list[list[LogLine]]) -> tuple[JourneyAssembler, list]:
+def _assemble(
+    batches: list[list[LogLine]], *, now: datetime | None = None
+) -> tuple[JourneyAssembler, list]:
     """Feed batches ("polls") through stitching + detection; no DB/broker.
 
     Returns the assembler and the completions from a single final evaluate().
-    A real message terminal always wins over the stall clock, so ``now`` is
-    irrelevant here; we pin it to the last timestamp for determinism.
+    For a message-driven outcome (SUCCESS/FAILED) a real terminal always wins
+    over the stall clock, so pinning ``now`` to the last log's own timestamp is
+    enough — the default here. A TIMED_OUT flow (scenario 15) has no message
+    terminal at all, so its completion only appears once ``now`` actually
+    crosses the stall boundary — callers pass an explicit ``now`` for that case
+    (see :func:`_terminal_now`).
     """
     a = JourneyAssembler()
     for batch in batches:
         a.add(batch)
-    all_ts = [log.timestamp for batch in batches for log in batch]
-    completions = a.evaluate(now=max(all_ts) if all_ts else None)
+    if now is None:
+        all_ts = [log.timestamp for batch in batches for log in batch]
+        now = max(all_ts) if all_ts else None
+    completions = a.evaluate(now=now)
     return a, completions
+
+
+def _terminal_now(flow: dict) -> datetime:
+    """The clock value at which ``flow``'s journey is expected to complete.
+
+    Message-driven outcomes complete the instant their last log lands, so the
+    last log's own timestamp is enough. TIMED_OUT (scenario 15) never hits a
+    message terminal by definition — it only resolves once the stall clock
+    crosses STALLED_TIMEOUT, so ``now`` must be pushed past that boundary.
+    """
+    last_ts = max(log.timestamp for log in flow["logs"])
+    if flow["outcome"] == TIMED_OUT:
+        return last_ts + timedelta(seconds=STALLED_TIMEOUT + 1)
+    return last_ts
 
 
 def _split(logs: list[LogLine], n: int) -> list[list[LogLine]]:
@@ -354,9 +377,9 @@ def _split(logs: list[LogLine], n: int) -> list[list[LogLine]]:
     return [logs[i : i + size] for i in range(0, len(logs), size)]
 
 
-def test_fixture_loads_ten_flows():
-    assert len(FLOWS) == 10
-    assert {f["scenario"] for f in FLOWS} == set(range(1, 11))
+def test_fixture_loads_fifteen_flows():
+    assert len(FLOWS) == 15
+    assert {f["scenario"] for f in FLOWS} == set(range(1, 16))
 
 
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
@@ -369,18 +392,24 @@ def test_flow_produces_exactly_one_journey(flow):
 
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_flow_outcome_matches_fixture(flow):
-    a, completions = _assemble([flow["logs"]])
+    a, completions = _assemble([flow["logs"]], now=_terminal_now(flow))
     assert len(completions) == 1
     assert completions[0].outcome == flow["outcome"]
-    # and pure detection agrees directly on the stitched, ordered logs
-    assert detect_terminal(a.stitcher.journeys[0].logs) == flow["outcome"]
+    # Pure detection agrees directly on the stitched, ordered logs — except for
+    # TIMED_OUT (scenario 15), which by definition has NO message terminal
+    # (that unrecognized-ness is exactly why it only resolves via the stall
+    # clock, not the shared clustering novel/embedding path's reason to exist).
+    if flow["outcome"] == TIMED_OUT:
+        assert detect_terminal(a.stitcher.journeys[0].logs) is None
+    else:
+        assert detect_terminal(a.stitcher.journeys[0].logs) == flow["outcome"]
 
 
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_flow_stitches_across_multiple_polls(flow):
     # The same events, delivered in several separate polls, still assemble into
     # exactly one journey with the same outcome (incremental / "lazy" assembly).
-    a, completions = _assemble(_split(flow["logs"], 4))
+    a, completions = _assemble(_split(flow["logs"], 4), now=_terminal_now(flow))
     assert len(a.stitcher.journeys) == 1
     assert len(a.stitcher.journeys[0].logs) == len(flow["logs"])
     assert len(completions) == 1
@@ -396,9 +425,10 @@ def test_flow_stitches_with_poll_boundary_at_the_bridge(flow):
     logs, b = flow["logs"], flow["bridge_idx"]
     batches = [logs[:b], logs[b : b + 1], logs[b + 1 :]]
     batches = [batch for batch in batches if batch]
-    a, completions = _assemble(batches)
+    a, completions = _assemble(batches, now=_terminal_now(flow))
     assert len(a.stitcher.journeys) == 1
     assert len(a.stitcher.journeys[0].logs) == len(logs)
+    assert len(completions) == 1
     assert completions[0].outcome == flow["outcome"]
 
 
@@ -413,7 +443,7 @@ def test_full_redelivery_is_idempotent(flow):
     assert a.add(logs) == []  # every re-delivered log_id is a duplicate → no-op
     assert len(a.stitcher.journeys) == 1
     assert len(a.stitcher.journeys[0].logs) == len(logs)
-    [completion] = a.evaluate(now=max(log.timestamp for log in logs))
+    [completion] = a.evaluate(now=_terminal_now(flow))
     assert completion.outcome == flow["outcome"]
 
 
@@ -509,9 +539,10 @@ def test_overlapping_polls_do_not_duplicate(flow):
     mid = len(logs) // 2
     overlap = min(len(logs), mid + 3)
     batches = [logs[:overlap], logs[mid:]]  # logs[mid:overlap] delivered twice
-    a, completions = _assemble(batches)
+    a, completions = _assemble(batches, now=_terminal_now(flow))
     assert len(a.stitcher.journeys) == 1
     assert len(a.stitcher.journeys[0].logs) == len(logs)
+    assert len(completions) == 1
     assert completions[0].outcome == flow["outcome"]
 
 

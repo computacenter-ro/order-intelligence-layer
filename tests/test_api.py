@@ -25,7 +25,12 @@ from sqlalchemy.dialects import postgresql
 
 from backend.main import app
 from backend.db import get_session, Alert, Journey, JourneyEvent
-from backend.api import build_alerts_query, build_journeys_query
+from backend.api import (
+    alert_filter_conditions,
+    build_alert_facet_query,
+    build_alerts_query,
+    build_journeys_query,
+)
 from backend.pagination import apply_keyset, build_page, decode_cursor, encode_cursor
 from backend.auth import get_current_user
 
@@ -134,6 +139,26 @@ def _journey(**over) -> Journey:
     return Journey(**base)
 
 
+from backend.schemas import IncidentOut
+
+
+def test_incident_out_from_orm_instance():
+    from backend.db import Incident
+
+    incident = Incident(
+        incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
+        failing_service="SPT", error_token="SocketTimeoutException",
+        title="ENRICHMENT_FAILED — SPT", department="devops", status="open",
+        first_ts=datetime(2026, 7, 26, 8, 0, 0, tzinfo=UTC),
+        last_ts=datetime(2026, 7, 26, 8, 5, 0, tzinfo=UTC),
+        primary_alert_id="a1", alert_count=12, journey_count=3,
+    )
+    out = IncidentOut.model_validate(incident)
+    assert out.incident_id == "inc-1"
+    assert out.journey_count == 3
+    assert out.status == "open"
+
+
 def _event(**over) -> JourneyEvent:
     base = dict(
         journey_id="J1",
@@ -169,9 +194,9 @@ def test_resolve_alert_requires_auth():
 def test_alerts_query_applies_all_filters():
     # build_alerts_query is filters-only now — ordering is the paginator's job
     # (apply_keyset), so no ORDER BY is emitted here.
-    sql = _compiled(build_alerts_query(datetime(2026, 7, 20, tzinfo=UTC), "backend", "ai"))
+    sql = _compiled(build_alerts_query(datetime(2026, 7, 20, tzinfo=UTC), ["backend"], "ai"))
     assert "emitted_at >=" in sql
-    assert "department =" in sql
+    assert "department IN (" in sql
     assert "source =" in sql
     assert "ORDER BY" not in sql
 
@@ -183,8 +208,8 @@ def test_alerts_query_no_filters_has_no_where_or_order():
 
 
 def test_alerts_query_department_only():
-    sql = _compiled(build_alerts_query(None, "backend", None))
-    assert "department =" in sql
+    sql = _compiled(build_alerts_query(None, ["backend"], None))
+    assert "department IN (" in sql
     assert "source =" not in sql
     assert "emitted_at >=" not in sql
 
@@ -192,54 +217,54 @@ def test_alerts_query_department_only():
 def test_alerts_query_source_only():
     sql = _compiled(build_alerts_query(None, None, "fallback"))
     assert "source =" in sql
-    assert "department =" not in sql
+    assert "department IN (" not in sql
     assert "emitted_at >=" not in sql
 
 
 def test_alerts_query_department_and_source_combination():
-    sql = _compiled(build_alerts_query(None, "devops", "ai"))
-    assert "department =" in sql and "source =" in sql
+    sql = _compiled(build_alerts_query(None, ["devops"], "ai"))
+    assert "department IN (" in sql and "source =" in sql
 
 
 def test_alerts_query_level_only():
     sql = _compiled(build_alerts_query(None, None, None, level="ERROR"))
     assert "level =" in sql
-    assert "app_name =" not in sql
-    assert "department =" not in sql and "source =" not in sql
+    assert "app_name IN (" not in sql
+    assert "department IN (" not in sql and "source =" not in sql
 
 
 def test_alerts_query_app_name_only():
-    sql = _compiled(build_alerts_query(None, None, None, app_name="cc-order-engine"))
-    assert "app_name =" in sql
+    sql = _compiled(build_alerts_query(None, None, None, app_name=["cc-order-engine"]))
+    assert "app_name IN (" in sql
     assert "level =" not in sql
-    assert "department =" not in sql and "source =" not in sql
+    assert "department IN (" not in sql and "source =" not in sql
 
 
 def test_alerts_query_all_filters_including_level_and_app_name():
     sql = _compiled(
         build_alerts_query(
-            datetime(2026, 7, 20, tzinfo=UTC), "backend", "ai",
-            level="WARN", app_name="cc-checker-service",
+            datetime(2026, 7, 20, tzinfo=UTC), ["backend"], "ai",
+            level="WARN", app_name=["cc-checker-service"],
         )
     )
     assert "emitted_at >=" in sql
-    assert "department =" in sql and "source =" in sql
-    assert "level =" in sql and "app_name =" in sql
+    assert "department IN (" in sql and "source =" in sql
+    assert "level =" in sql and "app_name IN (" in sql
     assert "ORDER BY" not in sql
 
 
 def test_alerts_query_severity_only():
-    sql = _compiled(build_alerts_query(None, None, None, severity="critical"))
-    assert "severity =" in sql
+    sql = _compiled(build_alerts_query(None, None, None, severity=["critical"]))
+    assert "severity IN (" in sql
     assert "level =" not in sql
-    assert "department =" not in sql and "source =" not in sql
+    assert "department IN (" not in sql and "source =" not in sql
 
 
 def test_alerts_query_cached_true_only():
     sql = _compiled(build_alerts_query(None, None, None, cached=True))
     assert "cached =" in sql
     assert "source =" not in sql
-    assert "severity =" not in sql
+    assert "severity IN (" not in sql
 
 
 def test_alerts_query_cached_false_is_a_real_filter_not_omitted():
@@ -283,6 +308,446 @@ def test_alert_out_coerces_unflushed_none_cached_to_false():
     assert AlertOut.model_validate(row).cached is False
 
 
+# --- multi-valued filters (department / app_name / severity) ------------------
+#
+# These three are lists: a non-empty list ORs within the category (SQL IN), while
+# None *and* an empty list mean "no filter". The empty case is the load-bearing
+# one — the UI's "nothing ticked" state must show everything, and an IN () would
+# instead match nothing and silently empty the feed.
+
+
+def _query_on(column: str, values: list[str]):
+    """build_alerts_query with exactly one multi-valued filter set."""
+    return build_alerts_query(
+        None,
+        values if column == "department" else None,
+        None,
+        app_name=values if column == "app_name" else None,
+        severity=values if column == "severity" else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "column, values",
+    [
+        ("department", ["backend", "devops"]),
+        ("app_name", ["cc-spt-service", "cc-rsm-service"]),
+        ("severity", ["critical", "high"]),
+    ],
+)
+def test_alerts_query_multiple_values_become_an_in_clause(column, values):
+    stmt = _query_on(column, values)
+    assert f"{column} IN (" in _compiled(stmt)
+    # The bound parameter carries every value, so the predicate is a real OR
+    # rather than the last value quietly winning.
+    assert _params(stmt)[f"{column}_1"] == values
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [("department", "database"), ("app_name", "cc-track-trace"), ("severity", "low")],
+)
+def test_alerts_query_single_value_still_uses_in(column, value):
+    """One selection is an IN with one element — not a special-cased ``=``."""
+    stmt = _query_on(column, [value])
+    assert f"{column} IN (" in _compiled(stmt)
+    assert _params(stmt)[f"{column}_1"] == [value]
+
+
+def test_alerts_query_empty_lists_apply_no_filter():
+    """Nothing ticked = show everything. An IN () here would match no rows."""
+    sql = _compiled(build_alerts_query(None, [], None, app_name=[], severity=[]))
+    assert "WHERE" not in sql
+
+
+def test_alerts_query_empty_lists_do_not_suppress_other_filters():
+    # An empty multi-filter must drop out on its own without taking the
+    # single-valued predicates with it.
+    sql = _compiled(
+        build_alerts_query(None, [], "ai", level="ERROR", app_name=[], severity=[])
+    )
+    assert "source =" in sql and "level =" in sql
+    assert "department IN (" not in sql
+    assert "app_name IN (" not in sql and "severity IN (" not in sql
+
+
+def test_alerts_query_absent_lists_apply_no_filter():
+    sql = _compiled(build_alerts_query(None, None, None, app_name=None, severity=None))
+    assert "WHERE" not in sql
+
+
+def test_alerts_query_multi_filters_compose_with_each_other_and_singles():
+    stmt = build_alerts_query(
+        datetime(2026, 7, 20, tzinfo=UTC),
+        ["backend", "database"],
+        "ai",
+        level="ERROR",
+        app_name=["cc-order-engine"],
+        severity=["critical", "high"],
+        cached=True,
+    )
+    sql = _compiled(stmt)
+    assert "emitted_at >=" in sql
+    assert "department IN (" in sql and "app_name IN (" in sql and "severity IN (" in sql
+    assert "source =" in sql and "level =" in sql and "cached =" in sql
+
+
+# --- multi-valued filters over HTTP (repeated query params) ------------------
+
+
+def test_get_alerts_repeated_department_params_become_one_in_clause():
+    session = _use([_FakeResult(items=[])])
+    # httpx encodes a list value as ?department=backend&department=devops
+    r = TestClient(app).get("/alerts", params={"department": ["backend", "devops"]})
+    assert r.status_code == 200
+    stmt = session.statements[0]
+    assert "department IN (" in _compiled(stmt)
+    assert _params(stmt)["department_1"] == ["backend", "devops"]
+
+
+def test_get_alerts_repeated_severity_params_become_one_in_clause():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"severity": ["critical", "low"]})
+    assert r.status_code == 200
+    stmt = session.statements[0]
+    assert "severity IN (" in _compiled(stmt)
+    assert _params(stmt)["severity_1"] == ["critical", "low"]
+
+
+def test_get_alerts_repeated_app_name_params_become_one_in_clause():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get(
+        "/alerts", params={"app_name": ["cc-spt-service", "cc-jam-service"]}
+    )
+    assert r.status_code == 200
+    stmt = session.statements[0]
+    assert "app_name IN (" in _compiled(stmt)
+    assert _params(stmt)["app_name_1"] == ["cc-spt-service", "cc-jam-service"]
+
+
+def test_get_alerts_omitted_multi_params_apply_no_filter():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts")
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "department IN (" not in sql
+    assert "app_name IN (" not in sql and "severity IN (" not in sql
+
+
+def test_get_alerts_all_three_multi_filters_at_once():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get(
+        "/alerts",
+        params={
+            "department": ["backend", "devops"],
+            "severity": ["critical", "high"],
+            "app_name": ["cc-order-engine", "cc-checker-service"],
+        },
+    )
+    assert r.status_code == 200
+    params = _params(session.statements[0])
+    assert params["department_1"] == ["backend", "devops"]
+    assert params["severity_1"] == ["critical", "high"]
+    assert params["app_name_1"] == ["cc-order-engine", "cc-checker-service"]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"department": ["backend", "marketing"]},   # one bad value in the list
+        {"department": ["marketing", "backend"]},   # order must not matter
+        {"severity": ["critical", "urgent"]},
+        {"severity": ["high", ""]},                  # empty string is not a value
+    ],
+)
+def test_get_alerts_one_invalid_value_in_a_list_is_422(params):
+    """Validation is per element — a good value does not launder a bad one."""
+    _use([_FakeResult(items=[])])
+    assert TestClient(app).get("/alerts", params=params).status_code == 422
+
+
+def test_get_alerts_multiple_unknown_app_names_are_not_422():
+    # app_name stays a free string, so unrecognised services are a valid (empty)
+    # query even in a list — the roster can grow without a code change.
+    _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/alerts", params={"app_name": ["cc-future-one", "cc-future-two"]})
+    assert r.status_code == 200
+
+
+# --- GET /alerts/facets ------------------------------------------------------
+#
+# Contextual counts for the three multi-select filters. The whole point is the
+# EXCLUDE-SELF rule: each facet is counted with every active filter except its
+# own, so ticking one department doesn't collapse the department list to that one
+# value (which would leave the user no way to see or reach the others).
+
+
+class _FacetRows:
+    """One grouped result: `.all()` yields (value, count) tuples."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def all(self):
+        return list(self._rows)
+
+
+def _facet_session(severity=(), department=(), app_name=()) -> _FakeSession:
+    """Seed the three facet queries in the order the route runs them."""
+    return _use(
+        [_FacetRows(severity), _FacetRows(department), _FacetRows(app_name)]
+    )
+
+
+def test_facets_requires_auth():
+    app.dependency_overrides.clear()  # drop the autouse stub user
+    assert TestClient(app).get("/alerts/facets").status_code == 401
+
+
+def test_facets_returns_a_count_map_per_facet():
+    _facet_session(
+        severity=[("critical", 3), ("low", 1)],
+        department=[("backend", 2), ("devops", 2)],
+        app_name=[("cc-order-engine", 4)],
+    )
+    r = TestClient(app).get("/alerts/facets")
+    assert r.status_code == 200
+    assert r.json() == {
+        "severity": {"critical": 3, "low": 1},
+        "department": {"backend": 2, "devops": 2},
+        "app_name": {"cc-order-engine": 4},
+    }
+
+
+def test_facets_response_keys_are_exactly_the_schema():
+    _facet_session()
+    body = TestClient(app).get("/alerts/facets").json()
+    assert set(body) == {"severity", "department", "app_name"}
+    # No rows -> empty maps, not nulls. A client reads a missing key as 0.
+    assert body == {"severity": {}, "department": {}, "app_name": {}}
+
+
+def test_facets_runs_one_grouped_query_per_facet():
+    session = _facet_session()
+    TestClient(app).get("/alerts/facets")
+    assert len(session.statements) == 3
+    for stmt, column in zip(session.statements, ["severity", "department", "app_name"]):
+        sql = _compiled(stmt)
+        assert f"GROUP BY alerts.{column}" in sql
+        assert "count(*)" in sql
+
+
+def test_facets_skips_nulls():
+    """A null severity/department means the LLM never rated/routed the alert —
+    there is no filter option for it, so there is nothing to attach a count to."""
+    session = _facet_session()
+    TestClient(app).get("/alerts/facets")
+    for stmt, column in zip(session.statements, ["severity", "department", "app_name"]):
+        assert f"{column} IS NOT NULL" in _compiled(stmt)
+
+
+def test_facets_counts_respect_the_other_filters():
+    """With level=ERROR active, every facet counts only ERROR alerts."""
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets", params={"level": "ERROR"})
+    assert r.status_code == 200
+    for stmt in session.statements:
+        assert "level =" in _compiled(stmt)
+
+
+def test_facets_exclude_self_department():
+    """department=backend ticked: the department facet must NOT filter by
+    department (so all departments still get counts), while severity and app_name
+    must."""
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets", params={"department": "backend"})
+    assert r.status_code == 200
+    severity_sql, department_sql, app_name_sql = (
+        _compiled(s) for s in session.statements
+    )
+    assert "department IN (" not in department_sql   # exclude-self
+    assert "department IN (" in severity_sql         # other facets stay scoped
+    assert "department IN (" in app_name_sql
+
+
+def test_facets_exclude_self_severity():
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets", params={"severity": "critical"})
+    assert r.status_code == 200
+    severity_sql, department_sql, app_name_sql = (
+        _compiled(s) for s in session.statements
+    )
+    assert "severity IN (" not in severity_sql
+    assert "severity IN (" in department_sql
+    assert "severity IN (" in app_name_sql
+
+
+def test_facets_exclude_self_app_name():
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets", params={"app_name": "cc-spt-service"})
+    assert r.status_code == 200
+    severity_sql, department_sql, app_name_sql = (
+        _compiled(s) for s in session.statements
+    )
+    assert "app_name IN (" not in app_name_sql
+    assert "app_name IN (" in severity_sql
+    assert "app_name IN (" in department_sql
+
+
+def test_facets_exclude_self_is_per_facet_not_global():
+    """All three ticked at once: each facet drops exactly its own filter and keeps
+    the other two — the failure mode being a facet that drops all three (counts
+    ignore context) or none (counts collapse to the selection)."""
+    session = _facet_session()
+    r = TestClient(app).get(
+        "/alerts/facets",
+        params={
+            "severity": ["critical"],
+            "department": ["backend"],
+            "app_name": ["cc-order-engine"],
+        },
+    )
+    assert r.status_code == 200
+    severity_sql, department_sql, app_name_sql = (
+        _compiled(s) for s in session.statements
+    )
+    assert "severity IN (" not in severity_sql
+    assert "department IN (" in severity_sql and "app_name IN (" in severity_sql
+
+    assert "department IN (" not in department_sql
+    assert "severity IN (" in department_sql and "app_name IN (" in department_sql
+
+    assert "app_name IN (" not in app_name_sql
+    assert "severity IN (" in app_name_sql and "department IN (" in app_name_sql
+
+
+def test_facets_multi_valued_filters_or_within_the_category():
+    session = _facet_session()
+    r = TestClient(app).get(
+        "/alerts/facets", params={"department": ["backend", "devops"]}
+    )
+    assert r.status_code == 200
+    # The severity facet is scoped by BOTH departments, not just the last one.
+    assert _params(session.statements[0])["department_1"] == ["backend", "devops"]
+
+
+def test_facets_passes_every_filter_through():
+    session = _facet_session()
+    r = TestClient(app).get(
+        "/alerts/facets",
+        params={
+            "since": "2026-07-20T00:00:00+00:00",
+            "source": "ai",
+            "level": "ERROR",
+            "resolved": "false",
+            "cached": "true",
+        },
+    )
+    assert r.status_code == 200
+    sql = _compiled(session.statements[0])
+    assert "emitted_at >=" in sql
+    assert "source =" in sql and "level =" in sql
+    assert "is_resolved =" in sql and "cached =" in sql
+
+
+def test_facets_no_filters_only_the_null_guard():
+    session = _facet_session()
+    r = TestClient(app).get("/alerts/facets")
+    assert r.status_code == 200
+    # The sole predicate is the IS NOT NULL guard — nothing else narrows it.
+    sql = _compiled(session.statements[0])
+    where = sql.split("WHERE")[1].split("GROUP BY")[0]
+    assert where.strip() == "alerts.severity IS NOT NULL"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"department": "marketing"},
+        {"severity": "urgent"},
+        {"severity": ["critical", "urgent"]},
+        {"level": "INFO"},
+        {"source": "human"},
+        {"cached": "maybe"},
+    ],
+)
+def test_facets_invalid_filter_value_is_422(params):
+    """Same validation as /alerts — the params are typed identically."""
+    _facet_session()
+    assert TestClient(app).get("/alerts/facets", params=params).status_code == 422
+
+
+def test_facets_accepts_the_same_filter_params_as_alerts():
+    """Drift guard: a filter added to GET /alerts must be added here too, or the
+    facet counts would quietly ignore it. /alerts/facets adds nothing of its own
+    and only omits the paging params (it aggregates rather than pages)."""
+    routes = {
+        (r.path, tuple(sorted(r.methods))): r
+        for r in app.routes
+        if getattr(r, "path", None) in ("/alerts", "/alerts/facets")
+    }
+    alerts = routes[("/alerts", ("GET",))]
+    facets = routes[("/alerts/facets", ("GET",))]
+
+    def query_params(route) -> set[str]:
+        return {p.name for p in route.dependant.query_params}
+
+    paging = {"limit", "cursor", "sort"}
+    assert query_params(facets) == query_params(alerts) - paging
+
+
+def test_facets_is_not_shadowed_by_the_resolve_route():
+    """"facets" must not be parsed as an {alert_id}. The resolve route is PATCH
+    /alerts/{alert_id}/resolve so the shapes differ, but a future GET
+    /alerts/{alert_id} would shadow this path — this pins the current behaviour."""
+    _facet_session()
+    assert TestClient(app).get("/alerts/facets").status_code == 200
+
+
+# --- filter-condition helper (shared by /alerts and /alerts/facets) ----------
+
+
+def test_alert_filter_conditions_returns_one_clause_per_active_filter():
+    assert alert_filter_conditions(None, None, None) == []
+    assert len(alert_filter_conditions(None, ["backend"], "ai", level="ERROR")) == 3
+    assert (
+        len(
+            alert_filter_conditions(
+                datetime(2026, 7, 20, tzinfo=UTC),
+                ["backend"],
+                "ai",
+                level="ERROR",
+                app_name=["cc-order-engine"],
+                severity=["critical"],
+                resolved=False,
+                cached=True,
+            )
+        )
+        == 8
+    )
+
+
+def test_alert_filter_conditions_ignores_empty_lists():
+    assert alert_filter_conditions(None, [], None, app_name=[], severity=[]) == []
+
+
+def test_build_alerts_query_and_facets_share_the_same_conditions():
+    """The refactor's payoff: identical filters produce identical predicates in
+    both consumers, so the feed and its facet counts can never disagree about
+    what a filter means."""
+    kwargs = dict(level="ERROR", app_name=["cc-order-engine"], severity=["critical"])
+    conditions = alert_filter_conditions(None, ["backend"], "ai", **kwargs)
+    feed_where = _compiled(
+        build_alerts_query(None, ["backend"], "ai", **kwargs)
+    ).split("WHERE")[1]
+    # The facet query is the same predicates plus its own IS NOT NULL guard.
+    facet_where = _compiled(build_alert_facet_query("severity", conditions)).split(
+        "WHERE"
+    )[1]
+    for clause in ("department IN (", "source =", "level =", "app_name IN ("):
+        assert clause in feed_where and clause in facet_where
+
+
 def test_journeys_query_status_filter():
     assert "status =" in _compiled(build_journeys_query("SUCCESS"))
     assert "WHERE" not in _compiled(build_journeys_query(None))
@@ -314,7 +779,7 @@ def test_get_alerts_passes_query_params_into_the_filter():
     )
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "emitted_at >=" in sql and "department =" in sql and "source =" in sql
+    assert "emitted_at >=" in sql and "department IN (" in sql and "source =" in sql
 
 
 @pytest.mark.parametrize("department", ["networking", "devops", "backend", "database", "general"])
@@ -323,7 +788,8 @@ def test_get_alerts_valid_department_filters(department):
     r = TestClient(app).get("/alerts", params={"department": department})
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "department =" in sql and "source =" not in sql
+    assert "department IN (" in sql and "source =" not in sql
+    assert _params(session.statements[0])["department_1"] == [department]
 
 
 @pytest.mark.parametrize("source", ["ai", "fallback"])
@@ -332,7 +798,7 @@ def test_get_alerts_valid_source_filters(source):
     r = TestClient(app).get("/alerts", params={"source": source})
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "source =" in sql and "department =" not in sql
+    assert "source =" in sql and "department IN (" not in sql
 
 
 @pytest.mark.parametrize("severity", ["critical", "high", "medium", "low"])
@@ -340,7 +806,8 @@ def test_get_alerts_valid_severity_filters(severity):
     session = _use([_FakeResult(items=[])])
     r = TestClient(app).get("/alerts", params={"severity": severity})
     assert r.status_code == 200
-    assert "severity =" in _compiled(session.statements[0])
+    assert "severity IN (" in _compiled(session.statements[0])
+    assert _params(session.statements[0])["severity_1"] == [severity]
 
 
 def test_get_alerts_invalid_severity_is_422():
@@ -353,7 +820,7 @@ def test_get_alerts_department_and_source_combination_via_http():
     r = TestClient(app).get("/alerts", params={"department": "database", "source": "fallback"})
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "department =" in sql and "source =" in sql
+    assert "department IN (" in sql and "source =" in sql
 
 
 @pytest.mark.parametrize("level", ["WARN", "ERROR"])
@@ -362,7 +829,7 @@ def test_get_alerts_valid_level_filters(level):
     r = TestClient(app).get("/alerts", params={"level": level})
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "level =" in sql and "app_name =" not in sql
+    assert "level =" in sql and "app_name IN (" not in sql
 
 
 def test_get_alerts_app_name_filters():
@@ -370,7 +837,8 @@ def test_get_alerts_app_name_filters():
     r = TestClient(app).get("/alerts", params={"app_name": "cc-spt-service"})
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "app_name =" in sql and "level =" not in sql
+    assert "app_name IN (" in sql and "level =" not in sql
+    assert _params(session.statements[0])["app_name_1"] == ["cc-spt-service"]
 
 
 def test_get_alerts_unknown_app_name_is_not_422():
@@ -394,8 +862,8 @@ def test_get_alerts_level_app_name_department_source_combination():
     )
     assert r.status_code == 200
     sql = _compiled(session.statements[0])
-    assert "level =" in sql and "app_name =" in sql
-    assert "department =" in sql and "source =" in sql
+    assert "level =" in sql and "app_name IN (" in sql
+    assert "department IN (" in sql and "source =" in sql
 
 
 @pytest.mark.parametrize(
@@ -646,3 +1114,98 @@ def test_get_journeys_last_page_has_null_next_cursor():
     body = TestClient(app).get("/journeys", params={"limit": 5}).json()
     assert [j["journey_id"] for j in body["items"]] == ["J1", "J2"]
     assert body["next_cursor"] is None
+
+
+# --- GET/PATCH /incidents -----------------------------------------------------
+
+
+from backend.db import Incident
+from backend.api import build_incidents_query
+
+
+def test_build_incidents_query_no_filter_selects_all():
+    stmt = build_incidents_query(None)
+    sql = _compiled(stmt)
+    assert "WHERE" not in sql.upper() or "incidents" in sql.lower()
+
+
+def test_build_incidents_query_filters_by_status():
+    stmt = build_incidents_query("open")
+    sql = _compiled(stmt)
+    assert "status" in sql.lower()
+
+
+def _incident(**over) -> Incident:
+    base = dict(
+        incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
+        failing_service="SPT", error_token=None, title="ENRICHMENT_FAILED — SPT",
+        department="devops", status="open",
+        first_ts=datetime(2026, 7, 26, 8, 0, 0, tzinfo=UTC),
+        last_ts=datetime(2026, 7, 26, 8, 5, 0, tzinfo=UTC),
+        primary_alert_id="a1", alert_count=12, journey_count=3,
+    )
+    base.update(over)
+    return Incident(**base)
+
+
+def test_list_incidents_returns_page():
+    client = TestClient(app)
+    session = _use([_FakeResult(items=[_incident()])])
+    resp = client.get("/incidents")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"][0]["incident_id"] == "inc-1"
+
+
+def test_get_incident_404_when_missing():
+    client = TestClient(app)
+    _use([_FakeResult(one=None)])
+    resp = client.get("/incidents/does-not-exist")
+    assert resp.status_code == 404
+
+
+def test_get_incident_returns_incident_and_its_alerts():
+    client = TestClient(app)
+    alert = Alert(
+        alert_id="a1", emitted_at=datetime(2026, 7, 26, 8, 0, 0, tzinfo=UTC),
+        log_id="l1", level="ERROR", app_name="cc-order-engine", logger="l",
+        message="m", source="fallback", journey_id="j1", incident_id="inc-1",
+        is_resolved=False,
+    )
+    _use([
+        _FakeResult(one=_incident()),
+        _FakeResult(items=[alert]),
+    ])
+    resp = client.get("/incidents/inc-1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["incident_id"] == "inc-1"
+    assert body["alerts"][0]["alert_id"] == "a1"
+
+
+def test_resolve_incident_sets_status_and_returns_404_when_missing(monkeypatch):
+    client = TestClient(app)
+    _use([_FakeResult(one=None)])
+    resp = client.patch("/incidents/does-not-exist/resolve")
+    assert resp.status_code == 404
+
+
+def test_resolve_incident_cascades_to_its_alerts():
+    """Resolving an incident must also resolve every alert linked to it — an
+    incident collapses those alerts, so they must leave the live Alert Feed
+    and show up in History exactly as if each were individually resolved."""
+    client = TestClient(app)
+    session = _use([
+        _FakeResult(one=_incident(status="resolved")),
+        _FakeResult(),  # the cascade UPDATE on alerts — return value unused
+    ])
+    resp = client.patch("/incidents/inc-1/resolve")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "resolved"
+
+    assert len(session.statements) == 2
+    cascade_sql = _compiled(session.statements[1]).lower()
+    assert "alerts" in cascade_sql
+    assert "is_resolved" in cascade_sql
+    assert "resolved_at" in cascade_sql
+    assert "incident_id" in cascade_sql

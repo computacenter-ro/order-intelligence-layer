@@ -1,6 +1,9 @@
 import type {
   ChatRequest,
   ChatResponse,
+  Incident,
+  IncidentDetail,
+  IncidentStatus,
   Journey,
   OverviewStats,
   ProcessedAlert,
@@ -71,11 +74,14 @@ export async function logout(): Promise<void> {
 
 export interface AlertsFilter {
   since?: string;
-  department?: string;
+  // Multi-valued: sent as repeated params (?department=backend&department=devops)
+  // and OR'd server-side into one `IN (...)`. An empty array or `undefined` both
+  // mean "no filter" — matching the backend, where [] and None behave alike.
+  department?: string[];
+  app_name?: string[];
+  severity?: string[];
   source?: string;
   level?: string;
-  app_name?: string;
-  severity?: string;
   resolved?: boolean;
   // Semantic-cache provenance; orthogonal to `source` (cached alerts are all
   // source="ai"). Omitted = both.
@@ -99,21 +105,61 @@ export async function resolveAlert(alertId: string): Promise<ProcessedAlert> {
   return res.json() as Promise<ProcessedAlert>;
 }
 
-export function fetchAlerts(filter: AlertsFilter = {}): Promise<Page<ProcessedAlert>> {
+/**
+ * The filter half of the query string, shared by `/alerts` and `/alerts/facets`.
+ *
+ * One builder on purpose: the two endpoints take the same filter params (the
+ * backend has a test pinning that), and the facet counts only describe the list
+ * if both are asked the same question. Paging params are added by `fetchAlerts`
+ * alone — facets aggregate rather than page.
+ */
+function alertFilterParams(filter: AlertsFilter): URLSearchParams {
   const params = new URLSearchParams();
   if (filter.since) params.set("since", filter.since);
-  if (filter.department) params.set("department", filter.department);
+  // append, not set: one entry per selected value, which is how FastAPI parses a
+  // list query param. `set` would keep only the last and silently narrow the
+  // filter to a single value. An empty array appends nothing = no filter.
+  (filter.department ?? []).forEach((v) => params.append("department", v));
+  (filter.app_name ?? []).forEach((v) => params.append("app_name", v));
+  (filter.severity ?? []).forEach((v) => params.append("severity", v));
   if (filter.source) params.set("source", filter.source);
   if (filter.level) params.set("level", filter.level);
-  if (filter.app_name) params.set("app_name", filter.app_name);
-  if (filter.severity) params.set("severity", filter.severity);
   if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
   if (filter.cached !== undefined) params.set("cached", String(filter.cached));
+  return params;
+}
+
+export function fetchAlerts(filter: AlertsFilter = {}): Promise<Page<ProcessedAlert>> {
+  const params = alertFilterParams(filter);
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.cursor) params.set("cursor", filter.cursor);
   if (filter.sort) params.set("sort", filter.sort);
   const query = params.toString();
   return getJson<Page<ProcessedAlert>>(`/alerts${query ? `?${query}` : ""}`);
+}
+
+/**
+ * Per-value alert counts for the three multi-select filters (backend
+ * ``GET /alerts/facets``). A value with no matches is absent from the map, so
+ * read a missing key as 0.
+ */
+export interface AlertFacets {
+  severity: Record<string, number>;
+  department: Record<string, number>;
+  app_name: Record<string, number>;
+}
+
+/**
+ * Contextual counts for the current filter selection.
+ *
+ * Pass the SAME filters as the list fetch, multi-select values included: the
+ * backend applies the exclude-self rule per facet (each facet omits its own
+ * filter), so it needs to see everything that is ticked. Withholding the
+ * multi-selects here would silently produce unscoped counts.
+ */
+export function fetchFacets(filter: AlertsFilter = {}): Promise<AlertFacets> {
+  const query = alertFilterParams(filter).toString();
+  return getJson<AlertFacets>(`/alerts/facets${query ? `?${query}` : ""}`);
 }
 
 export interface JourneysFilter {
@@ -133,6 +179,36 @@ export function fetchJourneys(filter: JourneysFilter = {}): Promise<Page<Journey
 
 export function fetchJourney(journeyId: string): Promise<Journey> {
   return getJson<Journey>(`/journeys/${encodeURIComponent(journeyId)}`);
+}
+
+export interface IncidentsFilter {
+  status?: IncidentStatus;
+  limit?: number;
+  cursor?: string;
+}
+
+export function fetchIncidents(filter: IncidentsFilter = {}): Promise<Page<Incident>> {
+  const params = new URLSearchParams();
+  if (filter.status) params.set("status", filter.status);
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  if (filter.cursor) params.set("cursor", filter.cursor);
+  const query = params.toString();
+  return getJson<Page<Incident>>(`/incidents${query ? `?${query}` : ""}`);
+}
+
+export function fetchIncident(incidentId: string): Promise<IncidentDetail> {
+  return getJson<IncidentDetail>(`/incidents/${encodeURIComponent(incidentId)}`);
+}
+
+/** Mark an incident resolved; returns the updated incident. */
+export async function resolveIncident(incidentId: string): Promise<Incident> {
+  const res = await fetch(`${API_URL}/incidents/${encodeURIComponent(incidentId)}/resolve`, {
+    method: "PATCH",
+    credentials: "include",
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`resolveIncident failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<Incident>;
 }
 
 /** Aggregate counters for the Insights page (backend GET /stats/insights). */

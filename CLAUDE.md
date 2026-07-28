@@ -44,6 +44,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 .
 ├── CLAUDE.md
 ├── docker-compose.yml            # rabbitmq (5672/15672), redis (6379), postgres (5432)
+├── alembic.ini                   # DB migrations config (backend/migrations)
 ├── requirements.txt
 ├── requirements-ml.txt           # optional: semantic-cache deps (sentence-transformers + CPU torch)
 ├── shared/                       # cross-cutting: used by pipeline/, ai_service/, and backend/
@@ -62,13 +63,16 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   ├── injector/inject.py        # starts flows (stands in for "Orders B2B / SF")
 │   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
 │   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
-│   └── data/                     # reference fixtures (e.g. captured real-system log samples)
+│   │   dump_backend.py           # dev harness: dump backend DB state to JSON
+│   └── data/                     # reference fixtures (mock-order-flows-v2.json / -v3.json)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 │   ├── semcache.py               # semantic cache (normalize + embed + LRU) — skips LLM on repeat log types
 ├── backend/                      # [5] :8000
-│   ├── main.py  consumers.py  journeys.py  stitching.py  teams.py  ws.py  db.py
+│   ├── main.py  consumers.py  journeys.py  stitching.py  linking.py  teams.py  ws.py  db.py
+│   ├── auth.py  summarizer.py    # session auth; LLM journey-summary client
 │   ├── api.py  schemas.py       # read-only REST API + Pydantic response schemas
+│   └── migrations/               # Alembic migrations (env.py, versions/)
 ├── dashboard/                    # [6] Next.js app, :3000
 └── tests/
 ```
@@ -596,10 +600,15 @@ possibly later than the alert that referenced it.
 alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
        event_id, order_id, cart_header_id, account_number,
        explanation, department, severity, confidence, source, cached, journey_id FK NULL)
+       explanation, department, severity, confidence, source, journey_id FK NULL,
+       is_resolved, resolved_at NULL)
 journeys(journey_id PK, status, outcome NULL, first_ts, last_ts,
          event_id, order_id, cart_header_id, summary NULL)
 journey_events(journey_id FK, log_id UNIQUE, ts, raw JSONB)
 ```
+
+Schema changes are applied via Alembic (`backend/migrations/versions/`), not by
+hand-editing tables — see "Gotchas" below.
 
 ### API
 ```
@@ -610,6 +619,19 @@ GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
                                         # cached=true|false is ORTHOGONAL to source:
                                         # every cached alert is source="ai", so it
                                         # narrows within AI answers, not beside them.
+                                        # department/app_name/severity are MULTI-valued:
+                                        # repeat the param to OR within the category
+                                        # (SQL IN). Omitted / empty = no filter — an
+                                        # IN () would match nothing and empty the feed.
+                                        # A non-empty list excludes NULLs, so filtering
+                                        # by department drops fallback alerts.
+GET  /alerts/facets                     # 🔒 per-value counts for the 3 multi-selects
+                                        # (severity/department/app_name). Same filter
+                                        # params as /alerts, no paging. EXCLUDE-SELF:
+                                        # each facet omits its OWN filter, so ticking
+                                        # one value never collapses that facet's list;
+                                        # the other filters still scope it. NULLs are
+                                        # skipped (no filter option to count them on).
 GET  /journeys?status=                  # 🔒 requires session
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
 GET  /stats/insights                    # 🔒 aggregate counters for the insights page
@@ -619,7 +641,21 @@ GET  /stats/insights                    # 🔒 aggregate counters for the insigh
                                         # alerts: total, open/resolved, by_department,
                                         # by_severity, by_level, by_source
 WS   /ws                                # 🔒 alert.new | journey.updated | journey.completed
+POST  /auth/login                        # {username,password} -> sets httpOnly session cookie
+POST  /auth/logout                       # clears the cookie
+GET   /auth/me                           # current user (401 if no valid session) — the frontend guard
+GET   /alerts?since=&department=&source=&level=&app_name=&severity=&resolved=  # 🔒 requires session
+PATCH /alerts/{alert_id}/resolve         # 🔒 manual triage — sets is_resolved=True, resolved_at=now()
+GET   /journeys?status=                  # 🔒 requires session
+GET   /journeys/{id}                     # 🔒 journey + its events + summary
+WS    /ws                                # 🔒 alert.new | journey.updated | journey.completed
 ```
+
+Alert filter conditions live in ONE place — `alert_filter_conditions()` in
+`backend/api.py` returns the WHERE clauses as a list, which `build_alerts_query`
+applies wholesale and `/alerts/facets` applies minus one clause per facet. Adding
+a filter there reaches both, so the feed and its counts cannot disagree about what
+a filter means (a test pins the two endpoints' query params to the same set).
 
 Aggregation lives in **`backend/stats.py`**, split so both halves are pure and
 unit-testable like `build_alerts_query`: query builders returning `Select`s with
@@ -697,6 +733,18 @@ Connects to backend WS + REST. Feature contract:
   summary once completed; `TIMED_OUT` flag surfaced. The journey may appear /
   fill in **later** than its alerts — the UI must handle progressive updates
   (`journey.updated`).
+- **Alert filter bar** (`components/alerts/AlertFilterBar.tsx`) — department /
+  source / level / service (`app_name`) / severity, shared by the Alert Feed
+  and History page. Selections persist per-page in `localStorage`
+  (`oil.alertFilters` / `oil.historyFilters`); `alertMatchesFilters` mirrors
+  the backend query exactly, so it also gates which live `alert.new` events
+  are admitted into the feed under the active filter.
+- **Resolve action** — a kebab menu (`AlertActionsMenu.tsx`) on each alert card
+  calls `PATCH /alerts/{id}/resolve`; a resolved alert drops out of the live
+  Alert Feed immediately.
+- **History page** (`/history`) — lists resolved alerts (`resolved=true`) with
+  the same card/filter UI as the Alert Feed. Not real-time: no WS, just a
+  re-fetch whenever the filters change.
 
 ---
 
@@ -723,6 +771,7 @@ pip install -r requirements.txt
 # Without it the cache disables itself and the pipeline runs unchanged.
 # Windows: enable long paths first (see requirements-ml.txt) or torch fails to unpack.
 pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+alembic upgrade head                          # apply DB migrations (backend/migrations)
 uvicorn pipeline.mock_es.app:app --port 9200  # [2]
 python -m pipeline.services.run_all           # [1] all mock services (baton consumers)
 python -m ai_service.main                     # [3] poller + graph + api (:8100)
@@ -803,6 +852,8 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 - There is **no rule-based classification** — the LLM-down path is a raw
   pass-through to the general channel. Don't reintroduce keyword routing.
 - Both output queues are at-least-once: consumers must be idempotent.
+- Schema changes go through Alembic (`backend/migrations/versions/`) — never
+  hand-edit the tables in `backend/db.py` without a matching migration.
 - The system must remain useful with the LLM completely down (breaker +
   pass-through alerts + template journey summaries). Test this path.
 - The semantic cache must **fail toward a miss**, never a false hit: a false miss

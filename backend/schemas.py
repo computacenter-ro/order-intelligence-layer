@@ -181,6 +181,55 @@ class JourneyDetailOut(JourneyOut):
     events: list[JourneyEventOut]
 
 
+class IncidentOut(BaseModel):
+    """A cause-cluster of alerts (``incidents`` row)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    incident_id: str
+    signature: str | None = None
+    failure_subtype: str | None = None
+    failing_service: str | None = None
+    error_token: str | None = None
+    title: str
+    department: str | None = None
+    status: str
+    first_ts: UtcDatetime
+    last_ts: UtcDatetime
+    primary_alert_id: str | None = None
+    alert_count: int
+    journey_count: int
+
+
+class IncidentDetailOut(IncidentOut):
+    """An incident plus its linked alerts (``GET /incidents/{id}`` payload).
+
+    Each alert already carries its own ``order_id``/``journey_id`` (see
+    ``AlertOut``), so the dashboard groups them by order client-side —
+    Plan 2's concern, not this API's.
+    """
+
+    alerts: list[AlertOut]
+
+
+class AlertFacets(BaseModel):
+    """``GET /alerts/facets`` — how many alerts each filter value would match.
+
+    One ``{value: count}`` map per multi-select filter. Each map is computed with
+    every active filter EXCEPT its own (the exclude-self rule in
+    ``build_alert_facet_query``), so the counts show what selecting a value would
+    give you rather than collapsing to what is already selected.
+
+    A value with no matches is simply absent — the maps are sparse, and a client
+    should read a missing key as 0. Null values are never counted: they mean the
+    LLM never rated/routed the alert, and there is no filter option for them.
+    """
+
+    severity: dict[str, int]
+    department: dict[str, int]
+    app_name: dict[str, int]
+
+
 # --- insights aggregation (GET /stats/insights) -------------------------------
 #
 # Assembled by backend/stats.py from GROUP BY results. The breakdown dicts are

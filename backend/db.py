@@ -29,6 +29,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -105,6 +106,13 @@ class Journey(Base):
 
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Set by backend/incidents.py on journey completion; null until then, and
+    # for a journey that never forms/joins an incident (SUCCESS journeys, or a
+    # TIMED_OUT journey with no linked ERROR alert).
+    incident_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incidents.incident_id"), nullable=True, index=True
+    )
+
     events: Mapped[list["JourneyEvent"]] = relationship(
         back_populates="journey",
         cascade="all, delete-orphan",
@@ -160,6 +168,16 @@ class Alert(Base):
         Boolean, nullable=False, default=False, server_default=sa.false()
     )
 
+    # The masked-message vector (ai_service/semcache.py's embed(), shipped on
+    # ProcessedAlert.embedding). None when no encoder was configured.
+    embedding: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # Nullable FK: the alert may precede its journey's incident-clustering
+    # decision (which only happens at journey completion).
+    incident_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incidents.incident_id"), nullable=True, index=True
+    )
+
     # Nullable FK: the alert may precede its assembled journey.
     journey_id: Mapped[str | None] = mapped_column(
         ForeignKey("journeys.journey_id"), nullable=True, index=True
@@ -195,3 +213,44 @@ class JourneyEvent(Base):
     __table_args__ = (
         UniqueConstraint("log_id", name="uq_journey_events_log_id"),
     )
+
+
+class Incident(Base):
+    """A cause-cluster of alerts (see repo-root incident-clustering-implementation-plan.md).
+
+    INFRA-classed incidents may span many journeys/orders (``journey_count``
+    grows as more orders hit the same failure); order-specific incidents
+    always have ``journey_count == 1`` and stay permanently scoped to the one
+    journey that created them this iteration — cross-order matching is never
+    attempted for them (see ``backend/incidents.py``).
+    """
+
+    __tablename__ = "incidents"
+
+    incident_id: Mapped[str] = mapped_column(String, primary_key=True)
+
+    # Exact-match key for the recognized/deterministic path; null for a novel
+    # (unrecognized) cause, which is matched by embedding cosine instead.
+    signature: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    failure_subtype: Mapped[str | None] = mapped_column(String, nullable=True)
+    failing_service: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Mined for display; NOT part of the signature hash (YAGNI — see this
+    # plan's Global Constraints).
+    error_token: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    department: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)  # "open" | "resolved"
+
+    first_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Set once at creation from the founding causal alert; NEVER reassigned —
+    # it's the novel path's cosine-comparison target (backend/incidents.py),
+    # not just a UI click-through.
+    primary_alert_id: Mapped[str | None] = mapped_column(
+        ForeignKey("alerts.alert_id"), nullable=True
+    )
+
+    alert_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    journey_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")

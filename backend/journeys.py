@@ -300,8 +300,12 @@ class JourneyAssembler:
 
         When ``on_event`` is given (else no-op), after a successful commit it
         emits — for every journey this chunk grew but did not finish — a
-        ``journey.updated`` event, and a ``journey.completed`` event for each
-        journey that reached a terminal state. Emitting after commit means we
+        ``journey.updated`` event, a ``journey.completed`` event for each
+        journey that reached a terminal state, and an ``incident.updated``
+        event for each incident that just absorbed a late-arriving orphan
+        alert (backend/linking.py's backfill_journey_alerts — a journey can
+        already have an incident here if it completed and clustered before
+        this batch of orphan alerts caught up). Emitting after commit means we
         never broadcast state that failed to persist.
         """
         new_events = self.add(logs)
@@ -309,7 +313,7 @@ class JourneyAssembler:
         # Parents before children: the journeys rows must exist before
         # journey_events (FK journey_events.journey_id -> journeys.journey_id),
         # otherwise the event insert raises a ForeignKeyViolationError.
-        await self._upsert_journeys(session, touched)
+        updated_incidents = await self._upsert_journeys(session, touched)
         await self._persist_events(session, new_events)
         completions = self.evaluate(now)
         summaries = await self._summaries_for(completions)
@@ -331,6 +335,11 @@ class JourneyAssembler:
                         completion, _summary_text(summaries.get(completion.journey_id))
                     )
                 )
+            if updated_incidents:
+                from backend.incidents import _incident_updated_event
+
+                for incident in updated_incidents:
+                    await on_event(_incident_updated_event(incident))
         return completions
 
     async def sweep_stalled(
@@ -383,15 +392,19 @@ class JourneyAssembler:
         await session.execute(stmt)
 
     @staticmethod
-    async def _upsert_journeys(session, journeys) -> None:
+    async def _upsert_journeys(session, journeys) -> list:
         """Insert in-progress journey rows; on re-touch, refresh span + aliases.
 
         Never overwrites ``status`` / ``outcome`` here — those are set at insert
         (IN_PROGRESS) and by :meth:`_finalize_journey`, so a late log arriving
         for an already-finalized journey cannot revert it to in-progress.
+
+        Returns the ``Incident`` rows that just absorbed a backfilled orphan
+        alert (see :func:`backend.linking.backfill_journey_alerts`), for the
+        caller to broadcast ``incident.updated`` for each after its own commit.
         """
         if not journeys:
-            return
+            return []
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from backend.db import Journey
 
@@ -423,7 +436,7 @@ class JourneyAssembler:
         # "fills in later").
         from backend.linking import backfill_journey_alerts
 
-        await backfill_journey_alerts(session, journeys)
+        return await backfill_journey_alerts(session, journeys)
 
     @staticmethod
     async def _finalize_journey(

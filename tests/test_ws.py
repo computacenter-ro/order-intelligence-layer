@@ -188,6 +188,14 @@ class _FakeResult:
     def __init__(self, rowcount: int = 1) -> None:
         self.rowcount = rowcount
 
+    def first(self):
+        # backend.linking's incident-backfill lookups read "nothing found"
+        # here — none of these WS-event tests exercise incidents.
+        return None
+
+    def scalar_one_or_none(self):
+        return None
+
 
 class _FakeSession:
     """Async session usable both as a CM (consumers) and directly (assembler)."""

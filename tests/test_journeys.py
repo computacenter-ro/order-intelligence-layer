@@ -504,6 +504,20 @@ def test_full_redelivery_is_idempotent(flow):
 # =============================================================================
 
 
+class _FakeExecuteResult:
+    """A result whose .first()/.scalar_one_or_none()/.rowcount all read as
+    "nothing found" — enough for backend.linking's incident-backfill lookups,
+    which none of these journey-level tests exercise incidents for."""
+
+    rowcount = 0
+
+    def first(self):
+        return None
+
+    def scalar_one_or_none(self):
+        return None
+
+
 class _FakeSession:
     """Minimal async session: swallows execute()/commit() (no real DB)."""
 
@@ -511,7 +525,7 @@ class _FakeSession:
         self.commits = 0
 
     async def execute(self, stmt):
-        return None
+        return _FakeExecuteResult()
 
     async def commit(self):
         self.commits += 1

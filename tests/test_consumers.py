@@ -70,6 +70,14 @@ class _FakeResult:
     def __init__(self, rowcount: int = 1) -> None:
         self.rowcount = rowcount
 
+    def first(self):
+        # backend.linking's incident-backfill lookups read "nothing found"
+        # here — none of these alert-persistence tests exercise incidents.
+        return None
+
+    def scalar_one_or_none(self):
+        return None
+
 
 class _FakeSession:
     """Records execute() statements and commit()s; usable as an async CM."""

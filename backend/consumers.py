@@ -233,12 +233,18 @@ class AlertsConsumer(_QueueConsumer):
             .values(**alert_row_values(alert))
             .on_conflict_do_nothing()  # dedup on unique alert_id / log_id
         )
+        updated_incident = None
         async with self._factory()() as session:
             result = await session.execute(stmt)
             # Link to its journey if one already exists (else it stays null and
             # the raw consumer back-fills it once the journey is assembled).
+            # If that journey already has an incident, link_alert also backfills
+            # this alert's incident_id and returns the bumped Incident row — a
+            # late-arriving alert on an already-clustered journey would
+            # otherwise sit forever with incident_id=NULL, invisible to that
+            # incident's view (live-testing discovery).
             if result.rowcount != 0:
-                await link_alert(session, alert)
+                updated_incident = await link_alert(session, alert)
             await session.commit()
 
         # Broadcast only a genuinely new alert: a redelivered duplicate inserts
@@ -246,6 +252,13 @@ class AlertsConsumer(_QueueConsumer):
         # at-least-once delivery idempotent end-to-end.
         if self._on_event is not None and result.rowcount != 0:
             await self._on_event(_alert_new_event(alert))
+
+        # Same idempotency guard as above, but keyed on whether an incident
+        # actually got bumped — broadcast AFTER commit, never before.
+        if self._on_event is not None and updated_incident is not None:
+            from backend.incidents import _incident_updated_event
+
+            await self._on_event(_incident_updated_event(updated_incident))
 
         # Feed the retrieval index. Gated on the same rowcount as the broadcast so
         # a redelivered duplicate does no extra work (the index upserts by id, so

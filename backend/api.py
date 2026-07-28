@@ -202,11 +202,20 @@ def build_journeys_query(status: str | None) -> Select:
     return stmt
 
 
-def build_incidents_query(status: str | None) -> Select:
-    """Select incidents, optionally filtered by ``status`` ('open'/'resolved')."""
+def build_incidents_query(status: str | None, department: list[str] | None = None) -> Select:
+    """Select incidents, optionally filtered by ``status`` ('open'/'resolved')
+    and/or ``department``.
+
+    ``department`` is multi-valued, same convention as the alerts filters: a
+    non-empty list becomes an ``IN (...)`` (OR within the category); ``None``
+    and an empty list both mean "no filter" (an ``IN ()`` would instead match
+    nothing and empty the page).
+    """
     stmt = select(Incident)
     if status is not None:
         stmt = stmt.where(Incident.status == status)
+    if department:
+        stmt = stmt.where(Incident.department.in_(department))
     return stmt
 
 
@@ -426,13 +435,14 @@ async def get_journey(
 @router.get("/incidents", response_model=Page[IncidentOut])
 async def list_incidents(
     status: Annotated[Literal["open", "resolved"] | None, Query()] = None,
+    department: Annotated[list[Department] | None, Query()] = None,
     limit: Annotated[int, Query()] = 16,
     cursor: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> Page[IncidentOut]:
     limit = max(1, min(limit, 100))
     stmt = apply_keyset(
-        build_incidents_query(status),
+        build_incidents_query(status, department),
         Incident.last_ts,
         Incident.incident_id,
         cursor=cursor,

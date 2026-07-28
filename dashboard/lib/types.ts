@@ -137,6 +137,13 @@ export interface ChatRequest {
   k?: number;
   filters?: Record<string, string> | null;
   context?: ChatContext | null;
+  /**
+   * IANA zone (e.g. "Europe/Bucharest") from the browser — the only party that
+   * knows where the reader is. The backend renders the SCOPED context's
+   * timestamps in it, so the model quotes a local time directly. Indexed records
+   * stay UTC (shared by all viewers) and are rewritten on display instead.
+   */
+  tz?: string;
 }
 
 /** One cited incident record. `link` is null when DASHBOARD_URL is unset. */

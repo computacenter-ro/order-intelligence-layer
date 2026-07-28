@@ -5,6 +5,7 @@ import { PaperPlaneRightIcon, XIcon } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
 import { sendChat, UnauthorizedError } from "@/lib/api";
+import { localizeUtcStamps } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ChatContext, ChatMode, ChatSource } from "@/lib/types";
 
@@ -40,8 +41,36 @@ interface Turn {
   text: string;
   mode?: ChatMode;
   sources?: ChatSource[];
+  /**
+   * Heading for the chip list. In an unscoped chat the retrieved records ARE the
+   * provenance of the answer, so "Sources" is accurate. In a scoped chat the
+   * answer comes from the injected record instead, and these are merely other
+   * records that resembled the query — calling those "Sources" would claim a
+   * provenance they don't have.
+   */
+  sourcesLabel?: string;
   /** True for the "something went wrong" turn — styled as a warning, not an answer. */
   failed?: boolean;
+}
+
+/**
+ * Drop the scoped record from its own citation list.
+ *
+ * A scoped answer is built from the context the backend injects (that journey's
+ * summary + log lines), not from retrieval — yet retrieval still runs on the
+ * query text and returns whatever resembles it. Measured on a live scoped
+ * question: 5 sources came back, 1 was the journey being asked about and 4 were
+ * unrelated journeys. Listing the record you are already looking at is noise;
+ * listing the others under "Sources" is worse, because it implies the answer drew
+ * on them. So the record itself is removed and the remainder is relabelled by the
+ * caller.
+ */
+export function withoutScopedRecord(
+  sources: ChatSource[],
+  scope: ChatContext | null
+): ChatSource[] {
+  if (!scope) return sources;
+  return sources.filter((s) => s.id !== scope.id);
 }
 
 const PANEL_WIDTH = 480;
@@ -61,6 +90,27 @@ const MODE_BADGE: Record<ChatMode, { status: "other" | "inactive"; label: string
     title: "The LLM was unavailable — this lists the matching records without a written answer",
   },
 };
+
+/**
+ * Turn an order number typed into the question into an exact metadata filter.
+ *
+ * Embeddings are poor at exact identifiers — `ORD-8427` and `ORD-8435` are nearly
+ * the same string to the model, so "why did ORD-8427 fail" can retrieve the wrong
+ * order's records. The index stores `order_id` in metadata, and the backend
+ * forwards `filters` verbatim, so lifting the id out of the prose turns a fuzzy
+ * match into an exact one.
+ *
+ * Same shape as the stitcher's mining pattern (`\bORD-\d+\b`). Only the FIRST
+ * match is used: two order numbers in one question means the agent is comparing
+ * them, and filtering to one would silently answer half the question.
+ */
+const ORDER_ID_RE = /\bORD-\d+\b/g;
+
+export function filtersFromQuery(query: string): Record<string, string> | null {
+  const matches = query.match(ORDER_ID_RE);
+  if (!matches || matches.length !== 1) return null;
+  return { order_id: matches[0] };
+}
 
 const SUGGESTIONS = [
   "Why did SAP submission fail?",
@@ -181,7 +231,7 @@ function TurnBubble({ turn }: { turn: Turn }) {
 
         {turn.sources && turn.sources.length > 0 && (
           <>
-            <SectionLabel>Sources</SectionLabel>
+            <SectionLabel>{turn.sourcesLabel ?? "Sources"}</SectionLabel>
             <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
               {turn.sources.map((s) => (
                 <SourceChip key={s.id} source={s} />
@@ -232,10 +282,27 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
     setDraft("");
     setBusy(true);
     try {
-      const res = await sendChat({ query, k: 5, context });
+      // A scoped conversation is already anchored to one record, so an order-id
+      // filter would only narrow it further (and could contradict the scope).
+      const filters = context ? null : filtersFromQuery(query);
+      // The browser is the only party that knows the reader's zone, so it tells
+      // the backend: scoped context timestamps then come back already local.
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+      const res = await sendChat({ query, k: 5, context, filters, tz });
       setTurns((prev) => [
         ...prev,
-        { role: "assistant", text: res.answer, mode: res.mode, sources: res.sources },
+        {
+          role: "assistant",
+          // Safety net for the other path: records from the INDEX carry UTC (they
+          // are shared by every viewer), so any such stamp the model quoted is
+          // rewritten to local here. Scoped answers are already local.
+          text: localizeUtcStamps(res.answer),
+          mode: res.mode,
+          sources: withoutScopedRecord(res.sources, context),
+          // Scoped: the answer came from the injected record, so these are
+          // lookalikes, not provenance. Unscoped: they genuinely are the sources.
+          sourcesLabel: context ? "Similar incidents" : "Sources",
+        },
       ]);
     } catch (err) {
       // Two failure shapes worth telling apart: an expired session is

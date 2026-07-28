@@ -175,6 +175,37 @@ class JourneyDetailOut(JourneyOut):
     events: list[JourneyEventOut]
 
 
+class IncidentOut(BaseModel):
+    """A cause-cluster of alerts (``incidents`` row)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    incident_id: str
+    signature: str | None = None
+    failure_subtype: str | None = None
+    failing_service: str | None = None
+    error_token: str | None = None
+    title: str
+    department: str | None = None
+    status: str
+    first_ts: UtcDatetime
+    last_ts: UtcDatetime
+    primary_alert_id: str | None = None
+    alert_count: int
+    journey_count: int
+
+
+class IncidentDetailOut(IncidentOut):
+    """An incident plus its linked alerts (``GET /incidents/{id}`` payload).
+
+    Each alert already carries its own ``order_id``/``journey_id`` (see
+    ``AlertOut``), so the dashboard groups them by order client-side —
+    Plan 2's concern, not this API's.
+    """
+
+    alerts: list[AlertOut]
+
+
 class AlertFacets(BaseModel):
     """``GET /alerts/facets`` — how many alerts each filter value would match.
 

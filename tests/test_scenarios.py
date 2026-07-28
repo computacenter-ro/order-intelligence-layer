@@ -1,4 +1,5 @@
-"""Tests for shared/scenarios.py — the 10 canonical scenarios + step compiler.
+"""Tests for shared/scenarios.py — the 10 canonical scenarios (+ 5 clustering
+test scenarios, 11-15) + step compiler.
 
 These are the ground-truth checks CLAUDE.md requires: outcomes match the
 canonical table, chains truncate at fail_at, pre-creation failures stay
@@ -28,7 +29,7 @@ from shared.scenarios import (
     compile_steps,
 )
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v3.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v4.json"
 
 # CLAUDE.md canonical table: {id: (outcome, fail_at, bridge_ids)}
 CANONICAL = {
@@ -45,19 +46,22 @@ CANONICAL = {
 }
 
 
-def test_exactly_ten_scenarios():
-    assert sorted(SCENARIOS) == list(range(1, 11))
+def test_exactly_fifteen_scenarios():
+    assert sorted(SCENARIOS) == list(range(1, 16))
 
 
 @pytest.mark.parametrize("sid", range(1, 11))
 def test_outcome_and_fail_at_match_canonical_table(sid):
+    # Deliberately scoped to 1-10 only: CANONICAL mirrors CLAUDE.md's canonical
+    # table, not "every scenario that exists" — scenarios 11-15 are clustering
+    # test cases (shared/scenarios.py), not part of that documented table.
     outcome, fail_at, _bridge = CANONICAL[sid]
     s = SCENARIOS[sid]
     assert s.outcome == outcome
     assert s.fail_at == fail_at
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_every_scenario_compiles_to_a_valid_baton(sid):
     s = SCENARIOS[sid]
     steps = compile_steps(s)
@@ -68,7 +72,7 @@ def test_every_scenario_compiles_to_a_valid_baton(sid):
     assert ctx.orderId is None and ctx.cartHeaderId is None
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_terminal_equals_last_compiled_step(sid):
     s = SCENARIOS[sid]
     assert compile_steps(s)[-1] == s.terminal
@@ -146,7 +150,7 @@ def test_enrichment_uses_fine_grained_call_serve_resp_trio():
 
 def test_outcomes_match_reference_fixture_order():
     ref = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    assert [f["outcome"] for f in ref] == [SCENARIOS[i].outcome for i in range(1, 11)]
+    assert [f["outcome"] for f in ref] == [SCENARIOS[i].outcome for i in range(1, 16)]
 
 
 # --- added: deeper invariants + edge cases -----------------------------------
@@ -162,7 +166,7 @@ def _is_phase2_step(step: tuple[str, str]) -> bool:
     return True
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_phase_ordering_no_phase2_step_before_create(sid):
     """No order-id-bearing (phase-2) block may appear before order_engine/create.
 
@@ -179,7 +183,7 @@ def test_phase_ordering_no_phase2_step_before_create(sid):
             assert i > create_idx, f"S{sid}: phase-2 step {step} at {i} precedes create"
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_bridge_when_present_sits_immediately_after_create(sid):
     steps = compile_steps(SCENARIOS[sid])
     if (INBOUND, BLOCKS.BRIDGE) not in steps:
@@ -225,7 +229,7 @@ def test_every_satellite_trio_is_intact_in_full_success_chain(sat):
     ]
 
 
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 def test_no_orphan_enrichment_calls_or_responses(sid):
     # Every enrich_X_call has a matching enrich_X_resp AND vice versa — unless
     # the chain was truncated mid-trio by a satellite failure, in which case a

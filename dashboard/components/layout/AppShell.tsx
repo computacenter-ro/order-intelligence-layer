@@ -11,6 +11,7 @@ import {
   ClockCounterClockwiseIcon,
   MapTrifoldIcon,
   SignOutIcon,
+  WarningIcon,
 } from "@phosphor-icons/react";
 import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
 import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-mark.png";
@@ -50,6 +51,12 @@ export function AppShell({ children }: AppShellProps) {
       href: "/journeys",
       icon: <MapTrifoldIcon size={20} />,
       active: pathname === "/journeys" || pathname.startsWith("/journeys/"),
+    },
+    {
+      label: "Incidents",
+      href: "/incidents",
+      icon: <WarningIcon size={20} />,
+      active: pathname === "/incidents" || pathname.startsWith("/incidents/"),
     },
     {
       label: "History",

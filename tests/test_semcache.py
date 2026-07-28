@@ -340,6 +340,37 @@ def test_load_tolerates_garbage():
 
 
 # =============================================================================
+# embed() — incident-clustering support (independent of lookup/store)
+# =============================================================================
+def test_embed_returns_vector_for_a_message():
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    vector = cache.embed("Timeout calling SPT for order ORD-6001")
+    assert vector is not None
+    assert len(vector) == FakeEncoder._DIMS
+
+
+def test_embed_returns_none_when_cache_disabled():
+    cache = SemanticCache(None, threshold=0.95, max_entries=10)
+    assert cache.embed("anything") is None
+
+
+def test_embed_normalizes_so_different_orders_collide():
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    v1 = cache.embed("Timeout calling SPT for order ORD-6001, account 81036533")
+    v2 = cache.embed("Timeout calling SPT for order ORD-9999, account 12345678")
+    assert v1 == v2  # same normalized text -> identical vector with FakeEncoder
+
+
+def test_embed_does_not_affect_lookup_or_store():
+    """embed() must be side-effect-free w.r.t. the cache's own lookup/store
+    state — it's a parallel capability, not a hook into the cache lifecycle."""
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    cache.embed("SPT price list unavailable")
+    assert len(cache) == 0  # embed() must not have stored anything
+    assert cache.lookup("SPT price list unavailable") is None  # still a miss
+
+
+# =============================================================================
 # process() integration — hit skips both LLM calls, miss runs + stores
 # =============================================================================
 async def test_hit_skips_llm(install_cache):
@@ -447,6 +478,65 @@ async def test_fallback_result_is_not_cached(install_cache):
 
 def get_deps_from(mod):
     return mod.get()
+
+
+# =============================================================================
+# embedding attachment — every ProcessedAlert path (cache-hit, AI, fallback)
+# =============================================================================
+async def test_cache_hit_alert_carries_embedding(install_cache):
+    install_cache()
+    explainer = CountingModel("SPT pricing for order ORD-6001 was unreachable.")
+    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    await process(_log(message="SPT price list unavailable", order_id="ORD-6001", log_id="L1"), deps)
+    hit = await process(
+        _log(message="SPT price list unavailable", order_id="ORD-8888", log_id="L2"), deps
+    )
+    assert hit.cached is True
+    assert hit.embedding is not None
+    assert len(hit.embedding) == FakeEncoder._DIMS
+
+
+async def test_ai_alert_carries_embedding(install_cache):
+    install_cache()
+    explainer = CountingModel("expl")
+    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
+    assert alert.source == "ai"
+    assert alert.embedding is not None
+    assert len(alert.embedding) == FakeEncoder._DIMS
+
+
+async def test_fallback_alert_carries_embedding(install_cache):
+    """Embedding attachment must not depend on the LLM/breaker being up — it's
+    entirely local, so a fallback (LLM-down) alert still gets one."""
+    install_cache()
+    deps = PipelineDeps(breaker=_breaker(FakeRedis(), FakeClock()), explainer=None, router=None)
+
+    alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
+    assert alert.source == "fallback"
+    assert alert.embedding is not None
+
+
+async def test_no_encoder_configured_yields_none_embedding(install_cache):
+    """When the cache is disabled (no encoder), embedding degrades to None
+    rather than raising — same graceful-degradation contract as the cache
+    itself."""
+    redis, _cache = install_cache()
+    # Reconfigure with encoder=None to simulate sentence-transformers missing.
+    disabled_cache = SemanticCache(None, threshold=0.95, max_entries=500)
+    semcache.configure(
+        SemCacheDeps(cache=disabled_cache, redis=redis, dump_key="k", hits_key="h", misses_key="m")
+    )
+    explainer = CountingModel("expl")
+    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    deps = _healthy_deps(explainer, router)
+
+    alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
+    assert alert.embedding is None
 
 
 # =============================================================================

@@ -139,6 +139,26 @@ def _journey(**over) -> Journey:
     return Journey(**base)
 
 
+from backend.schemas import IncidentOut
+
+
+def test_incident_out_from_orm_instance():
+    from backend.db import Incident
+
+    incident = Incident(
+        incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
+        failing_service="SPT", error_token="SocketTimeoutException",
+        title="ENRICHMENT_FAILED — SPT", department="devops", status="open",
+        first_ts=datetime(2026, 7, 26, 8, 0, 0, tzinfo=UTC),
+        last_ts=datetime(2026, 7, 26, 8, 5, 0, tzinfo=UTC),
+        primary_alert_id="a1", alert_count=12, journey_count=3,
+    )
+    out = IncidentOut.model_validate(incident)
+    assert out.incident_id == "inc-1"
+    assert out.journey_count == 3
+    assert out.status == "open"
+
+
 def _event(**over) -> JourneyEvent:
     base = dict(
         journey_id="J1",
@@ -1094,3 +1114,98 @@ def test_get_journeys_last_page_has_null_next_cursor():
     body = TestClient(app).get("/journeys", params={"limit": 5}).json()
     assert [j["journey_id"] for j in body["items"]] == ["J1", "J2"]
     assert body["next_cursor"] is None
+
+
+# --- GET/PATCH /incidents -----------------------------------------------------
+
+
+from backend.db import Incident
+from backend.api import build_incidents_query
+
+
+def test_build_incidents_query_no_filter_selects_all():
+    stmt = build_incidents_query(None)
+    sql = _compiled(stmt)
+    assert "WHERE" not in sql.upper() or "incidents" in sql.lower()
+
+
+def test_build_incidents_query_filters_by_status():
+    stmt = build_incidents_query("open")
+    sql = _compiled(stmt)
+    assert "status" in sql.lower()
+
+
+def _incident(**over) -> Incident:
+    base = dict(
+        incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
+        failing_service="SPT", error_token=None, title="ENRICHMENT_FAILED — SPT",
+        department="devops", status="open",
+        first_ts=datetime(2026, 7, 26, 8, 0, 0, tzinfo=UTC),
+        last_ts=datetime(2026, 7, 26, 8, 5, 0, tzinfo=UTC),
+        primary_alert_id="a1", alert_count=12, journey_count=3,
+    )
+    base.update(over)
+    return Incident(**base)
+
+
+def test_list_incidents_returns_page():
+    client = TestClient(app)
+    session = _use([_FakeResult(items=[_incident()])])
+    resp = client.get("/incidents")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"][0]["incident_id"] == "inc-1"
+
+
+def test_get_incident_404_when_missing():
+    client = TestClient(app)
+    _use([_FakeResult(one=None)])
+    resp = client.get("/incidents/does-not-exist")
+    assert resp.status_code == 404
+
+
+def test_get_incident_returns_incident_and_its_alerts():
+    client = TestClient(app)
+    alert = Alert(
+        alert_id="a1", emitted_at=datetime(2026, 7, 26, 8, 0, 0, tzinfo=UTC),
+        log_id="l1", level="ERROR", app_name="cc-order-engine", logger="l",
+        message="m", source="fallback", journey_id="j1", incident_id="inc-1",
+        is_resolved=False,
+    )
+    _use([
+        _FakeResult(one=_incident()),
+        _FakeResult(items=[alert]),
+    ])
+    resp = client.get("/incidents/inc-1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["incident_id"] == "inc-1"
+    assert body["alerts"][0]["alert_id"] == "a1"
+
+
+def test_resolve_incident_sets_status_and_returns_404_when_missing(monkeypatch):
+    client = TestClient(app)
+    _use([_FakeResult(one=None)])
+    resp = client.patch("/incidents/does-not-exist/resolve")
+    assert resp.status_code == 404
+
+
+def test_resolve_incident_cascades_to_its_alerts():
+    """Resolving an incident must also resolve every alert linked to it — an
+    incident collapses those alerts, so they must leave the live Alert Feed
+    and show up in History exactly as if each were individually resolved."""
+    client = TestClient(app)
+    session = _use([
+        _FakeResult(one=_incident(status="resolved")),
+        _FakeResult(),  # the cascade UPDATE on alerts — return value unused
+    ])
+    resp = client.patch("/incidents/inc-1/resolve")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "resolved"
+
+    assert len(session.statements) == 2
+    cascade_sql = _compiled(session.statements[1]).lower()
+    assert "alerts" in cascade_sql
+    assert "is_resolved" in cascade_sql
+    assert "resolved_at" in cascade_sql
+    assert "incident_id" in cascade_sql

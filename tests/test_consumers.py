@@ -94,12 +94,13 @@ class _FakeSession:
 
 
 class _FakeAssembler:
-    def __init__(self) -> None:
+    def __init__(self, completions: list | None = None) -> None:
         self.ingested: list[tuple[object, list, object]] = []
+        self._completions = completions or []
 
     async def ingest(self, session, logs, now=None, on_event=None):
         self.ingested.append((session, list(logs), on_event))
-        return []
+        return self._completions
 
 
 def _compiled(stmt) -> str:
@@ -211,6 +212,36 @@ async def test_raw_process_forwards_log_to_assembler():
     assert passed_session is session
     assert passed_logs == [log]
     assert passed_on_event is None  # no hub wired -> no broadcasting
+
+
+async def test_raw_events_consumer_triggers_incident_clustering_on_completion(monkeypatch):
+    """A journey that completes as FAILED must be handed to
+    backend.incidents.process_completion — this is the hook point the whole
+    clustering engine depends on."""
+    from backend.journeys import Completion
+    from backend.stitching import StitchedJourney
+
+    called_with = []
+
+    async def fake_process_completion(session, completion, **kw):
+        called_with.append(completion)
+        return None
+
+    monkeypatch.setattr("backend.consumers.process_completion", fake_process_completion)
+
+    completed = Completion(
+        journey_id="j1",
+        journey=StitchedJourney(journey_id="j1", order_id="ORD-1"),
+        status=JourneyStatus.FAILED,
+        outcome="ENRICHMENT_FAILED",
+    )
+    session = _FakeSession()
+    assembler = _FakeAssembler(completions=[completed])
+    consumer = RawEventsConsumer(session_factory=lambda: session, assembler=assembler)
+
+    await consumer._process(_log())
+
+    assert called_with == [completed]
 
 
 async def test_raw_process_forwards_on_event_to_assembler():

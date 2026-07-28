@@ -30,7 +30,7 @@ from pipeline.services.registry import BLOCKS
 from shared.models import Baton, BatonContext, LogLine
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v3.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v4.json"
 
 # Importing the service modules registers their blocks (import side-effect).
 _SERVICE_MODULES = [
@@ -87,11 +87,22 @@ TERMINAL_CONTAINS = {
     8: "processing aborted",
     9: "submission aborted",
     10: "order.outbound.dlq",
+    # 11-15: clustering test scenarios (shared/scenarios.py) — 11/12 and 6/13
+    # reuse the SPT-down/margin-check fail paths verbatim, so their terminal
+    # substrings match scenarios 8/6; 14 reuses the SAP-down path (matches 10).
+    11: "processing aborted",
+    12: "processing aborted",
+    13: "blocked by margin check",
+    14: "order.outbound.dlq",
+    # 15 is the novel/embedding-path case: it never reaches a recognized
+    # terminal at all, it TIMES OUT — its "terminal" is just the last emitted
+    # line, the unrecognized SettingsClient connection-reset ERROR.
+    15: "settings service unavailable",
 }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 async def test_scenario_ends_on_canonical_terminal(sid):
     logs, _ctx = await _drive(sid)
     assert logs, f"S{sid}: emitted no logs"
@@ -101,7 +112,7 @@ async def test_scenario_ends_on_canonical_terminal(sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", range(1, 11))
+@pytest.mark.parametrize("sid", range(1, 16))
 async def test_no_single_line_links_both_id_families_as_fields(sid):
     """The honest-bridge invariant: NO emitted line carries an eventId FIELD
     together with an order-id FIELD. The bridge is no longer an exception — it
@@ -131,7 +142,7 @@ async def test_pre_creation_failures_are_event_id_only(sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
 async def test_bridge_carries_only_event_id(sid):
     """The honest bridge: eventId ONLY — no order ids as fields, and none in its
     text (the message ends ``: status=CREATED``). It no longer links the id
@@ -154,7 +165,7 @@ async def test_bridge_carries_only_event_id(sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
 async def test_creation_logs_carry_order_ids_in_text_contract(sid):
     """CONTRACT (load-bearing, like the terminal messages): for every flow that
     creates an order, the order-engine creation logs must expose BOTH order ids

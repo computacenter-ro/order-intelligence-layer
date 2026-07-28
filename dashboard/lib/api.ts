@@ -1,4 +1,11 @@
-import type { Journey, OverviewStats, ProcessedAlert } from "@/lib/types";
+import type {
+  Incident,
+  IncidentDetail,
+  IncidentStatus,
+  Journey,
+  OverviewStats,
+  ProcessedAlert,
+} from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -170,6 +177,36 @@ export function fetchJourneys(filter: JourneysFilter = {}): Promise<Page<Journey
 
 export function fetchJourney(journeyId: string): Promise<Journey> {
   return getJson<Journey>(`/journeys/${encodeURIComponent(journeyId)}`);
+}
+
+export interface IncidentsFilter {
+  status?: IncidentStatus;
+  limit?: number;
+  cursor?: string;
+}
+
+export function fetchIncidents(filter: IncidentsFilter = {}): Promise<Page<Incident>> {
+  const params = new URLSearchParams();
+  if (filter.status) params.set("status", filter.status);
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  if (filter.cursor) params.set("cursor", filter.cursor);
+  const query = params.toString();
+  return getJson<Page<Incident>>(`/incidents${query ? `?${query}` : ""}`);
+}
+
+export function fetchIncident(incidentId: string): Promise<IncidentDetail> {
+  return getJson<IncidentDetail>(`/incidents/${encodeURIComponent(incidentId)}`);
+}
+
+/** Mark an incident resolved; returns the updated incident. */
+export async function resolveIncident(incidentId: string): Promise<Incident> {
+  const res = await fetch(`${API_URL}/incidents/${encodeURIComponent(incidentId)}/resolve`, {
+    method: "PATCH",
+    credentials: "include",
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`resolveIncident failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<Incident>;
 }
 
 /** Aggregate counters for the Insights page (backend GET /stats/insights). */

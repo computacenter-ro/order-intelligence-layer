@@ -107,6 +107,12 @@ class ChatRequest(BaseModel):
     k: int = 5
     filters: dict | None = None
     context: ChatContext | None = None
+    # IANA zone from the browser (e.g. "Europe/Bucharest") — the only party that
+    # knows where the reader is. Used to render the SCOPED context's timestamps in
+    # local time so the model quotes a time the reader recognises. Absent/unknown
+    # falls back to UTC. Indexed text stays UTC (it is shared by every viewer) and
+    # is converted on display instead.
+    tz: str | None = None
 
 
 class ChatSource(BaseModel):

@@ -55,6 +55,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.auth import get_current_user
 from backend.db import Alert, Incident, Journey, JourneyEvent, get_session
 from backend.pagination import apply_keyset, build_page
+# human_time lives in rag_client (the lower-level, shared module) so the indexer,
+# the backfill script and this route all format LLM-facing timestamps identically.
+from backend.rag_client import human_time
 from backend import stats
 from backend.schemas import (
     AlertFacets,
@@ -539,12 +542,64 @@ def _dashboard_link(metadata: dict, *, kind: str = "", record_id: str = "") -> s
     return f"{base}/journeys/{ref}"
 
 
-async def _context_text(session: AsyncSession, kind: str, record_id: str) -> str | None:
+# How many of a journey's log lines to include in the scoped context.
+#
+# A journey can carry 40+ events, most of them DEBUG/INFO filler. Sending all of
+# them would make every scoped question a large, slow prompt for little gain, so
+# the selection is: every WARN/ERROR (where the story is), plus the first and last
+# lines (where it started and how it ended), capped at this many.
+_CONTEXT_EVENT_CAP = 24
+
+
+def select_context_events(events: list) -> list:
+    """The log lines worth showing for a scoped journey question (pure).
+
+    Keeps WARN/ERROR lines plus the first and last event, in timestamp order,
+    truncated to :data:`_CONTEXT_EVENT_CAP`. Returns the ORM/dict rows unchanged so
+    the caller decides formatting.
+
+    Why not all of them: the summary alone could not answer "what came next?",
+    "how many retries?" or "what time did it fail?" — but the full DEBUG trace
+    would bury those answers and cost a large prompt on every question. The
+    WARN/ERROR lines are where a failure narrative actually lives.
+    """
+    if not events:
+        return []
+    keep: dict[int, object] = {}
+    for i, event in enumerate(events):
+        level = str((event.raw or {}).get("level", "")).upper()
+        if level in ("WARN", "ERROR") or i == 0 or i == len(events) - 1:
+            keep[i] = event
+    ordered = [keep[i] for i in sorted(keep)]
+    if len(ordered) <= _CONTEXT_EVENT_CAP:
+        return ordered
+    # Over the cap: keep the head and the tail, since a truncated middle costs
+    # less than losing either the start or the terminal line.
+    half = _CONTEXT_EVENT_CAP // 2
+    return ordered[:half] + ordered[-half:]
+
+
+def format_context_events(events: list, tz: str | None = None) -> str:
+    """Render selected journey events as one line each (pure, testable)."""
+    lines = []
+    for event in events:
+        raw = event.raw or {}
+        ts = human_time(raw.get("timestamp") or event.ts, tz) or ""
+        lines.append(
+            f"  {ts} {raw.get('level', '')} {raw.get('app_name', '')}: {raw.get('message', '')}"
+        )
+    return "\n".join(lines)
+
+
+async def _context_text(
+    session: AsyncSession, kind: str, record_id: str, tz: str | None = None
+) -> str | None:
     """The text of the record a question is scoped to, or None if absent.
 
     Read from THIS service's Postgres (the backend owns the DB) rather than asking
     the AI service — the index holds an embedded copy, but the DB is the source of
-    truth and may be newer.
+    truth and may be newer, and it has detail the index deliberately does not (the
+    per-journey log lines).
     """
     if kind == "alert":
         row = (
@@ -555,14 +610,62 @@ async def _context_text(session: AsyncSession, kind: str, record_id: str) -> str
         parts = [f"{row.app_name} {row.level} {row.logger}: {row.message}"]
         if row.explanation:
             parts.append(row.explanation)
-        return " ".join(parts)
+        # Ids + time so a scoped question can ask "when did this happen?" or
+        # "which journey is this part of?" — previously unanswerable because the
+        # context was only the message and the explanation.
+        facts = [f"at={human_time(row.emitted_at, tz)}" if row.emitted_at else ""]
+        for key, value in (
+            ("order_id", row.order_id),
+            ("event_id", row.event_id),
+            ("journey_id", row.journey_id),
+            ("department", row.department),
+            ("severity", row.severity),
+        ):
+            if value:
+                facts.append(f"{key}={value}")
+        return " ".join(parts) + " [" + " ".join(f for f in facts if f) + "]"
+
     if kind == "journey":
         row = (
             await session.execute(select(Journey).where(Journey.journey_id == record_id))
         ).scalar_one_or_none()
         if row is None:
             return None
-        return f"Journey {row.outcome or row.status}: {row.summary or ''}".strip()
+        header = f"Journey {row.outcome or row.status}"
+        facts = []
+        for key, value in (
+            ("order_id", row.order_id),
+            ("event_id", row.event_id),
+            ("cart_header_id", row.cart_header_id),
+            ("started", human_time(row.first_ts, tz)),
+            ("ended", human_time(row.last_ts, tz)),
+        ):
+            if value:
+                facts.append(f"{key}={value}")
+        blocks = [f"{header} [{' '.join(facts)}]"]
+        if row.summary:
+            blocks.append(row.summary.strip())
+
+        # The events are the point of this change: the summary is 2-4 sentences,
+        # while the DB holds the actual sequence the question is usually about.
+        events = (
+            (
+                await session.execute(
+                    select(JourneyEvent)
+                    .where(JourneyEvent.journey_id == record_id)
+                    .order_by(JourneyEvent.ts.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        selected = select_context_events(list(events))
+        if selected:
+            blocks.append(
+                f"Log lines ({len(selected)} of {len(events)} shown — "
+                f"WARN/ERROR plus first and last):\n{format_context_events(selected, tz)}"
+            )
+        return "\n".join(blocks)
     return None
 
 
@@ -595,7 +698,9 @@ async def chat(
 
     context_text = None
     if body.context is not None:
-        context_text = await _context_text(session, body.context.kind, body.context.id)
+        context_text = await _context_text(
+            session, body.context.kind, body.context.id, body.tz
+        )
 
     result = await ask(
         build_scoped_query(body.query, context_text), k=body.k, filters=body.filters

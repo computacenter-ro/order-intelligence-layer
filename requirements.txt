@@ -9,6 +9,10 @@ uvicorn[standard]>=0.30          # includes websockets support for backend /ws
 pydantic>=2.7                    # LogLine, Baton, ProcessedAlert
 pydantic-settings>=2.3           # env-based config (ES_URL, RABBITMQ_URL, ...)
 python-dotenv>=1.0               # load a gitignored .env into the environment
+# zoneinfo needs a zone database. Linux images have one; WINDOWS DOES NOT, so
+# without this ZoneInfo("Europe/Bucharest") raises and /chat silently falls back
+# to UTC in local dev while working in the container. Pure-Python, ~half a MB.
+tzdata>=2024.1                   # IANA zones for zoneinfo (required on Windows)
 
 # --- AI service (LangGraph pipeline) ---
 langgraph>=0.2

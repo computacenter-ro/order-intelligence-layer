@@ -190,6 +190,8 @@ def _failing_step(fail_at: str, chain: list[tuple[str, str]]) -> int:
             target = (OUTBOUND, BLOCKS.SUBMIT)
         case "settings":
             target = (SETTINGS, BLOCKS.SERVE)
+        case "rsm":
+            target = (RSM, BLOCKS.SERVE)
         case _:
             raise ValueError(f"unknown fail_at block: {fail_at!r}")
     try:
@@ -457,6 +459,70 @@ SCENARIOS: dict[int, Scenario] = {
         bridge_ids="both",
         fail_at="settings",
         terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
+    # =====================================================================
+    # 16 & 17 — TWO MORE NOVEL failures that exercise the embedding/novel
+    # path, chosen to demonstrate the two opposite clustering outcomes.
+    #
+    #   15 + 16  -> ONE novel incident (journey_count=2). Both fail at the
+    #               SETTINGS satellite with an unrecognized, INFRA-shaped
+    #               message, but 16 is WORDED DIFFERENTLY. Exact-text matching
+    #               would keep them apart; the embedding recognizes they MEAN
+    #               the same thing (same failing_service=SETTINGS, high cosine,
+    #               veto passes) and MERGES them. This is the case the novel
+    #               path exists for.
+    #   17        -> its OWN novel incident. It fails at a DIFFERENT satellite
+    #               (RSM), so failing_service=RSM. The novel-path guard keys on
+    #               failing_service BEFORE cosine, so RSM != SETTINGS keeps 17
+    #               out of 15/16's cluster deterministically — no reliance on
+    #               the embedding threshold. It would only ever absorb OTHER
+    #               novel RSM failures.
+    #
+    # !!! Same service-code prerequisites as 15 (scenarios.py alone is NOT
+    #     enough); both fail via the order-engine client "<--- ERROR" response
+    #     (satellite unreachable, so NO satellite serve log), and the chain
+    #     truncates BEFORE the recognized "Order processing aborted" wrapper so
+    #     the failure stays UNRECOGNIZED_FAILURE (novel), not a NAMED subtype.
+    #   16) pipeline/services/settings.py must emit a NOVEL, INFRA-shaped ERROR
+    #       for its serve block when ctx.fail_at == "settings" — matching flow
+    #       16 in the mock JSON, DIFFERENT WORDING from flow 15 but same meaning:
+    #        "[SettingsClient#getAccountSettingByOrganizationHierarchy] <--- ERROR:
+    #         could not reach settings satellite — read timed out awaiting account
+    #         settings response (8000ms)"
+    #   17) pipeline/services/rsm.py must emit a NOVEL, INFRA-shaped ERROR for
+    #       its serve block when ctx.fail_at == "rsm" — matching flow 17:
+    #        "[RsmClient#getPvcRates] <--- ERROR: rsm rebate service unreachable —
+    #         upstream returned HTTP 502 after 3 retries (12000ms)"
+    #   Also required for 17 to cluster by SERVICE (not the coarse cc-order-engine
+    #   fallback): add the RsmClient logger marker to the backend's
+    #   _SERVICE_LOGGER_MARKERS -> ("RsmClient", "RSM"). Without it, 17's
+    #   failing_service falls back to cc-order-engine and leans on cosine alone.
+    #   Verify: 15+16 -> one UNRECOGNIZED_FAILURE incident (journey_count=2);
+    #   17 -> a SEPARATE UNRECOGNIZED_FAILURE incident (journey_count=1).
+    # =====================================================================
+    16: Scenario(
+        id=16,
+        name="Novel enrichment failure (SETTINGS unavailable) — 2nd order, DIFFERENT wording (MERGES with 15) — NEEDS EMBEDDINGS",
+        outcome="UNRECOGNIZED_FAILURE",  # unrecognized on purpose -> novel/embedding path
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("4249751", "SKU-DELL-P7680-I9")],
+        bridge_ids="both",
+        fail_at="settings",
+        terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
+    17: Scenario(
+        id=17,
+        name="Novel enrichment failure (RSM unreachable) — DIFFERENT service (SEPARATE cluster from 15/16) — NEEDS EMBEDDINGS",
+        outcome="UNRECOGNIZED_FAILURE",  # unrecognized on purpose -> novel/embedding path
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("4249751", "SKU-DELL-P7680-I9")],
+        bridge_ids="both",
+        fail_at="rsm",
+        terminal=(RSM, BLOCKS.SERVE),
     ),
 }
 

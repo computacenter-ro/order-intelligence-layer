@@ -2,12 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@computacenter-ro/style-guide/components";
-import { radii, semanticSpacing } from "@computacenter-ro/style-guide/tokens";
+import { semanticSpacing } from "@computacenter-ro/style-guide/tokens";
 import { fetchIncidents, resolveIncident } from "@/lib/api";
 import { usePagination } from "@/lib/usePagination";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { IncidentCard } from "@/components/incidents/IncidentCard";
 import { NewIncidentsBanner } from "@/components/incidents/NewIncidentsBanner";
+import { FilterDropdown } from "@/components/alerts/FilterDropdown";
 import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
 import type { FilterOption } from "@/components/alerts/FilterDropdown";
 import { capitalize } from "@/lib/format";
@@ -30,19 +31,6 @@ const DEPARTMENT_OPTIONS: FilterOption[] = DEPARTMENTS.map((d) => ({
   value: d,
   label: capitalize(d),
 }));
-
-const selectStyle: React.CSSProperties = {
-  height: "32px",
-  minWidth: "150px",
-  padding: `0 ${semanticSpacing.md}`,
-  fontSize: "14px",
-  fontFamily: "inherit",
-  color: "var(--cc-grey-one)",
-  backgroundColor: "var(--cc-cloud-white)",
-  border: "1px solid var(--cc-grey-four)",
-  borderRadius: radii.md,
-  cursor: "pointer",
-};
 
 export default function IncidentsPage() {
   const [status, setStatus] = useState<StatusFilter>("open");
@@ -157,36 +145,17 @@ export default function IncidentsPage() {
       <div
         style={{
           display: "flex",
-          alignItems: "flex-end",
-          gap: semanticSpacing.base,
+          gap: semanticSpacing.sm,
           marginBottom: "24px",
         }}
       >
-        <div style={{ display: "flex", flexDirection: "column", maxWidth: "220px" }}>
-          <label
-            htmlFor="incident-status-filter"
-            style={{
-              fontSize: "14px",
-              fontWeight: 500,
-              color: "var(--cc-grey-one)",
-              marginBottom: semanticSpacing.xs,
-            }}
-          >
-            Status
-          </label>
-          <select
-            id="incident-status-filter"
-            style={selectStyle}
-            value={status}
-            onChange={(e) => handleStatusChange(e.target.value as StatusFilter)}
-          >
-            {STATUS_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-        </div>
+        <FilterDropdown
+          label="Status"
+          value={status}
+          options={STATUS_OPTIONS}
+          defaultValue="all"
+          onChange={(v) => handleStatusChange(v as StatusFilter)}
+        />
         <MultiFilterDropdown
           label="Department"
           selected={department}

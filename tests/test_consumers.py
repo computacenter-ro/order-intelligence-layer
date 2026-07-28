@@ -159,6 +159,21 @@ def test_alert_row_values_fallback_nulls_enrichment():
     assert values["log_id"] == "log-1"
 
 
+def test_alert_row_values_maps_embedding():
+    # Regression: the embedding was computed by ai_service and carried on the
+    # ProcessedAlert, but silently dropped at this exact DB boundary — every
+    # persisted alert had embedding=NULL, which made backend/incidents.py's
+    # novel/embedding clustering path (_find_open_incident_by_cosine) bail out
+    # immediately for every unrecognized failure, live-testing discovery.
+    alert = _alert("ai")
+    alert.embedding = [0.1, 0.2, 0.3]
+    assert alert_row_values(alert)["embedding"] == [0.1, 0.2, 0.3]
+
+
+def test_alert_row_values_embedding_defaults_none():
+    assert alert_row_values(_alert("ai"))["embedding"] is None
+
+
 # --- AlertsConsumer ----------------------------------------------------------
 
 

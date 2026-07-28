@@ -89,6 +89,10 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
         # recomputed. Kept distinct from ``source`` on purpose — a hit is still
         # source="ai", so Teams routing is unchanged and only this flag differs.
         "cached": alert.cached,
+        # backend/incidents.py's novel/embedding clustering path compares this
+        # across alerts (_find_open_incident_by_cosine) — without it, every
+        # unrecognized failure would silently fail to cluster with any other.
+        "embedding": alert.embedding,
     }
 
 

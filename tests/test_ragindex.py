@@ -21,7 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ai_service import api, ragindex
-from ai_service.ragindex import RagDeps, RagIndex
+from ai_service.ragindex import NEUTRAL_BOOST, RagDeps, RagIndex
 
 # Reuse the deterministic fakes — no duplicate test scaffolding.
 from tests.test_ai_service import FakeRedis
@@ -88,7 +88,9 @@ def test_retrieve_ranks_a_different_query_differently(index):
 
 def test_retrieve_returns_all_expected_fields(index):
     top = index.retrieve("margin check failed", k=1)[0]
-    assert set(top) == {"id", "kind", "text", "metadata", "score"}
+    # final_score/boost were added with feedback-blended ranking; `score` stays the
+    # raw cosine so the blend's effect is inspectable rather than invisible.
+    assert set(top) == {"id", "kind", "text", "metadata", "score", "final_score", "boost"}
     assert top["kind"] == "alert"
     assert 0.0 <= top["score"] <= 1.0
 
@@ -116,6 +118,90 @@ def test_retrieval_floor_is_looser_than_the_cache_threshold():
     from ai_service import settings
 
     assert settings.RAGINDEX_MIN_SCORE < settings.SEMCACHE_THRESHOLD
+
+
+# =============================================================================
+# feedback-blended ranking
+# =============================================================================
+def test_zero_weight_is_an_exact_no_op(index):
+    """The escape hatch must be provably inert: RAGINDEX_FEEDBACK_WEIGHT=0 has to
+    leave ranking bit-for-bit unchanged, or "turn it off" is not a real option."""
+    plain = index.retrieve("margin check failed below threshold", k=5)
+    boosted = index.retrieve(
+        "margin check failed below threshold", k=5,
+        boosts={"a1": 1.0, "a2": 0.0}, feedback_weight=0.0,
+    )
+    assert [r["id"] for r in plain] == [r["id"] for r in boosted]
+    assert all(r["score"] == r["final_score"] for r in boosted)
+
+
+def test_feedback_cannot_surface_an_irrelevant_record(index):
+    """THE safety property. The relevance floor is applied to raw cosine BEFORE the
+    blend, so no amount of likes can put an unrelated incident in front of an
+    agent. Without this, a brigade of votes could break search entirely."""
+    index.index("offtopic", "alert", "completely unrelated bread baking recipe", {})
+    results = index.retrieve(
+        "sap rfc communication failure partner", k=10,
+        boosts={"offtopic": 1.0}, feedback_weight=0.15,
+    )
+    assert all(r["id"] != "offtopic" for r in results)
+
+
+def test_an_unvoted_record_is_not_penalised(index):
+    """A record missing from `boosts` must score NEUTRAL, not zero — most records
+    are never voted on, and treating silence as bad would tax them all."""
+    results = index.retrieve(
+        "margin check failed below threshold", k=5,
+        boosts={}, feedback_weight=0.15,
+    )
+    assert results
+    assert all(r["boost"] == NEUTRAL_BOOST for r in results)
+
+
+def test_a_boost_can_reorder_close_matches(index):
+    """The point of the feature: among records that BOTH cleared the floor, feedback
+    decides order."""
+    idx = RagIndex(FakeEncoder(), min_score=0.0, max_entries=10)
+    # Near-identical text so cosine is close and the boost is decisive.
+    idx.index("liked", "alert", "sap rfc failure partner not reached", {})
+    idx.index("plain", "alert", "sap rfc failure partner unreachable", {})
+    q = "sap rfc failure partner"
+    before = [r["id"] for r in idx.retrieve(q, k=2)]
+    after = [
+        r["id"]
+        for r in idx.retrieve(q, k=2, boosts={"liked": 1.0}, feedback_weight=0.5)
+    ]
+    assert before != after or before[0] == "liked"
+    assert after[0] == "liked"
+
+
+def test_the_blend_formula_is_applied_as_documented(index):
+    results = index.retrieve(
+        "margin check failed below threshold", k=1,
+        boosts={"a1": 1.0}, feedback_weight=0.2,
+    )
+    top = results[0]
+    assert top["final_score"] == pytest.approx(top["score"] * 0.8 + 1.0 * 0.2)
+
+
+def test_weight_is_clamped_to_a_sane_range(index):
+    """A misconfigured weight must not invert or explode the ranking."""
+    for weight in (-5.0, 5.0):
+        results = index.retrieve(
+            "margin check failed below threshold", k=5,
+            boosts={"a1": 1.0}, feedback_weight=weight,
+        )
+        assert all(0.0 <= r["final_score"] <= 1.0 for r in results)
+
+
+def test_raw_score_is_still_reported_alongside_the_blend(index):
+    """Both numbers are returned so the effect is inspectable rather than invisible."""
+    top = index.retrieve(
+        "margin check failed below threshold", k=1,
+        boosts={"a1": 0.9}, feedback_weight=0.15,
+    )[0]
+    assert "score" in top and "final_score" in top and "boost" in top
+    assert top["final_score"] != top["score"]  # the blend did something
 
 
 # =============================================================================

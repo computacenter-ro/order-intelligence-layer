@@ -123,6 +123,20 @@ RAGINDEX_MIN_SCORE = float(os.getenv("RAGINDEX_MIN_SCORE", "0.30"))
 RAGINDEX_MAX_ENTRIES = int(os.getenv("RAGINDEX_MAX_ENTRIES", "5000"))
 # Redis key for the persisted index dump (rebuildable via backfill_rag).
 RAGINDEX_KEY = os.getenv("RAGINDEX_KEY", "ai:ragindex")
+# How much agent thumbs-up/down feedback nudges retrieval ranking:
+#   final = cosine * (1 - w) + feedback * w
+# Deliberately SMALL. Relevance must dominate, so no amount of likes can promote
+# an irrelevant record (the relevance floor is applied to raw cosine, before the
+# blend). 0 disables the feature entirely and is an exact no-op on ranking — the
+# escape hatch if feedback ever turns out to hurt. See backend/feedback.py for how
+# the score is computed and which voting biases it corrects for.
+#
+# 0.30 rather than a more timid 0.15, calibrated to THIS corpus: retrieved cosine
+# scores cluster tightly (measured 0.5805..0.6263 — a 0.046 spread), so a 0.15
+# weight shifts a final score by at most ~0.02 and could not cross the gap between
+# neighbours. Feedback that cannot reorder anything is not a feature. Raise or
+# lower it if the score spread changes; check with the numbers, not by feel.
+RAGINDEX_FEEDBACK_WEIGHT = float(os.getenv("RAGINDEX_FEEDBACK_WEIGHT", "0.30"))
 
 # --- Suppression list ---------------------------------------------------------
 # Benign WARNs that must never become alerts (CLAUDE.md [3] "Suppression list").

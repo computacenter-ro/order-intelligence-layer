@@ -205,4 +205,28 @@ export interface ChatResponse {
   sources: ChatSource[];
   mode: ChatMode;
   coverage: ChatCoverage;
+  /** Identifies THIS answer so it can be rated (POST /chat/feedback). */
+  answer_id: string;
+}
+
+/**
+ * A thumbs up/down on one answer.
+ *
+ * Rates the ANSWER, not any single source: the backend attributes credit to the
+ * cited records by rank (see backend/feedback.py), so `record_ids` must be sent
+ * IN THE ORDER SHOWN. Re-voting the same `answer_id` replaces the prior vote.
+ */
+export interface ChatFeedbackRequest {
+  answer_id: string;
+  liked: boolean;
+  query?: string;
+  record_ids?: string[];
+  answer_mode?: ChatMode;
+  scoped_kind?: string | null;
+  scoped_id?: string | null;
+}
+
+export interface ChatFeedbackResponse {
+  recorded: boolean;
+  liked: boolean;
 }

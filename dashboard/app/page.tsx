@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { fetchAlerts, fetchFacets, resolveAlert, type AlertFacets, type Page } from "@/lib/api";
 import { usePagination } from "@/lib/usePagination";
@@ -12,10 +12,12 @@ import {
   AlertFilterBar,
   DEFAULT_ALERT_FILTERS,
   alertMatchesFilters,
+  hasActiveFilters,
   sanitizeAlertFilters,
   toAlertsQuery,
   type AlertFilters,
 } from "@/components/alerts/AlertFilterBar";
+import { EmptyState } from "@/components/ui/EmptyState";
 import type { ProcessedAlert, WsEvent } from "@/lib/types";
 
 const FILTERS_STORAGE_KEY = "oil.alertFilters";
@@ -80,25 +82,32 @@ export default function AlertFeedPage() {
   // exact query; the backend applies exclude-self per facet, which is why the
   // current multi-select ticks are sent rather than withheld.
   const [facets, setFacets] = useState<AlertFacets | null>(null);
+  const facetsRequestRef = useRef(0);
 
-  useEffect(() => {
-    if (!filtersReady) return;
-    // Filters can change faster than the request returns; without this guard a
-    // slow earlier response could land last and leave stale counts on screen.
-    let current = true;
+  const loadFacets = useCallback(() => {
+    // Self-guarding rather than relying on each caller: filters can change — or a
+    // reveal can fire — faster than the request returns, and a slow earlier
+    // response landing last would leave stale counts on screen. Stamping every
+    // request and applying only the newest protects the effect and the reveal
+    // alike, so a future third caller can't forget to.
+    const requestId = ++facetsRequestRef.current;
     fetchFacets(toAlertsQuery(filters, false))
       .then((next) => {
-        if (current) setFacets(next);
+        if (requestId === facetsRequestRef.current) setFacets(next);
       })
       .catch((err) => {
         // Counts are an enhancement — the filters and the list work without them,
         // so a failure keeps the last known values rather than breaking the page.
         console.error("Failed to load alert facets:", err);
       });
-    return () => {
-      current = false;
-    };
-  }, [filters, filtersReady]);
+  }, [filters]);
+
+  // loadFacets' identity changes with `filters`, so this refires on every filter
+  // change as well as once filters become ready.
+  useEffect(() => {
+    if (!filtersReady) return;
+    loadFacets();
+  }, [filtersReady, loadFacets]);
 
   const { items, loading, hasMore, loadMore, reload, prepend, remove } =
     usePagination<ProcessedAlert>(fetchPage, (a) => a.alert_id);
@@ -136,7 +145,12 @@ export default function AlertFeedPage() {
     // oldest-first to leave the newest alert on top. The hook dedups.
     [...pending].reverse().forEach(prepend);
     setPending([]);
-  }, [pending, prepend]);
+    // The revealed alerts change what the filter counts should say, and nothing
+    // else would refresh them — the facets effect keys on `filters`, which a
+    // reveal doesn't touch. Without this the pills keep the numbers from before
+    // the burst arrived.
+    loadFacets();
+  }, [pending, prepend, loadFacets]);
 
   const handleResolve = useCallback(
     (alert: ProcessedAlert) => {
@@ -160,17 +174,31 @@ export default function AlertFeedPage() {
       </p>
       <AlertFilterBar value={filters} onChange={handleFiltersChange} facets={facets} />
       <div>
-        <NewAlertsBanner count={pending.length} onReveal={handleReveal} />
-        {/* Server returns emitted_at DESC; prepend keeps live alerts on top. */}
-        {items.map((alert) => (
-          <AlertCard
-            key={alert.alert_id}
-            alert={alert}
-            onOpen={setSelected}
-            onResolve={handleResolve}
-            isSelected={selected?.alert_id === alert.alert_id}
-          />
-        ))}
+        <NewAlertsBanner count={pending.length} onClick={handleReveal} />
+        {items.length === 0 && !loading ? (
+          hasActiveFilters(filters) ? (
+            <EmptyState
+              title="No alerts match your filters"
+              hint="Try clearing or widening the filters above."
+            />
+          ) : (
+            <EmptyState
+              title="No active alerts"
+              hint="New WARN / ERROR alerts show up here in real time — fire the injector to generate some flows."
+            />
+          )
+        ) : (
+          /* Server returns emitted_at DESC; prepend keeps live alerts on top. */
+          items.map((alert) => (
+            <AlertCard
+              key={alert.alert_id}
+              alert={alert}
+              onOpen={setSelected}
+              onResolve={handleResolve}
+              isSelected={selected?.alert_id === alert.alert_id}
+            />
+          ))
+        )}
       </div>
       {hasMore && (
         <div style={{ display: "flex", justifyContent: "center", marginTop: "16px" }}>

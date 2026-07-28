@@ -210,6 +210,7 @@ async def ask(
     query: str,
     k: int = 5,
     filters: dict | None = None,
+    boosts: dict[str, float] | None = None,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> dict:
@@ -222,7 +223,9 @@ async def ask(
     same way an LLM outage does: no narrative, no sources, but not an error page.
     """
     url = f"{AI_SERVICE_URL}/chat"
-    body = {"query": query, "k": k, "filters": filters}
+    # boosts travel with the request: the backend owns the votes, the AI service
+    # owns the index and stays DB-free.
+    body = {"query": query, "k": k, "filters": filters, "boosts": boosts or {}}
     try:
         if client is not None:
             resp = await client.post(url, json=body, timeout=RAG_CHAT_TIMEOUT)

@@ -349,7 +349,7 @@ def _backend_client(monkeypatch, *, reply=None, capture=None):
 
     app.dependency_overrides[get_session] = _session_override
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         if capture is not None:
             capture.append({"query": query, "k": k, "filters": filters})
         return reply or {
@@ -585,7 +585,7 @@ def test_backend_chat_context_fetches_and_prepends_the_record(monkeypatch):
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -640,7 +640,7 @@ def test_backend_chat_journey_context_includes_log_lines(monkeypatch):
 
     seen: list[str] = []
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         seen.append(query)
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -674,7 +674,7 @@ def test_backend_chat_missing_context_record_degrades_to_the_bare_question(monke
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "retrieval-only"}
 

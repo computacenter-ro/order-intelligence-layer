@@ -1,10 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { PaperPlaneRightIcon, XIcon } from "@phosphor-icons/react";
+import {
+  PaperPlaneRightIcon,
+  ThumbsDownIcon,
+  ThumbsUpIcon,
+  XIcon,
+} from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
-import { sendChat, UnauthorizedError } from "@/lib/api";
+import { sendChat, sendChatFeedback, UnauthorizedError } from "@/lib/api";
 import { localizeUtcStamps } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ChatContext, ChatMode, ChatSource } from "@/lib/types";
@@ -51,6 +56,71 @@ interface Turn {
   sourcesLabel?: string;
   /** True for the "something went wrong" turn — styled as a warning, not an answer. */
   failed?: boolean;
+  /** Identifies this answer for rating; absent on failed turns (nothing to rate). */
+  answerId?: string;
+  /** The question that produced it — sent with the vote for later analysis. */
+  query?: string;
+  /** null = not yet voted. Optimistic: set before the request returns. */
+  liked?: boolean | null;
+}
+
+/** Thumbs up/down on one answer. */
+function VoteButtons({
+  liked,
+  onVote,
+}: {
+  liked: boolean | null | undefined;
+  onVote: (liked: boolean) => void;
+}) {
+  const base: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "28px",
+    height: "28px",
+    background: "transparent",
+    border: "1px solid var(--cc-grey-five)",
+    borderRadius: "8px",
+    cursor: "pointer",
+    padding: 0,
+    lineHeight: 0,
+  };
+  // Circuit Green / United Red are the palette's success and negative signals, and
+  // this is exactly a small semantic indicator — the one place accent colours are
+  // allowed. Unselected stays grey so neither option is visually pre-suggested.
+  const up: React.CSSProperties =
+    liked === true
+      ? { ...base, borderColor: "var(--cc-circuit-green)", color: "var(--cc-circuit-green)" }
+      : { ...base, color: "var(--cc-grey-three)" };
+  const down: React.CSSProperties =
+    liked === false
+      ? { ...base, borderColor: "var(--cc-united-red)", color: "var(--cc-united-red)" }
+      : { ...base, color: "var(--cc-grey-three)" };
+
+  return (
+    <div style={{ display: "flex", gap: "4px", marginLeft: "auto" }}>
+      <button
+        type="button"
+        onClick={() => onVote(true)}
+        style={up}
+        aria-label="This answer was helpful"
+        aria-pressed={liked === true}
+        title="Helpful — nudges these records up in future searches"
+      >
+        <ThumbsUpIcon size={16} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onVote(false)}
+        style={down}
+        aria-label="This answer was not helpful"
+        aria-pressed={liked === false}
+        title="Not helpful"
+      >
+        <ThumbsDownIcon size={16} />
+      </button>
+    </div>
+  );
 }
 
 /**
@@ -175,7 +245,13 @@ function SourceChip({ source }: { source: ChatSource }) {
   );
 }
 
-function TurnBubble({ turn }: { turn: Turn }) {
+function TurnBubble({
+  turn,
+  onVote,
+}: {
+  turn: Turn;
+  onVote?: (turn: Turn, liked: boolean) => void;
+}) {
   if (turn.role === "user") {
     return (
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "16px" }}>
@@ -226,6 +302,10 @@ function TurnBubble({ turn }: { turn: Turn }) {
             <span title={badge.title}>
               <Badge status={badge.status}>{badge.label}</Badge>
             </span>
+            {/* Only real answers are rateable — a failed turn has nothing to rate. */}
+            {turn.answerId && onVote && (
+              <VoteButtons liked={turn.liked} onVote={(liked) => onVote(turn, liked)} />
+            )}
           </div>
         )}
 
@@ -274,6 +354,33 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
 
   if (!open) return null;
 
+  /**
+   * Record a thumbs up/down.
+   *
+   * Optimistic and deliberately un-revertible on failure: the click is a nicety,
+   * not the work, so a dropped vote must never bounce the button back and imply
+   * the agent mis-clicked. Clicking the same side again is idempotent server-side
+   * (the row is keyed by answer_id), so a double-click cannot inflate the tally.
+   */
+  const vote = (turn: Turn, liked: boolean) => {
+    if (!turn.answerId) return;
+    const answerId = turn.answerId;
+    setTurns((prev) =>
+      prev.map((t) => (t.answerId === answerId ? { ...t, liked } : t))
+    );
+    void sendChatFeedback({
+      answer_id: answerId,
+      liked,
+      query: turn.query ?? "",
+      // In the ORDER SHOWN — the backend attributes credit by citation rank, so a
+      // reordered list would mis-credit the sources.
+      record_ids: (turn.sources ?? []).map((s) => s.id),
+      answer_mode: turn.mode,
+      scoped_kind: context?.kind ?? null,
+      scoped_id: context?.id ?? null,
+    });
+  };
+
   const ask = async (question: string) => {
     const query = question.trim();
     if (!query || busy) return;
@@ -293,6 +400,9 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
         ...prev,
         {
           role: "assistant",
+          answerId: res.answer_id,
+          query,
+          liked: null,
           // Safety net for the other path: records from the INDEX carry UTC (they
           // are shared by every viewer), so any such stamp the model quoted is
           // rewritten to local here. Scoped answers are already local.
@@ -413,7 +523,7 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           )}
 
           {turns.map((turn, i) => (
-            <TurnBubble key={i} turn={turn} />
+            <TurnBubble key={i} turn={turn} onVote={vote} />
           ))}
 
           {busy && (

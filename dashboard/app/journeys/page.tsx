@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Card, Button } from "@computacenter-ro/style-guide/components";
 import { badgeColors, radii } from "@computacenter-ro/style-guide/tokens";
 import { Badge } from "@/components/ui/Badge";
+import { EmptyState } from "@/components/ui/EmptyState";
 import { formatTime, formatTimestampFull } from "@/lib/format";
 import { JOURNEY_STATUS_BADGE, JOURNEY_STATUS_LABEL } from "@/lib/journeyStatus";
 import { fetchJourneys } from "@/lib/api";
@@ -248,6 +249,15 @@ function JourneysPageContent() {
           </tbody>
         </table>
       </Card>
+      {items.length === 0 && !loading &&
+        (status !== "all" ? (
+          <EmptyState title="No journeys with this status" />
+        ) : (
+          <EmptyState
+            title="No journeys yet"
+            hint="Run the injector to start some order flows."
+          />
+        ))}
       {hasMore && (
         <div style={{ display: "flex", justifyContent: "center", marginTop: "16px" }}>
           <Button variant="secondary" onClick={loadMore} disabled={loading} loading={loading}>

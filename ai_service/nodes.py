@@ -17,6 +17,7 @@ fallback), never coerced into a wrong-but-valid department.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -167,6 +168,26 @@ _SUMMARY_SYSTEM = (
     "beyond the logs. Reply with the summary only."
 )
 
+# UNRECOGNIZED_FAILURE is the one outcome journeys.py can't name — a real
+# ERROR occurred but no known _FAILURE_RULES marker matched it. This is the
+# ONLY outcome that asks for a label; every other outcome uses _SUMMARY_SYSTEM
+# unchanged. Duplicated literal, not imported — ai_service and backend never
+# cross-import (see this project's clustering-plan Global Constraints).
+_UNRECOGNIZED_FAILURE_OUTCOME = "UNRECOGNIZED_FAILURE"
+
+_SUMMARY_WITH_LABEL_SYSTEM = (
+    "You summarize the end-to-end journey of ONE order through a microservice "
+    "order-management pipeline, for an IT-support engineer. This order's "
+    "journey ended in a way none of the system's known failure categories "
+    "recognize, so do two things:\n"
+    "1. Write 2-4 plain-English sentences: which services the order touched, "
+    "where it stopped, and why. Do not speculate beyond the logs.\n"
+    "2. Give a short label (3-6 words) naming the specific failure, based on "
+    "the causal ERROR log — e.g. 'SPT connection pool exhausted'.\n"
+    "Reply with ONLY a JSON object: {\"summary\": \"...\", \"label\": \"...\"}. "
+    "No other text."
+)
+
 
 def _log_brief(log: LogLine) -> str:
     """The log fields the LLM needs, as a compact prompt block."""
@@ -215,29 +236,67 @@ async def route(
     return _parse_route(_content_text(resp))
 
 
+@dataclass(frozen=True)
+class SummaryResult:
+    summary: str
+    suggested_label: str | None = None
+
+
 async def summarize_journey(
     outcome: str, logs: list[LogLine], model: BaseChatModel | None
-) -> str:
-    """LLM journey summary. Returns the summary text; raises LLMError otherwise.
+) -> SummaryResult:
+    """LLM journey summary (+ a suggested failure label for the one
+    unrecognized case). Returns a :class:`SummaryResult`; raises LLMError
+    otherwise.
 
-    Builds a compact prompt from the journey outcome + its ordered log lines
-    (app_name + message each, which is what the narrative needs). The caller
-    (api.py) runs this under the shared breaker and falls back to a template.
+    For every outcome except UNRECOGNIZED_FAILURE this behaves exactly as
+    before: one plain-text summary, no label, same prompt. That's the one
+    case where backend/journeys.py couldn't name the failure — the same LLM
+    call is also asked to name it, via a JSON reply instead of plain text.
     """
     if model is None:
         raise LLMError("no summary model configured")
     lines = "\n".join(f"{log.app_name}: {log.message}" for log in logs)
     prompt = f"outcome={outcome}\nlogs:\n{lines}"
+    want_label = outcome == _UNRECOGNIZED_FAILURE_OUTCOME
+    system = _SUMMARY_WITH_LABEL_SYSTEM if want_label else _SUMMARY_SYSTEM
     try:
         resp = await model.ainvoke(
-            [SystemMessage(content=_SUMMARY_SYSTEM), HumanMessage(content=prompt)]
+            [SystemMessage(content=system), HumanMessage(content=prompt)]
         )
     except Exception as exc:
         raise LLMError(f"summary call failed: {exc}") from exc
     text = _content_text(resp).strip()
     if not text:
         raise LLMError("summary returned empty text")
-    return text
+    if not want_label:
+        return SummaryResult(summary=text, suggested_label=None)
+    return _parse_summary_with_label(text)
+
+
+def _parse_summary_with_label(text: str) -> SummaryResult:
+    """Split a JSON `{"summary": ..., "label": ...}` reply into a
+    :class:`SummaryResult`. Tolerant of surrounding prose (grabs the first
+    {...}, mirrors _parse_route's extraction). Never raises: a missing or
+    malformed label degrades to ``suggested_label=None``, using the raw text
+    as the summary — a bad label must never take down a perfectly good
+    summary, matching this codebase's "always fail toward the safe default"
+    rule (see ai_service/semcache.py).
+    """
+    raw = text.strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(raw[start : end + 1])
+        except (ValueError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            summary = str(data.get("summary", "")).strip()
+            label = data.get("label")
+            label = str(label).strip() if label else None
+            if summary:
+                return SummaryResult(summary=summary, suggested_label=label or None)
+    return SummaryResult(summary=raw, suggested_label=None)
 
 
 def build_chat_prompt(query: str, sources: list[dict]) -> str:

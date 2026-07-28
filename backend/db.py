@@ -106,6 +106,13 @@ class Journey(Base):
 
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Set only for a FAILED journey whose outcome is UNRECOGNIZED_FAILURE
+    # (backend/journeys.py) — an LLM-suggested short phrase for the incident
+    # title, persisted by backend/journeys.py's _finalize_journey and read by
+    # backend/incidents.py's process_completion. Null for every other outcome,
+    # and null when the AI service had nothing to suggest (LLM down, etc.).
+    suggested_failure_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Set by backend/incidents.py on journey completion; null until then, and
     # for a journey that never forms/joins an incident (SUCCESS journeys, or a
     # TIMED_OUT journey with no linked ERROR alert).

@@ -19,6 +19,7 @@ from shared.models import LogLine
 from backend.journeys import (
     JourneyAssembler,
     JourneyStatus,
+    SummaryResult,
     classify_failure,
     detect_terminal,
     is_stalled,
@@ -616,7 +617,7 @@ async def test_summary_populated_in_completed_event_when_summarizer_set():
 
     async def fake_summarizer(completion):
         calls.append(completion.journey_id)
-        return "This UK order completed successfully through to tracking."
+        return SummaryResult(summary="This UK order completed successfully through to tracking.")
 
     a = JourneyAssembler(summarizer=fake_summarizer)
     events, on_event = _sink()
@@ -630,7 +631,7 @@ async def test_summary_populated_in_completed_event_when_summarizer_set():
 
 async def test_summary_none_when_summarizer_returns_none():
     async def down_summarizer(completion):
-        return None  # AI service unreachable / LLM down
+        return SummaryResult(summary=None)  # AI service unreachable / LLM down
 
     a = JourneyAssembler(summarizer=down_summarizer)
     events, on_event = _sink()
@@ -657,7 +658,7 @@ async def test_summarizer_called_from_sweep_stalled():
 
     async def fake_summarizer(completion):
         seen.append(completion.outcome)
-        return f"Timed out at {completion.outcome}."
+        return SummaryResult(summary=f"Timed out at {completion.outcome}.")
 
     a = JourneyAssembler(stalled_timeout=90, summarizer=fake_summarizer)
     events, on_event = _sink()

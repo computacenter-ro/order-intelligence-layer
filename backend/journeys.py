@@ -183,6 +183,20 @@ class Completion:
     outcome: str  # subtype (== status value for SUCCESS / TIMED_OUT)
 
 
+@dataclass
+class SummaryResult:
+    """What the injected ``summarizer`` callable returns: the journey summary
+    text, plus (only for the UNRECOGNIZED_FAILURE outcome) a suggested
+    incident-title label the AI service derived from the causal line. Both
+    fields are ``None`` when the AI service is unreachable or the LLM is
+    down — the callable itself never raises, mirroring every other
+    best-effort integration point in this codebase.
+    """
+
+    summary: str | None
+    suggested_label: str | None = None
+
+
 # --- Incremental assembly + persistence --------------------------------------
 
 
@@ -314,7 +328,7 @@ class JourneyAssembler:
             for completion in completions:
                 await on_event(
                     _journey_completed_event(
-                        completion, summaries.get(completion.journey_id)
+                        completion, _summary_text(summaries.get(completion.journey_id))
                     )
                 )
         return completions
@@ -343,7 +357,7 @@ class JourneyAssembler:
             for completion in completions:
                 await on_event(
                     _journey_completed_event(
-                        completion, summaries.get(completion.journey_id)
+                        completion, _summary_text(summaries.get(completion.journey_id))
                     )
                 )
         return completions
@@ -413,7 +427,7 @@ class JourneyAssembler:
 
     @staticmethod
     async def _finalize_journey(
-        session, completion: Completion, summary: str | None = None
+        session, completion: Completion, summary_result: "SummaryResult | None" = None
     ) -> None:
         from sqlalchemy import update
         from backend.db import Journey
@@ -428,10 +442,13 @@ class JourneyAssembler:
             "order_id": journey.order_id,
             "cart_header_id": journey.cart_header_id,
         }
-        # Only overwrite summary when we actually got one — a failed/absent
-        # summary must not clobber a summary a prior finalize may have stored.
-        if summary is not None:
-            values["summary"] = summary
+        # Only overwrite summary/label when we actually got one — a failed/absent
+        # result must not clobber a value a prior finalize may have stored.
+        if summary_result is not None:
+            if summary_result.summary is not None:
+                values["summary"] = summary_result.summary
+            if summary_result.suggested_label is not None:
+                values["suggested_failure_label"] = summary_result.suggested_label
         stmt = (
             update(Journey)
             .where(Journey.journey_id == completion.journey_id)
@@ -439,12 +456,12 @@ class JourneyAssembler:
         )
         await session.execute(stmt)
 
-    async def _summaries_for(self, completions) -> dict[str, str | None]:
+    async def _summaries_for(self, completions) -> dict[str, "SummaryResult"]:
         """Fetch summaries for completed journeys (empty if no summarizer set).
 
-        Best-effort: the summarizer itself never raises (returns None on any
-        failure), so a slow/down AI service degrades to summary=None without
-        breaking completion.
+        Best-effort: the summarizer itself never raises (returns a
+        SummaryResult with both fields None on any failure), so a slow/down AI
+        service degrades without breaking completion.
 
         Also pushes each completed journey to the retrieval index, since this is
         the one place that has both the completion and its summary. Gated on
@@ -453,12 +470,12 @@ class JourneyAssembler:
         """
         if self._summarizer is None or not completions:
             return {}
-        summaries: dict[str, str | None] = {}
+        results: dict[str, SummaryResult] = {}
         for completion in completions:
-            summary = await self._summarizer(completion)
-            summaries[completion.journey_id] = summary
-            await self._index_journey_safely(completion, summary)
-        return summaries
+            result = await self._summarizer(completion)
+            results[completion.journey_id] = result
+            await self._index_journey_safely(completion, result.summary)
+        return results
 
     async def _index_journey_safely(self, completion: Completion, summary: str | None) -> None:
         """Push a completed journey to the retrieval index; swallow everything.
@@ -481,6 +498,10 @@ class JourneyAssembler:
 
 def _as_list(logs) -> list[LogLine]:
     return list(logs)
+
+
+def _summary_text(result: "SummaryResult | None") -> str | None:
+    return result.summary if result is not None else None
 
 
 def _distinct_journeys(new_events) -> list[StitchedJourney]:

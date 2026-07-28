@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from backend.journeys import Completion, JourneyStatus
+from backend.journeys import Completion, JourneyStatus, SummaryResult
 from backend.stitching import StitchedJourney
 from backend.summarizer import build_request, fetch_summary
 from shared.models import LogLine
@@ -90,20 +90,43 @@ def test_build_request_validates_against_ai_service_contract():
 async def test_fetch_summary_returns_text_on_success():
     client = _FakeClient(_FakeResp({"journey_id": "J1", "summary": "All good.", "source": "ai"}))
     result = await fetch_summary(_completion(), client=client)
-    assert result == "All good."
+    assert result.summary == "All good."
+    assert result.suggested_label is None
     assert client.calls[0][0].endswith("/summarize-journey")
 
 
 async def test_fetch_summary_returns_none_when_ai_service_down():
     client = _FakeClient(boom=True)  # connection error
-    assert await fetch_summary(_completion(), client=client) is None
+    result = await fetch_summary(_completion(), client=client)
+    assert result.summary is None
+    assert result.suggested_label is None
 
 
 async def test_fetch_summary_returns_none_on_http_error():
     client = _FakeClient(_FakeResp({}, status=500))
-    assert await fetch_summary(_completion(), client=client) is None
+    result = await fetch_summary(_completion(), client=client)
+    assert result.summary is None
 
 
 async def test_fetch_summary_returns_none_on_empty_summary():
     client = _FakeClient(_FakeResp({"journey_id": "J1", "summary": "", "source": "fallback"}))
-    assert await fetch_summary(_completion(), client=client) is None
+    result = await fetch_summary(_completion(), client=client)
+    assert result.summary is None
+
+
+async def test_fetch_summary_returns_suggested_label_when_present():
+    client = _FakeClient(_FakeResp({
+        "journey_id": "J1", "summary": "Novel failure.", "source": "ai",
+        "suggested_label": "SPT connection pool exhausted",
+    }))
+    result = await fetch_summary(_completion(), client=client)
+    assert result.summary == "Novel failure."
+    assert result.suggested_label == "SPT connection pool exhausted"
+
+
+async def test_fetch_summary_defaults_label_to_none_when_field_absent():
+    # Rolling-deploy safety: an older AI-service reply with no suggested_label
+    # field must not crash the backend.
+    client = _FakeClient(_FakeResp({"journey_id": "J1", "summary": "ok", "source": "ai"}))
+    result = await fetch_summary(_completion(), client=client)
+    assert result.suggested_label is None

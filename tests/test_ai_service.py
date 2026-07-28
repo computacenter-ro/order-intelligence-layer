@@ -876,6 +876,104 @@ def test_summarize_journey_falls_back_to_template_when_no_model():
     assert "cc-spt-service" in body["summary"]  # the app_name from the logs
 
 
+def _summary_request_unrecognized() -> dict:
+    req = _summary_request()
+    req["outcome"] = "UNRECOGNIZED_FAILURE"
+    req["logs"] = [
+        _log(level="INFO", message="Get order by Order Number:ORD-6015").model_dump(mode="json"),
+        _log(level="ERROR", message="ConnectionPoolExhaustedError: settings cache unavailable").model_dump(mode="json"),
+    ]
+    return req
+
+
+def test_summarize_journey_returns_suggested_label_for_unrecognized_failure():
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake('{"summary": "The order stalled at settings enrichment.", '
+                    '"label": "Settings cache connection pool exhausted"}'),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["summary"] == "The order stalled at settings enrichment."
+    assert body["suggested_label"] == "Settings cache connection pool exhausted"
+
+
+def test_summarize_journey_no_label_for_recognized_outcomes():
+    # Every existing outcome (named subtypes, SUCCESS, plain TIMED_OUT) must
+    # never get a label, regardless of what the model would say — the branch
+    # only exists for UNRECOGNIZED_FAILURE.
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("Order ORD-6008 was created then failed at SPT enrichment."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())  # outcome=ENRICHMENT_FAILED
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("suggested_label") is None
+    assert "SPT" in body["summary"]  # existing behavior, byte-for-byte unchanged
+
+
+def test_summarize_journey_label_falls_back_to_none_when_breaker_open():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "fallback"
+    assert body.get("suggested_label") is None
+    assert "UNRECOGNIZED_FAILURE" in body["summary"]  # existing template, unchanged
+
+
+def test_summarize_journey_degrades_gracefully_on_malformed_json_label_reply():
+    # The model ignores the JSON instruction and replies with plain prose —
+    # must still produce a usable summary, just no label. Never raises.
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("The settings cache could not be reached."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["summary"] == "The settings cache could not be reached."
+    assert body.get("suggested_label") is None
+
+
+from ai_service.nodes import SummaryResult, _parse_summary_with_label  # noqa: E402
+
+
+def test_parse_summary_with_label_happy_path():
+    result = _parse_summary_with_label(
+        '{"summary": "Settings cache was unreachable.", "label": "Settings cache down"}'
+    )
+    assert result == SummaryResult(summary="Settings cache was unreachable.", suggested_label="Settings cache down")
+
+
+def test_parse_summary_with_label_tolerates_surrounding_prose():
+    result = _parse_summary_with_label(
+        'Sure, here you go:\n{"summary": "It failed.", "label": "X"}\nHope that helps!'
+    )
+    assert result.summary == "It failed."
+    assert result.suggested_label == "X"
+
+
+def test_parse_summary_with_label_degrades_when_not_json():
+    result = _parse_summary_with_label("It just failed, no idea why.")
+    assert result.summary == "It just failed, no idea why."
+    assert result.suggested_label is None
+
+
+def test_parse_summary_with_label_degrades_when_label_key_missing():
+    result = _parse_summary_with_label('{"summary": "It failed."}')
+    assert result.summary == "It failed."
+    assert result.suggested_label is None
+
+
 def test_template_summary_is_deterministic_and_llm_free():
     req = api.SummaryRequest(**_summary_request())
     s1 = api.template_summary(req)

@@ -415,9 +415,12 @@ SCENARIOS: dict[int, Scenario] = {
     # 15 is the NOVEL failure — the ONLY scenario here that needs EMBEDDINGS.
     #
     # It fails at the SETTINGS enrichment satellite with a message the backend's
-    # _FAILURE_RULES does NOT recognize, so the journey never resolves to a known
-    # subtype: it TIMES OUT with a real ERROR and must cluster via the embedding
-    # / novel path instead of a (subtype, service) signature.
+    # _FAILURE_RULES does NOT recognize, so the journey never resolves to a
+    # known NAMED subtype. Since it logs a real ERROR before going silent, the
+    # journey correctly resolves as FAILED/UNRECOGNIZED_FAILURE (not TIMED_OUT
+    # — that label is reserved for journeys with no ERROR signal at all) once
+    # the stall clock confirms nothing more is coming, and clusters via the
+    # embedding/novel path instead of a (subtype, service) signature.
     #
     # !!! REQUIRES a small service-code change — scenarios.py alone is NOT enough:
     #   1) pipeline/services/settings.py must emit an ERROR failure variant for
@@ -429,7 +432,8 @@ SCENARIOS: dict[int, Scenario] = {
     #         account settings (8000ms)"
     #      Two properties MUST both hold:
     #        (a) it must NOT match any backend _FAILURE_RULES pattern — that
-    #            unfamiliarity is what keeps it novel -> TIMED_OUT -> embeddings; and
+    #            unfamiliarity is what keeps it novel -> UNRECOGNIZED_FAILURE ->
+    #            embeddings; and
     #        (b) it must read as INFRA (words like "unavailable"/"connection"),
     #            because only INFRA-class failures search for a match. A novel
     #            failure classified order-specific would just open its own
@@ -438,13 +442,14 @@ SCENARIOS: dict[int, Scenario] = {
     #   2) The chain truncates after (SETTINGS, SERVE) below, so the order engine
     #      never emits its recognized "Order processing aborted" wrapper — which
     #      is what stops it being (mis)classified as ENRICHMENT_FAILED.
-    #   Verify: the flow should end TIMED_OUT (not a recognized outcome) and,
-    #   because it carries a real ERROR, still form/join an incident via embeddings.
+    #   Verify: the flow should end FAILED/UNRECOGNIZED_FAILURE (not a recognized
+    #   NAMED subtype, and not TIMED_OUT — it has a real ERROR) and, because it
+    #   carries that real ERROR, still form/join an incident via embeddings.
     # =====================================================================
     15: Scenario(
         id=15,
         name="Novel enrichment failure (SETTINGS unavailable) — NEEDS EMBEDDINGS",
-        outcome="TIMED_OUT",  # unrecognized on purpose -> novel/embedding path
+        outcome="UNRECOGNIZED_FAILURE",  # unrecognized on purpose -> novel/embedding path
         country="UK",
         user="RFLORIA",
         accountNumber="81036533",

@@ -229,26 +229,26 @@ async def test_index_journey_never_raises_when_the_service_is_down():
 async def test_assembler_completion_survives_an_exploding_indexer():
     """The indexer is wired into _summaries_for; if it raises, journey completion
     must still return its summaries (backend/journeys.py isolates the sink)."""
-    from backend.journeys import JourneyAssembler
+    from backend.journeys import JourneyAssembler, SummaryResult
 
     async def _summarizer(_completion):
-        return "the summary"
+        return SummaryResult(summary="the summary")
 
     async def _indexer(_completion, _summary):
         raise RuntimeError("index exploded")
 
     assembler = JourneyAssembler(summarizer=_summarizer, indexer=_indexer)
     summaries = await assembler._summaries_for([_completion()])
-    assert summaries == {"J1": "the summary"}  # completion unaffected
+    assert summaries == {"J1": SummaryResult(summary="the summary")}  # completion unaffected
 
 
 async def test_assembler_passes_the_summary_to_the_indexer():
-    from backend.journeys import JourneyAssembler
+    from backend.journeys import JourneyAssembler, SummaryResult
 
     seen: list[tuple[str, str | None]] = []
 
     async def _summarizer(_completion):
-        return "the summary"
+        return SummaryResult(summary="the summary")
 
     async def _indexer(completion, summary):
         seen.append((completion.journey_id, summary))
@@ -259,10 +259,10 @@ async def test_assembler_passes_the_summary_to_the_indexer():
 
 
 async def test_assembler_without_an_indexer_is_unchanged():
-    from backend.journeys import JourneyAssembler
+    from backend.journeys import JourneyAssembler, SummaryResult
 
     async def _summarizer(_completion):
-        return "s"
+        return SummaryResult(summary="s")
 
     assembler = JourneyAssembler(summarizer=_summarizer)  # no indexer
-    assert await assembler._summaries_for([_completion()]) == {"J1": "s"}
+    assert await assembler._summaries_for([_completion()]) == {"J1": SummaryResult(summary="s")}

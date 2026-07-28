@@ -8865,7 +8865,7 @@
     "orderId": "ORD-6015",
     "cartHeaderId": "1840927365018240015",
     "scenario": "Novel enrichment failure — SETTINGS unavailable (unrecognized → embeddings)",
-    "outcome": "TIMED_OUT",
+    "outcome": "UNRECOGNIZED_FAILURE",
     "events": [
       {
         "log_id": "ff7c6b9a-713d-43f1-a9ac-000126e9d1a2",

@@ -384,7 +384,7 @@ async def test_sweep_stalled_finalizes_timed_out_journey():
     # be finalized as TIMED_OUT by the sweep (no new message needed).
     start = datetime(2026, 7, 20, 8, 0, 0, tzinfo=timezone.utc)
     assembler = JourneyAssembler(stalled_timeout=90)
-    assembler.add([_log(log_id="x-1", timestamp=start, message="Received inbound order event evt-1")])
+    assembler.add([_log(log_id="x-1", timestamp=start, message="Received inbound order event evt-1", level="INFO")])
 
     session = _FakeSession()
     now = start + timedelta(seconds=120)  # well past the 90s stall window

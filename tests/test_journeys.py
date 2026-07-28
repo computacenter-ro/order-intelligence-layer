@@ -25,7 +25,7 @@ from backend.journeys import (
     status_for,
     SUCCESS,
     TIMED_OUT,
-    FAILED,
+    UNRECOGNIZED_FAILURE,
     INBOUND_TRANSFORM_FAILED,
     ORDER_CREATION_FAILED,
     MARGIN_CHECK_FAILED,
@@ -179,7 +179,7 @@ def test_status_for():
     assert status_for(TIMED_OUT) is JourneyStatus.TIMED_OUT
     assert status_for(MARGIN_CHECK_FAILED) is JourneyStatus.FAILED
     assert status_for(INBOUND_TRANSFORM_FAILED) is JourneyStatus.FAILED
-    assert status_for(FAILED) is JourneyStatus.FAILED
+    assert status_for(UNRECOGNIZED_FAILURE) is JourneyStatus.FAILED
 
 
 # --- JourneyAssembler: incremental decisions --------------------------------
@@ -244,6 +244,55 @@ def test_assembler_timeout_only_after_threshold():
     [c] = a.evaluate(now=BASE + timedelta(seconds=91))
     assert c.status is JourneyStatus.TIMED_OUT
     assert c.outcome == TIMED_OUT
+
+
+def test_unrecognized_error_reclassifies_as_failed_not_timed_out():
+    # A genuinely new fatal ERROR that doesn't match any _FAILURE_RULES marker
+    # must not be indistinguishable from a journey that went silent with no
+    # error at all.
+    a = JourneyAssembler(stalled_timeout=90)
+    a.add([
+        mk(0, "Received inbound order event evt-1", eventId="evt-1"),
+        mk(1, "ConnectionPoolExhaustedError: no available connections",
+           level="ERROR", app_name="cc-settings-service", eventId="evt-1"),
+    ])
+    # last log lands at offset 1s, so the 90s window elapses at BASE+91s
+    [c] = a.evaluate(now=BASE + timedelta(seconds=92))
+    assert c.status is JourneyStatus.FAILED
+    assert c.outcome == UNRECOGNIZED_FAILURE
+
+
+def test_true_silence_still_times_out():
+    # No ERROR at all -> still TIMED_OUT, unchanged (this already passes via
+    # test_assembler_timeout_only_after_threshold; this is the same case named
+    # explicitly for contrast with the test above).
+    a = JourneyAssembler(stalled_timeout=90)
+    a.add([mk(0, "Received inbound order event evt-1", eventId="evt-1")])
+    [c] = a.evaluate(now=BASE + timedelta(seconds=91))
+    assert c.status is JourneyStatus.TIMED_OUT
+    assert c.outcome == TIMED_OUT
+
+
+def test_error_burst_before_silence_still_reclassifies_once_stalled():
+    # Mirrors pipeline/services/spt.py's real retry shape: multiple ERROR
+    # lines (one per retry) all land well before the 90s window elapses. The
+    # reclassification must not fire early on the FIRST error — only once the
+    # stall clock actually crosses the threshold, same as today's timing.
+    a = JourneyAssembler(stalled_timeout=90)
+    a.add([
+        mk(0, "Received inbound order event evt-1", eventId="evt-1"),
+        mk(1, "SocketTimeoutException: connect timed out (10014ms)",
+           level="ERROR", app_name="cc-order-engine", eventId="evt-1"),
+        mk(2, "SocketTimeoutException: connect timed out (10014ms)",
+           level="ERROR", app_name="cc-order-engine", eventId="evt-1"),
+        mk(3, "SocketTimeoutException: connect timed out (10014ms)",
+           level="ERROR", app_name="cc-order-engine", eventId="evt-1"),
+    ])
+    # still within the window: nothing decided yet, regardless of the ERRORs
+    assert a.evaluate(now=BASE + timedelta(seconds=90)) == []
+    [c] = a.evaluate(now=BASE + timedelta(seconds=94))
+    assert c.status is JourneyStatus.FAILED
+    assert c.outcome == UNRECOGNIZED_FAILURE
 
 
 def test_message_terminal_wins_over_timeout():
@@ -342,10 +391,10 @@ def _assemble(
     Returns the assembler and the completions from a single final evaluate().
     For a message-driven outcome (SUCCESS/FAILED) a real terminal always wins
     over the stall clock, so pinning ``now`` to the last log's own timestamp is
-    enough — the default here. A TIMED_OUT flow (scenario 15) has no message
-    terminal at all, so its completion only appears once ``now`` actually
-    crosses the stall boundary — callers pass an explicit ``now`` for that case
-    (see :func:`_terminal_now`).
+    enough — the default here. Scenario 15 (UNRECOGNIZED_FAILURE) has no
+    message terminal at all, so its completion only appears once ``now``
+    actually crosses the stall boundary — callers pass an explicit ``now`` for
+    that case (see :func:`_terminal_now`).
     """
     a = JourneyAssembler()
     for batch in batches:
@@ -361,12 +410,13 @@ def _terminal_now(flow: dict) -> datetime:
     """The clock value at which ``flow``'s journey is expected to complete.
 
     Message-driven outcomes complete the instant their last log lands, so the
-    last log's own timestamp is enough. TIMED_OUT (scenario 15) never hits a
-    message terminal by definition — it only resolves once the stall clock
-    crosses STALLED_TIMEOUT, so ``now`` must be pushed past that boundary.
+    last log's own timestamp is enough. TIMED_OUT and UNRECOGNIZED_FAILURE
+    (scenario 15) never hit a message terminal by definition — they only
+    resolve once the stall clock crosses STALLED_TIMEOUT, so ``now`` must be
+    pushed past that boundary.
     """
     last_ts = max(log.timestamp for log in flow["logs"])
-    if flow["outcome"] == TIMED_OUT:
+    if flow["outcome"] in (TIMED_OUT, UNRECOGNIZED_FAILURE):
         return last_ts + timedelta(seconds=STALLED_TIMEOUT + 1)
     return last_ts
 
@@ -396,10 +446,11 @@ def test_flow_outcome_matches_fixture(flow):
     assert len(completions) == 1
     assert completions[0].outcome == flow["outcome"]
     # Pure detection agrees directly on the stitched, ordered logs — except for
-    # TIMED_OUT (scenario 15), which by definition has NO message terminal
-    # (that unrecognized-ness is exactly why it only resolves via the stall
-    # clock, not the shared clustering novel/embedding path's reason to exist).
-    if flow["outcome"] == TIMED_OUT:
+    # TIMED_OUT and UNRECOGNIZED_FAILURE (scenario 15), where by definition no
+    # _FAILURE_RULES marker matches (that unrecognized-ness is exactly why
+    # detect_terminal alone can't resolve it — only the stall-clock branch in
+    # _state() can, which is exactly the path this whole feature adds).
+    if flow["outcome"] in (TIMED_OUT, UNRECOGNIZED_FAILURE):
         assert detect_terminal(a.stitcher.journeys[0].logs) is None
     else:
         assert detect_terminal(a.stitcher.journeys[0].logs) == flow["outcome"]

@@ -66,7 +66,9 @@ def _utcnow() -> datetime:
 
 SUCCESS = "SUCCESS"
 TIMED_OUT = "TIMED_OUT"
-FAILED = "FAILED"  # generic fallback subtype for an unclassified fatal abort
+UNRECOGNIZED_FAILURE = "UNRECOGNIZED_FAILURE"  # a real ERROR occurred but no
+# _FAILURE_RULES marker matched it — distinct from TIMED_OUT (which means no
+# ERROR signal was ever seen at all). See _state()'s stall branch below.
 
 INBOUND_TRANSFORM_FAILED = "INBOUND_TRANSFORM_FAILED"
 ORDER_CREATION_FAILED = "ORDER_CREATION_FAILED"
@@ -259,6 +261,8 @@ class JourneyAssembler:
         if outcome is not None:
             return status_for(outcome), outcome
         if journey.last_ts is not None and is_stalled(journey.last_ts, now, self._timeout):
+            if any(log.level == "ERROR" for log in journey.logs):
+                return JourneyStatus.FAILED, UNRECOGNIZED_FAILURE
             return JourneyStatus.TIMED_OUT, TIMED_OUT
         return JourneyStatus.IN_PROGRESS, None
 

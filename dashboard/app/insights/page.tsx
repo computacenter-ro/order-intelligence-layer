@@ -1,12 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchStats } from "@/lib/api";
-<<<<<<< Updated upstream
-=======
 import { useWebSocket } from "@/lib/useWebSocket";
 import { NewAlertsBanner } from "@/components/alerts/NewAlertsBanner";
->>>>>>> Stashed changes
 import { formatDuration, humanizeKey } from "@/lib/format";
 import {
   OUTCOME_FAILED,
@@ -20,7 +17,7 @@ import { StatCard } from "@/components/insights/StatCard";
 import { ChartCard, ColorKey } from "@/components/insights/ChartCard";
 import { BreakdownBarChart, type BreakdownRow } from "@/components/insights/BreakdownBarChart";
 import { SplitBar } from "@/components/insights/SplitBar";
-import type { OverviewStats } from "@/lib/types";
+import type { OverviewStats, WsEvent } from "@/lib/types";
 
 // Backend bucket keys for journeys that have not stopped anywhere yet. The
 // outcome chart answers "where do orders stop?", so an order still moving
@@ -49,16 +46,46 @@ export default function InsightsPage() {
   const [stats, setStats] = useState<OverviewStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Alerts that arrived since the numbers on screen were computed. This page is
+  // a snapshot, not a live view — refetching per alert would redraw every chart
+  // mid-read — so it counts them and lets the reader choose when to catch up.
+  const [newCount, setNewCount] = useState(0);
 
-  useEffect(() => {
+  const loadStats = useCallback(() => {
     fetchStats()
-      .then(setStats)
+      .then((next) => {
+        setStats(next);
+        // Clear a stale error from a previous failed attempt, so a recovered
+        // backend doesn't leave the error screen up behind fresh data.
+        setError(null);
+      })
       .catch((err) => {
         console.error("Failed to load insights stats:", err);
         setError("Could not load the insights stats.");
       })
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    loadStats();
+  }, [loadStats]);
+
+  // Both event types move these numbers: alert.new changes the alert breakdowns,
+  // journey.completed changes the outcome chart and the success rate. journey.updated
+  // is ignored — an in-progress journey is already counted and its status hasn't
+  // changed, so it would inflate the badge without anything to refresh.
+  const handleEvent = useCallback((event: WsEvent) => {
+    if (event.type === "alert.new" || event.type === "journey.completed") {
+      setNewCount((count) => count + 1);
+    }
+  }, []);
+
+  useWebSocket(handleEvent);
+
+  const handleRefresh = useCallback(() => {
+    loadStats();
+    setNewCount(0);
+  }, [loadStats]);
 
   const outcomeRows = useMemo<BreakdownRow[]>(() => {
     if (!stats) return [];
@@ -104,7 +131,11 @@ export default function InsightsPage() {
     return <p style={{ fontSize: "16px", color: "var(--cc-grey-three)" }}>Loading overview…</p>;
   }
 
-  if (error || !stats) {
+  // Gated on `!stats`, not on `error`: now that a refresh can fail too, keying
+  // this on the error flag would tear down a screen full of valid charts because
+  // one refetch failed. With stats in hand the page keeps showing them (the
+  // failure is logged) and the reader can click the pill again.
+  if (!stats) {
     return (
       <div>
         <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: 0 }}>
@@ -126,6 +157,11 @@ export default function InsightsPage() {
 
   return (
     <div>
+      {/* Same pill the feed uses (NewAlertsBanner takes a bare onClick, so the
+          "reveal" meaning is the caller's). Here clicking refetches the stats,
+          which redraws the KPIs and every chart, and resets the count. "update"
+          because the count mixes alerts and journey completions. */}
+      <NewAlertsBanner count={newCount} onClick={handleRefresh} noun="update" />
       <h1 style={{ fontSize: "32px", fontWeight: 700, color: "var(--cc-heritage-blue)", margin: 0 }}>
         Insights
       </h1>
@@ -172,11 +208,6 @@ export default function InsightsPage() {
           // Signal color only when there is something to signal; the label says
           // "Critical" either way, so color is never the only cue.
           tone={criticalCount > 0 ? OUTCOME_FAILED : undefined}
-        />
-        <StatCard
-          label="Avg duration"
-          value={formatDuration(journeys.avg_duration_seconds)}
-          hint="first to last log"
         />
         <StatCard
           label="Timed out"

@@ -5,7 +5,19 @@ import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 
 interface NewAlertsBannerProps {
   count: number;
-  onReveal: () => void;
+  /** Fired when the pill is clicked. Named for the interaction, not one caller's
+   *  meaning of it: the feed reveals buffered alerts, Insights re-fetches its
+   *  stats. Anything that wants a "N new things — click me" pill can use it. */
+  onClick: () => void;
+  /**
+   * What is being counted, singular. Pluralized with a trailing "s".
+   *
+   * Needed because the count is not always alerts: Insights also counts
+   * journey completions, and a pill reading "3 new alerts" for 2 alerts and a
+   * journey states something false about the data — the one thing a live counter
+   * must not do.
+   */
+  noun?: string;
 }
 
 /** Nearest ancestor that actually scrolls (the app content scrolls inside
@@ -20,7 +32,7 @@ function getScrollParent(node: HTMLElement): HTMLElement | null {
   return null;
 }
 
-export function NewAlertsBanner({ count, onReveal }: NewAlertsBannerProps) {
+export function NewAlertsBanner({ count, onClick, noun = "alert" }: NewAlertsBannerProps) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [scrolled, setScrolled] = useState(false);
   const visible = count > 0;
@@ -41,7 +53,7 @@ export function NewAlertsBanner({ count, onReveal }: NewAlertsBannerProps) {
   if (!visible) return null;
 
   const tone = badgeColors.pending;
-  const label = count === 1 ? "1 new alert" : `${count} new alerts`;
+  const label = count === 1 ? `1 new ${noun}` : `${count} new ${noun}s`;
 
   return (
     // Full-width sticky strip; transparent + click-through so only the pill
@@ -61,7 +73,7 @@ export function NewAlertsBanner({ count, onReveal }: NewAlertsBannerProps) {
       <button
         type="button"
         className="oil-new-alerts-banner"
-        onClick={onReveal}
+        onClick={onClick}
         style={{
           pointerEvents: "auto",
           width: "100%",

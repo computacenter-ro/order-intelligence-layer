@@ -1,4 +1,6 @@
 import type {
+  ChatFeedbackRequest,
+  ChatFeedbackResponse,
   ChatRequest,
   ChatResponse,
   Incident,
@@ -246,4 +248,29 @@ export async function sendChat(body: ChatRequest): Promise<ChatResponse> {
   if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error(`/chat failed: ${res.status} ${res.statusText}`);
   return res.json() as Promise<ChatResponse>;
+}
+
+/**
+ * Rate an assistant answer (thumbs up/down).
+ *
+ * Fire-and-forget from the UI's point of view: the panel updates optimistically
+ * and a failure here must not undo what the agent clicked or throw an error at
+ * them — the vote is a nicety, not the work. Returns null on any failure so the
+ * caller can decide whether to surface it.
+ */
+export async function sendChatFeedback(
+  body: ChatFeedbackRequest
+): Promise<ChatFeedbackResponse | null> {
+  try {
+    const res = await fetch(`${API_URL}/chat/feedback`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as ChatFeedbackResponse;
+  } catch {
+    return null;
+  }
 }

@@ -361,8 +361,6 @@ const TIME_OPTIONS: FilterOption[] = TIME_FILTERS.map((t) => ({
 // sliver of row two peek through.
 const COLLAPSED_MAX_PX = 36;
 
-<<<<<<< Updated upstream
-=======
 /**
  * True when any filter is set away from its default. Spelled out rather than
  * looped over the defaults: the three multi-selects are arrays, and
@@ -382,21 +380,8 @@ export function hasActiveFilters(value: AlertFilters): boolean {
     value.search.trim() !== ""
   );
 }
-
->>>>>>> Stashed changes
 export function AlertFilterBar({ value, onChange, facets }: AlertFilterBarProps) {
-  // Spelled out rather than looped over the defaults: the three multi-selects are
-  // arrays, and `value.department === DEFAULT_ALERT_FILTERS.department` compares
-  // references — always false for a fresh [], which would leave "Reset Filters"
-  // permanently visible.
-  const isDefault =
-    value.department.length === 0 &&
-    value.severity.length === 0 &&
-    value.app_name.length === 0 &&
-    value.source === "all" &&
-    value.level === "all" &&
-    value.cached === "all" &&
-    value.time === "all";
+  const isDefault = !hasActiveFilters(value);
 
   const [expanded, setExpanded] = useState(false);
   // Whether the seven controls need more than one row at the current width —

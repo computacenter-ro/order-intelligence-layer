@@ -9,10 +9,12 @@ import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
 import {
   AlertFilterBar,
   DEFAULT_ALERT_FILTERS,
+  hasActiveFilters,
   sanitizeAlertFilters,
   toAlertsQuery,
   type AlertFilters,
 } from "@/components/alerts/AlertFilterBar";
+import { EmptyState } from "@/components/ui/EmptyState";
 import type { ProcessedAlert } from "@/lib/types";
 
 // Separate from the feed's "oil.alertFilters" so History and Feed remember their
@@ -124,9 +126,15 @@ export default function HistoryPage() {
       </p>
       <AlertFilterBar value={filters} onChange={setFilters} facets={facets} />
       <div>
-        {items.length === 0 && !loading && (
-          <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet.</p>
-        )}
+        {items.length === 0 && !loading &&
+          (hasActiveFilters(filters) ? (
+            <EmptyState title="No resolved alerts match your filters" />
+          ) : (
+            <EmptyState
+              title="No resolved alerts yet"
+              hint="Resolve an alert from the feed and it'll land here."
+            />
+          ))}
         {items.map((alert) => (
           <AlertCard
             key={alert.alert_id}

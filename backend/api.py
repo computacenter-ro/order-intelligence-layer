@@ -50,6 +50,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
@@ -58,7 +59,8 @@ from sqlalchemy import ColumnElement, Select, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user
-from backend.db import Alert, Incident, Journey, JourneyEvent, get_session
+from backend.db import Alert, ChatFeedback, Incident, Journey, JourneyEvent, get_session
+from backend.feedback import boosts_from
 from backend.pagination import apply_keyset, build_page
 # human_time lives in rag_client (the lower-level, shared module) so the indexer,
 # the backfill script and this route all format LLM-facing timestamps identically.
@@ -68,6 +70,8 @@ from backend.schemas import (
     AlertFacets,
     AlertOut,
     ChatCoverage,
+    ChatFeedbackRequest,
+    ChatFeedbackResponse,
     ChatRequest,
     ChatResponse,
     ChatSource,
@@ -750,8 +754,17 @@ async def chat(
             session, body.context.kind, body.context.id, body.tz
         )
 
+    # Agent feedback is the backend's data, but ranking happens in the AI service
+    # (which owns the index and must stay DB-free), so the counts travel WITH the
+    # request. Failure here is non-fatal: no boosts means ranking falls back to
+    # pure relevance, which is the pre-feedback behaviour.
+    boosts = await _feedback_boosts(session)
+
     result = await ask(
-        build_scoped_query(body.query, context_text), k=body.k, filters=body.filters
+        build_scoped_query(body.query, context_text),
+        k=body.k,
+        filters=body.filters,
+        boosts=boosts,
     )
     return ChatResponse(
         answer=result["answer"],
@@ -774,7 +787,94 @@ async def chat(
         # retrieval, and the dashboard renders it (a badge on counting answers)
         # rather than reading it out of the prose.
         coverage=ChatCoverage(**(result.get("coverage") or {})),
+        # Minted here so the dashboard can rate THIS answer. Not persisted until a
+        # vote actually arrives — an unrated answer leaves no row.
+        answer_id=uuid.uuid4().hex,
     )
+
+
+# Most recent votes to fold into the boosts. Bounded so one query stays cheap on
+# the chat path; older votes are decayed to near-nothing anyway
+# (backend/feedback.py HALF_LIFE_DAYS), so the tail contributes little.
+_FEEDBACK_SCAN_LIMIT = 2000
+
+
+def settings_feedback_weight() -> float:
+    """The configured blend weight, read from the AI service's settings.
+
+    Read at call time rather than import time so a test can monkeypatch it, and
+    kept in one function so the "is the feature on?" check has a single home.
+    """
+    from ai_service import settings as ai_settings
+
+    return float(getattr(ai_settings, "RAGINDEX_FEEDBACK_WEIGHT", 0.0))
+
+
+async def _feedback_boosts(session: AsyncSession) -> dict[str, float]:
+    """Per-record feedback boosts for ranking, or ``{}`` on any problem.
+
+    Returns ``{}`` — never raises — when the weight is 0 (feature off) or the query
+    fails: retrieval then ranks on relevance alone, exactly as it did before
+    feedback existed. Search must not break because a vote table is unavailable.
+    """
+    if settings_feedback_weight() <= 0.0:
+        return {}
+    try:
+        rows = (
+            await session.execute(
+                select(ChatFeedback).order_by(ChatFeedback.created_at.desc()).limit(
+                    _FEEDBACK_SCAN_LIMIT
+                )
+            )
+        ).scalars().all()
+        return boosts_from(rows)
+    except Exception as exc:  # noqa: BLE001 — ranking degrades, never fails
+        print(f"[chat] feedback boosts unavailable: {type(exc).__name__}: {exc}", flush=True)
+        return {}
+
+
+@router.post("/chat/feedback", response_model=ChatFeedbackResponse)
+async def chat_feedback(
+    body: ChatFeedbackRequest,
+    user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ChatFeedbackResponse:
+    """Record a thumbs up/down on one answer (auth required).
+
+    Upserts on ``answer_id``, so voting again REPLACES the previous vote rather
+    than stacking — an agent can change their mind without inflating the tally.
+
+    Stored per ANSWER, not per record: the vote rates the reply that was read, and
+    credit is attributed to its sources as a derivation (rank-weighted, see
+    ``backend/feedback.py``). That keeps the attribution rule changeable later.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    vote = 1 if body.liked else -1
+    values = {
+        "answer_id": body.answer_id,
+        "created_at": datetime.now(timezone.utc),
+        "vote": vote,
+        "query": body.query,
+        "record_ids": list(body.record_ids),
+        "answer_mode": body.answer_mode,
+        "scoped_kind": body.scoped_kind,
+        "scoped_id": body.scoped_id,
+        "username": user,
+    }
+    stmt = (
+        pg_insert(ChatFeedback)
+        .values(**values)
+        .on_conflict_do_update(
+            index_elements=["answer_id"],
+            # Refresh created_at too: a changed vote is new evidence, and recency
+            # decay should treat it as such.
+            set_={k: values[k] for k in ("vote", "created_at")},
+        )
+    )
+    await session.execute(stmt)
+    await session.commit()
+    return ChatFeedbackResponse(recorded=True, liked=body.liked)
 
 
 @router.get("/stats/insights", response_model=OverviewStats)

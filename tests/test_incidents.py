@@ -655,29 +655,6 @@ async def test_joining_existing_incident_emits_incident_updated_not_new():
     assert events[0]["data"]["journey_count"] == 2
 
 
-from backend.incidents import INCIDENT_QUIET_TIMEOUT, sweep_stale_incidents
-
-
-async def test_sweep_closes_incidents_past_the_quiet_timeout():
-    stale = Incident(
-        incident_id="inc-old", signature="d1", failure_subtype="ENRICHMENT_FAILED",
-        failing_service="SPT", error_token=None, title="t", department=None,
-        status="open", first_ts=NOW - timedelta(seconds=INCIDENT_QUIET_TIMEOUT + 100),
-        last_ts=NOW - timedelta(seconds=INCIDENT_QUIET_TIMEOUT + 1),
-        primary_alert_id="a0", alert_count=1, journey_count=1,
-    )
-    session = _FakeSession([_FakeResult(items=[stale])])
-    closed = await sweep_stale_incidents(session, now=NOW)
-    assert closed == [stale]
-    assert stale.status == "resolved"
-
-
-async def test_sweep_leaves_recently_active_incidents_open():
-    session = _FakeSession([_FakeResult(items=[])])  # query already filters by last_ts
-    closed = await sweep_stale_incidents(session, now=NOW)
-    assert closed == []
-
-
 from backend.db import Journey
 from backend.incidents import retry_unclustered_completions
 

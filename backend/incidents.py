@@ -11,8 +11,10 @@ own split:
   INFRA-vs-order-specific classification, the cosine + salient-token veto.
   No DB, fully unit-testable with plain objects.
 * **DB-touching orchestration** (:func:`assign_incident`,
-  :func:`process_completion`, :func:`sweep_stale_incidents`) — a thin layer
-  over the pure decisions above.
+  :func:`process_completion`) — a thin layer over the pure decisions above.
+  Incidents close ONLY via the manual REST resolve endpoint
+  (``PATCH /incidents/{id}/resolve``, ``backend/api.py``) — there is no
+  automatic closing mechanism here.
 
 ``backend/journeys.py`` is NOT re-run for classification here. The failure
 ``subtype`` comes from the journey's OWN completion outcome
@@ -30,14 +32,9 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # --- config -------------------------------------------------------------------
-
-# Deliberately generous — a safety net, not the primary closing mechanism
-# (manual dashboard resolve is primary; see backend/incidents.py's docstring
-# and the source spec §4 step 7).
-INCIDENT_QUIET_TIMEOUT = int(os.getenv("INCIDENT_QUIET_TIMEOUT", "1800"))
 
 # Cosine-similarity floor for the novel (unrecognized) path's incident match.
 INCIDENT_COSINE_THRESHOLD = float(os.getenv("INCIDENT_COSINE_THRESHOLD", "0.95"))
@@ -582,34 +579,6 @@ async def process_completion(session, completion, *, now: datetime | None = None
         else:
             await on_event(_incident_updated_event(incident))
     return incident
-
-
-# --- lifecycle: quiet-timeout sweep (DB) -----------------------------------------
-
-
-async def sweep_stale_incidents(session, now: datetime | None = None) -> list:
-    """Close OPEN incidents that have had no new member for
-    ``INCIDENT_QUIET_TIMEOUT`` seconds.
-
-    This is the safety-net fallback closing mechanism (source spec §4 step 7)
-    — manual dashboard resolve is the PRIMARY one and is a REST write
-    endpoint, not implemented here (Plan 2). No automatic "recovery" signal of
-    any kind closes an incident; this sweep is the only automatic closer.
-    """
-    from sqlalchemy import select
-    from backend.db import Incident
-
-    now = now or _utcnow()
-    cutoff = now - timedelta(seconds=INCIDENT_QUIET_TIMEOUT)
-    result = await session.execute(
-        select(Incident).where(Incident.status == "open", Incident.last_ts < cutoff)
-    )
-    stale = result.scalars().all()
-    for incident in stale:
-        incident.status = "resolved"
-    if stale:
-        await session.commit()
-    return stale
 
 
 # --- lifecycle: retry journeys whose completion outran their alerts (DB) --------

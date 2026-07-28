@@ -40,7 +40,7 @@ import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractIncomingMessage
 
 from shared.models import LogLine, ProcessedAlert
-from backend.incidents import process_completion, retry_unclustered_completions, sweep_stale_incidents
+from backend.incidents import process_completion, retry_unclustered_completions
 from backend.journeys import JourneyAssembler, OnEvent
 
 # --- Config (env-driven, matching ai_service/settings.py conventions) --------
@@ -340,23 +340,24 @@ async def _sweep_stalled_loop(
         raise
 
 
-async def _sweep_incidents_loop(on_event: OnEvent | None = None) -> None:
-    """Periodically close incidents that have gone quiet past
-    INCIDENT_QUIET_TIMEOUT (the safety-net closing mechanism — manual dashboard
-    resolve is the primary one, added in Plan 2's API work), and retry
-    clustering for any terminal journey still missing an incident (a journey's
-    completion, detected via raw.events, can be persisted before its own
-    alerts — bound by the LLM and ALERT_CONCURRENCY via processed.alerts —
-    exist yet; see backend.incidents.retry_unclustered_completions). Runs on
-    the same cadence as the stalled-journey sweep.
+async def _retry_unclustered_incidents_loop(on_event: OnEvent | None = None) -> None:
+    """Periodically retry clustering for any terminal journey still missing an
+    incident (a journey's completion, detected via raw.events, can be
+    persisted before its own alerts — bound by the LLM and ALERT_CONCURRENCY
+    via processed.alerts — exist yet; see
+    backend.incidents.retry_unclustered_completions). Runs on the same
+    cadence as the stalled-journey sweep.
+
+    Incidents are closed ONLY via the manual REST resolve endpoint
+    (``PATCH /incidents/{id}/resolve``) — there is deliberately no automatic
+    closing mechanism; an incident stays open until a person resolves it.
 
     ``on_event`` is threaded into the retry path so a newly-created incident
     that only clustered on this catch-up pass still gets its ``incident.new``
     push — the retry exists precisely because the first (synchronous) attempt
     can miss, and a live incident that never appears on screen because it
     happened to cluster one sweep late would defeat the point of pushing it
-    live at all. ``sweep_stale_incidents`` (closing) is not wired to any event —
-    out of scope; only NEW incidents are pushed, mirroring ``alert.new``.
+    live at all.
     """
     import asyncio
 
@@ -367,7 +368,6 @@ async def _sweep_incidents_loop(on_event: OnEvent | None = None) -> None:
             await asyncio.sleep(STALLED_SWEEP_INTERVAL)
             try:
                 async with SessionLocal() as session:
-                    await sweep_stale_incidents(session)
                     await retry_unclustered_completions(session, on_event=on_event)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[incident-sweep] ERROR (continuing): {exc}", flush=True)
@@ -416,7 +416,7 @@ async def run_consumers(
             alerts.run(),
             raw.run(),
             _sweep_stalled_loop(assembler, on_event=on_event),
-            _sweep_incidents_loop(on_event=on_event),
+            _retry_unclustered_incidents_loop(on_event=on_event),
         )
 
 

@@ -210,6 +210,11 @@ export default function InsightsPage() {
           tone={criticalCount > 0 ? OUTCOME_FAILED : undefined}
         />
         <StatCard
+          label="Avg duration"
+          value={formatDuration(journeys.avg_duration_seconds)}
+          hint="first to last log"
+        />
+        <StatCard
           label="Timed out"
           value={timedOut.toLocaleString()}
           hint="stalled 90s+"

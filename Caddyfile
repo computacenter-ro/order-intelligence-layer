@@ -13,7 +13,6 @@
 #
 # {$PUBLIC_HOST} and {$ACME_EMAIL} are substituted from the environment by Caddy
 # itself (compose passes them through), so this file is not per-environment.
-
 {
 	# Where Let's Encrypt sends expiry warnings. Optional but recommended.
 	email {$ACME_EMAIL}
@@ -31,6 +30,24 @@
 	# No special "upgrade" config is needed: reverse_proxy passes the
 	# Connection/Upgrade headers through and Caddy handles WS natively.
 	handle /ws {
+		reverse_proxy backend:8000
+	}
+
+	# --- Entra ID OAuth callback -------------------------------------------
+	# MUST be routed to the backend WITHOUT the /api prefix, and separately from
+	# the /api/* rule below.
+	#
+	# Reason: this URL is not called by our frontend — MICROSOFT redirects the
+	# user's browser to it, using the exact ENTRA_REDIRECT_URI registered in the
+	# Azure app registration (https://$PUBLIC_HOST/auth/entra/callback). That has
+	# no /api segment, so without this rule the catch-all below would hand
+	# Microsoft's callback to the Next.js app, which has no such route: sign-in
+	# would end on a 404 after the user had already authenticated.
+	#
+	# (The dashboard's own call to start the flow goes to /api/auth/entra/login
+	# and is handled by the /api/* rule, which strips the prefix. Both therefore
+	# reach the backend at its real /auth/entra/* routes.)
+	handle /auth/entra/* {
 		reverse_proxy backend:8000
 	}
 

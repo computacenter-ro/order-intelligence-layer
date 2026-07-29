@@ -237,6 +237,15 @@ services:
       CORS_ORIGINS: https://${PUBLIC_HOST}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
       DASHBOARD_URL: ${DASHBOARD_URL:-https://${PUBLIC_HOST}}
+      # Entra ID is the deployment's sign-in path. Password login defaults to ON
+      # in the app (for local dev), and the built-in admin hash is bcrypt("admin")
+      # — so leaving it enabled here would be a documented way around SSO.
+      # Default to off, overridable if the client secret expires mid-demo.
+      PASSWORD_LOGIN_ENABLED: ${PASSWORD_LOGIN_ENABLED:-false}
+      # Must match the Azure app registration BYTE-FOR-BYTE, and Entra requires
+      # HTTPS for non-localhost redirect URIs. Derived from PUBLIC_HOST so it
+      # cannot drift from the host Caddy holds the certificate for.
+      ENTRA_REDIRECT_URI: ${ENTRA_REDIRECT_URI:-https://${PUBLIC_HOST}/auth/entra/callback}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else sys.exit(1)"]
       interval: 15s

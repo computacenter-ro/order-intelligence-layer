@@ -70,6 +70,14 @@ class _FakeResult:
     def __init__(self, rowcount: int = 1) -> None:
         self.rowcount = rowcount
 
+    def first(self):
+        # backend.linking's incident-backfill lookups read "nothing found"
+        # here — none of these alert-persistence tests exercise incidents.
+        return None
+
+    def scalar_one_or_none(self):
+        return None
+
 
 class _FakeSession:
     """Records execute() statements and commit()s; usable as an async CM."""
@@ -157,6 +165,21 @@ def test_alert_row_values_fallback_nulls_enrichment():
     assert values["confidence"] is None
     # the log fields are still present
     assert values["log_id"] == "log-1"
+
+
+def test_alert_row_values_maps_embedding():
+    # Regression: the embedding was computed by ai_service and carried on the
+    # ProcessedAlert, but silently dropped at this exact DB boundary — every
+    # persisted alert had embedding=NULL, which made backend/incidents.py's
+    # novel/embedding clustering path (_find_open_incident_by_cosine) bail out
+    # immediately for every unrecognized failure, live-testing discovery.
+    alert = _alert("ai")
+    alert.embedding = [0.1, 0.2, 0.3]
+    assert alert_row_values(alert)["embedding"] == [0.1, 0.2, 0.3]
+
+
+def test_alert_row_values_embedding_defaults_none():
+    assert alert_row_values(_alert("ai"))["embedding"] is None
 
 
 # --- AlertsConsumer ----------------------------------------------------------
@@ -384,7 +407,7 @@ async def test_sweep_stalled_finalizes_timed_out_journey():
     # be finalized as TIMED_OUT by the sweep (no new message needed).
     start = datetime(2026, 7, 20, 8, 0, 0, tzinfo=timezone.utc)
     assembler = JourneyAssembler(stalled_timeout=90)
-    assembler.add([_log(log_id="x-1", timestamp=start, message="Received inbound order event evt-1")])
+    assembler.add([_log(log_id="x-1", timestamp=start, message="Received inbound order event evt-1", level="INFO")])
 
     session = _FakeSession()
     now = start + timedelta(seconds=120)  # well past the 90s stall window

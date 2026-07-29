@@ -48,6 +48,7 @@ class SummaryResponse(BaseModel):
     journey_id: str
     summary: str
     source: str                        # "ai" | "fallback"
+    suggested_label: str | None = None
 
 
 # --- retrieval contract (the seam with the backend + future chatbot) ----------
@@ -311,12 +312,15 @@ async def summarize_journey(req: SummaryRequest) -> SummaryResponse:
     if _deps is None:  # pragma: no cover - guards misconfiguration
         raise RuntimeError("api.configure() must be called before serving")
 
-    summary = await _deps.breaker.call(
+    result = await _deps.breaker.call(
         lambda: nodes.summarize_journey(req.outcome, req.logs, _deps.model),
         fallback=None,
     )
-    if summary is None:
+    if result is None:
         return SummaryResponse(
             journey_id=req.journey_id, summary=template_summary(req), source="fallback"
         )
-    return SummaryResponse(journey_id=req.journey_id, summary=summary, source="ai")
+    return SummaryResponse(
+        journey_id=req.journey_id, summary=result.summary, source="ai",
+        suggested_label=result.suggested_label,
+    )

@@ -190,6 +190,8 @@ def _failing_step(fail_at: str, chain: list[tuple[str, str]]) -> int:
             target = (OUTBOUND, BLOCKS.SUBMIT)
         case "settings":
             target = (SETTINGS, BLOCKS.SERVE)
+        case "settings_rejected":
+            target = (SETTINGS, BLOCKS.SERVE)
         case _:
             raise ValueError(f"unknown fail_at block: {fail_at!r}")
     try:
@@ -415,9 +417,12 @@ SCENARIOS: dict[int, Scenario] = {
     # 15 is the NOVEL failure — the ONLY scenario here that needs EMBEDDINGS.
     #
     # It fails at the SETTINGS enrichment satellite with a message the backend's
-    # _FAILURE_RULES does NOT recognize, so the journey never resolves to a known
-    # subtype: it TIMES OUT with a real ERROR and must cluster via the embedding
-    # / novel path instead of a (subtype, service) signature.
+    # _FAILURE_RULES does NOT recognize, so the journey never resolves to a
+    # known NAMED subtype. Since it logs a real ERROR before going silent, the
+    # journey correctly resolves as FAILED/UNRECOGNIZED_FAILURE (not TIMED_OUT
+    # — that label is reserved for journeys with no ERROR signal at all) once
+    # the stall clock confirms nothing more is coming, and clusters via the
+    # embedding/novel path instead of a (subtype, service) signature.
     #
     # !!! REQUIRES a small service-code change — scenarios.py alone is NOT enough:
     #   1) pipeline/services/settings.py must emit an ERROR failure variant for
@@ -429,7 +434,8 @@ SCENARIOS: dict[int, Scenario] = {
     #         account settings (8000ms)"
     #      Two properties MUST both hold:
     #        (a) it must NOT match any backend _FAILURE_RULES pattern — that
-    #            unfamiliarity is what keeps it novel -> TIMED_OUT -> embeddings; and
+    #            unfamiliarity is what keeps it novel -> UNRECOGNIZED_FAILURE ->
+    #            embeddings; and
     #        (b) it must read as INFRA (words like "unavailable"/"connection"),
     #            because only INFRA-class failures search for a match. A novel
     #            failure classified order-specific would just open its own
@@ -438,19 +444,86 @@ SCENARIOS: dict[int, Scenario] = {
     #   2) The chain truncates after (SETTINGS, SERVE) below, so the order engine
     #      never emits its recognized "Order processing aborted" wrapper — which
     #      is what stops it being (mis)classified as ENRICHMENT_FAILED.
-    #   Verify: the flow should end TIMED_OUT (not a recognized outcome) and,
-    #   because it carries a real ERROR, still form/join an incident via embeddings.
+    #   Verify: the flow should end FAILED/UNRECOGNIZED_FAILURE (not a recognized
+    #   NAMED subtype, and not TIMED_OUT — it has a real ERROR) and, because it
+    #   carries that real ERROR, still form/join an incident via embeddings.
     # =====================================================================
     15: Scenario(
         id=15,
         name="Novel enrichment failure (SETTINGS unavailable) — NEEDS EMBEDDINGS",
-        outcome="TIMED_OUT",  # unrecognized on purpose -> novel/embedding path
+        outcome="UNRECOGNIZED_FAILURE",  # unrecognized on purpose -> novel/embedding path
         country="UK",
         user="RFLORIA",
         accountNumber="81036533",
         lines=[_line("4249751", "SKU-DELL-P7680-I9")],
         bridge_ids="both",
         fail_at="settings",
+        terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
+    # =====================================================================
+    # 16 & 17 — TWO MORE NOVEL failures that exercise the embedding/novel
+    # path, chosen to demonstrate the two opposite clustering outcomes.
+    #
+    #   15 + 16  -> ONE novel incident (journey_count=2). Both fail at the
+    #               SETTINGS satellite with an unrecognized, INFRA-shaped
+    #               message, but 16 is WORDED DIFFERENTLY. Exact-text matching
+    #               would keep them apart; the embedding recognizes they MEAN
+    #               the same thing (same failing_service=SETTINGS, high cosine,
+    #               veto passes) and MERGES them. This is the case the novel
+    #               path exists for.
+    #   17        -> its OWN novel incident, on the SAME SETTINGS satellite as
+    #               15/16 (so failing_service is identical — this deliberately
+    #               does NOT rely on the failing_service pre-filter to stay
+    #               separate). Its cause is different (a 503 rejection, not a
+    #               connectivity problem — see pipeline/services/settings.py's
+    #               ``_settings_rejected``), worded with salient tokens
+    #               ("rejected"/"failed"/"503") that share nothing with
+    #               settings_down's ("unavailable"/"8000ms"). It still enters
+    #               the cosine search (both INFRA-shaped, same failing_service)
+    #               but backend/incidents.py's divergence guard vetoes the
+    #               match on the salient-token mismatch — proving the guard
+    #               itself does real work, not just the failing_service check.
+    #
+    # !!! Scenario 16 still needs a service-code change — scenarios.py alone is
+    #     NOT enough for it: pipeline/services/settings.py must emit a NOVEL,
+    #     INFRA-shaped ERROR for its serve block when ctx.fail_at == "settings"
+    #     that is WORDED DIFFERENTLY from flow 15's message but means the same
+    #     thing (e.g. "could not reach settings satellite — read timed out
+    #     awaiting account settings response (8000ms)") — today ``fail_at ==
+    #     "settings"`` always emits flow 15's exact message via
+    #     ``_settings_down``, so 15 and 16 are currently byte-identical rather
+    #     than "differently worded, same meaning."
+    #   Scenario 17 needs NO further changes: ``fail_at="settings_rejected"``
+    #   is already wired to ``_settings_rejected`` in
+    #   pipeline/services/settings.py, and no backend change is needed since
+    #   it shares SETTINGS's existing (fallback) failing_service with 15/16.
+    #   Verify: 15+16 -> one UNRECOGNIZED_FAILURE incident (journey_count=2,
+    #   once 16's service-code TODO above is done); 17 -> a SEPARATE
+    #   UNRECOGNIZED_FAILURE incident (journey_count=1), never merging into
+    #   15/16's even though it shares their failing_service.
+    # =====================================================================
+    16: Scenario(
+        id=16,
+        name="Novel enrichment failure (SETTINGS unavailable) — 2nd order, DIFFERENT wording (MERGES with 15) — NEEDS EMBEDDINGS",
+        outcome="UNRECOGNIZED_FAILURE",  # unrecognized on purpose -> novel/embedding path
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("4249751", "SKU-DELL-P7680-I9")],
+        bridge_ids="both",
+        fail_at="settings",
+        terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
+    17: Scenario(
+        id=17,
+        name="Novel enrichment failure (SETTINGS rejected, HTTP 503) — DIFFERENT cause, same satellite (SEPARATE cluster from 15/16 via divergence guard) — NEEDS EMBEDDINGS",
+        outcome="UNRECOGNIZED_FAILURE",  # unrecognized on purpose -> novel/embedding path
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("4249751", "SKU-DELL-P7680-I9")],
+        bridge_ids="both",
+        fail_at="settings_rejected",
         terminal=(SETTINGS, BLOCKS.SERVE),
     ),
 }

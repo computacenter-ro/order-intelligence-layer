@@ -11,8 +11,10 @@ own split:
   INFRA-vs-order-specific classification, the cosine + salient-token veto.
   No DB, fully unit-testable with plain objects.
 * **DB-touching orchestration** (:func:`assign_incident`,
-  :func:`process_completion`, :func:`sweep_stale_incidents`) — a thin layer
-  over the pure decisions above.
+  :func:`process_completion`) — a thin layer over the pure decisions above.
+  Incidents close ONLY via the manual REST resolve endpoint
+  (``PATCH /incidents/{id}/resolve``, ``backend/api.py``) — there is no
+  automatic closing mechanism here.
 
 ``backend/journeys.py`` is NOT re-run for classification here. The failure
 ``subtype`` comes from the journey's OWN completion outcome
@@ -30,14 +32,9 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # --- config -------------------------------------------------------------------
-
-# Deliberately generous — a safety net, not the primary closing mechanism
-# (manual dashboard resolve is primary; see backend/incidents.py's docstring
-# and the source spec §4 step 7).
-INCIDENT_QUIET_TIMEOUT = int(os.getenv("INCIDENT_QUIET_TIMEOUT", "1800"))
 
 # Cosine-similarity floor for the novel (unrecognized) path's incident match.
 INCIDENT_COSINE_THRESHOLD = float(os.getenv("INCIDENT_COSINE_THRESHOLD", "0.95"))
@@ -318,9 +315,32 @@ def _cosine(a: list[float], b: list[float]) -> float:
 # --- incident title (pure) ------------------------------------------------------
 
 
-def build_title(signature: Signature) -> str:
-    """A deterministic, no-LLM incident title — reads correctly even with the
-    Azure LLM breaker open."""
+def _sanitize_suggested_label(label: str) -> str:
+    """Strip volatile ids out of an LLM-suggested title (reuses _mask_ids'
+    patterns, then drops the mask tokens rather than showing them literally).
+
+    An infra-class incident can absorb many different orders over its open
+    lifetime, so a title that baked in the *first* order's id would read as
+    misleading once other orders join it.
+    """
+    cleaned = _mask_ids(label)
+    for token in ("<EVT>", "<ORD>", "<CART>", "<ACC>"):
+        cleaned = cleaned.replace(token, "")
+    return " ".join(cleaned.split())  # collapse whitespace left behind
+
+
+def build_title(signature: Signature, suggested_label: str | None = None) -> str:
+    """A deterministic incident title — reads correctly even with the Azure
+    LLM breaker open. ``suggested_label`` (an LLM-derived phrase, only ever
+    passed for the UNRECOGNIZED_FAILURE case) is used only when the signature
+    has no recognized subtype AND sanitizes to something non-empty; every
+    other case — including LLM-down/absent-label — uses exactly the static
+    fallback text.
+    """
+    if signature.failure_subtype is None and suggested_label:
+        cleaned = _sanitize_suggested_label(suggested_label)
+        if cleaned:
+            return f"{cleaned} — {signature.failing_service}"
     subtype = signature.failure_subtype or "Unrecognized failure"
     return f"{subtype} — {signature.failing_service}"
 
@@ -372,7 +392,8 @@ async def _find_open_incident_by_cosine(session, *, failing_service: str, causal
 
 
 async def assign_incident(session, *, signature: Signature, infra_class: str,
-                           causal: CausalCandidate, now: datetime):
+                           causal: CausalCandidate, now: datetime,
+                           suggested_label: str | None = None):
     """Find an OPEN incident to join, or create a new one.
 
     Order-specific causal lines NEVER search — they always create their own
@@ -403,7 +424,7 @@ async def assign_incident(session, *, signature: Signature, infra_class: str,
         failure_subtype=signature.failure_subtype,
         failing_service=signature.failing_service,
         error_token=signature.error_token,
-        title=build_title(signature),
+        title=build_title(signature, suggested_label),
         department=causal.department,
         status="open",
         first_ts=now,
@@ -487,7 +508,7 @@ async def process_completion(session, completion, *, now: datetime | None = None
     """
     from sqlalchemy import select, update
     from backend.db import Alert, Journey
-    from backend.journeys import JourneyStatus
+    from backend.journeys import JourneyStatus, UNRECOGNIZED_FAILURE
 
     now = now or _utcnow()
 
@@ -495,11 +516,13 @@ async def process_completion(session, completion, *, now: datetime | None = None
         return None
 
     result = await session.execute(
-        select(Journey.incident_id).where(Journey.journey_id == completion.journey_id)
+        select(Journey.incident_id, Journey.suggested_failure_label)
+        .where(Journey.journey_id == completion.journey_id)
     )
     row = result.first()
     if row is None or row[0] is not None:
         return None  # journey row missing, or already clustered — no-op
+    suggested_label = row[1]
 
     candidates = await _fetch_causal_candidates(session, completion.journey_id)
     causal = pick_causal_line(candidates)
@@ -509,9 +532,15 @@ async def process_completion(session, completion, *, now: datetime | None = None
         return None  # TIMED_OUT needs a real ERROR (Eligibility, above)
 
     # subtype from the journey's OWN classification — recognized only when
-    # FAILED; TIMED_OUT / unrecognized -> None -> the novel/embedding path.
+    # FAILED with a NAMED subtype. UNRECOGNIZED_FAILURE is a real FAILED
+    # status but not a specific cause, so it's normalized to None here too —
+    # otherwise every unrelated unrecognized failure from the same service
+    # would hash-merge by service name alone, losing the cosine path's
+    # message-content precision.
     failure_subtype = (
-        completion.outcome if completion.status is JourneyStatus.FAILED else None
+        completion.outcome
+        if completion.status is JourneyStatus.FAILED and completion.outcome != UNRECOGNIZED_FAILURE
+        else None
     )
     signature = build_signature(
         failure_subtype, causal.logger, causal.app_name, causal.message
@@ -519,7 +548,8 @@ async def process_completion(session, completion, *, now: datetime | None = None
     infra_class = classify_infra_or_order_specific(failure_subtype, causal.message)
 
     incident = await assign_incident(
-        session, signature=signature, infra_class=infra_class, causal=causal, now=now
+        session, signature=signature, infra_class=infra_class, causal=causal, now=now,
+        suggested_label=suggested_label,
     )
     # A freshly created incident starts at alert_count=0 (see assign_incident);
     # a matched existing one is already >0. Capture this BEFORE the bump below,
@@ -549,34 +579,6 @@ async def process_completion(session, completion, *, now: datetime | None = None
         else:
             await on_event(_incident_updated_event(incident))
     return incident
-
-
-# --- lifecycle: quiet-timeout sweep (DB) -----------------------------------------
-
-
-async def sweep_stale_incidents(session, now: datetime | None = None) -> list:
-    """Close OPEN incidents that have had no new member for
-    ``INCIDENT_QUIET_TIMEOUT`` seconds.
-
-    This is the safety-net fallback closing mechanism (source spec §4 step 7)
-    — manual dashboard resolve is the PRIMARY one and is a REST write
-    endpoint, not implemented here (Plan 2). No automatic "recovery" signal of
-    any kind closes an incident; this sweep is the only automatic closer.
-    """
-    from sqlalchemy import select
-    from backend.db import Incident
-
-    now = now or _utcnow()
-    cutoff = now - timedelta(seconds=INCIDENT_QUIET_TIMEOUT)
-    result = await session.execute(
-        select(Incident).where(Incident.status == "open", Incident.last_ts < cutoff)
-    )
-    stale = result.scalars().all()
-    for incident in stale:
-        incident.status = "resolved"
-    if stale:
-        await session.commit()
-    return stale
 
 
 # --- lifecycle: retry journeys whose completion outran their alerts (DB) --------

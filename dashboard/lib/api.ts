@@ -3,6 +3,7 @@ import type {
   ChatFeedbackResponse,
   ChatRequest,
   ChatResponse,
+  Department,
   Incident,
   IncidentDetail,
   IncidentStatus,
@@ -190,6 +191,10 @@ export function fetchJourney(journeyId: string): Promise<Journey> {
 
 export interface IncidentsFilter {
   status?: IncidentStatus;
+  // Multi-valued, same convention as AlertsFilter.department: sent as
+  // repeated params (?department=backend&department=devops), OR'd server
+  // side. [] and undefined both mean "no filter".
+  department?: Department[];
   limit?: number;
   cursor?: string;
 }
@@ -197,6 +202,7 @@ export interface IncidentsFilter {
 export function fetchIncidents(filter: IncidentsFilter = {}): Promise<Page<Incident>> {
   const params = new URLSearchParams();
   if (filter.status) params.set("status", filter.status);
+  (filter.department ?? []).forEach((v) => params.append("department", v));
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.cursor) params.set("cursor", filter.cursor);
   const query = params.toString();

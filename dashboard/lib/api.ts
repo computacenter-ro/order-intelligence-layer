@@ -75,6 +75,27 @@ export async function logout(): Promise<void> {
   await fetch(`${API_URL}/auth/logout`, { method: "POST", credentials: "include" });
 }
 
+/** Which sign-in methods the backend offers (GET /auth/config, unauthenticated). */
+export interface AuthConfig {
+  entra_enabled: boolean;
+  password_login: boolean;
+}
+
+export async function fetchAuthConfig(): Promise<AuthConfig> {
+  const res = await fetch(`${API_URL}/auth/config`, { credentials: "include" });
+  if (!res.ok) throw new Error(`/auth/config failed: ${res.status}`);
+  return res.json() as Promise<AuthConfig>;
+}
+
+/**
+ * Where the Microsoft sign-in starts. Used as a full-page navigation target, NOT
+ * with fetch: OAuth needs a real top-level navigation, and an XHR could neither
+ * pass CORS nor render Microsoft's sign-in page.
+ */
+export function entraLoginUrl(): string {
+  return `${API_URL}/auth/entra/login`;
+}
+
 export interface AlertsFilter {
   since?: string;
   // Multi-valued: sent as repeated params (?department=backend&department=devops)

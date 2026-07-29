@@ -641,8 +641,12 @@ hand-editing tables — see "Gotchas" below.
 ### API
 ```
 POST /auth/login                        # {username,password} -> sets httpOnly session cookie
+                                        # (404 when PASSWORD_LOGIN_ENABLED is off)
 POST /auth/logout                       # clears the cookie
 GET  /auth/me                           # current user (401 if no valid session) — the frontend guard
+GET  /auth/config                       # {entra_enabled, password_login} — what the login screen renders
+GET  /auth/entra/login                  # 307 -> Microsoft (503 when Entra is unconfigured)
+GET  /auth/entra/callback               # code -> session cookie -> 302 to DASHBOARD_URL
 GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
                                         # cached=true|false is ORTHOGONAL to source:
                                         # every cached alert is source="ai", so it
@@ -693,30 +697,65 @@ executed rows into the response. Nullable group-by columns get an explicit bucke
 (`department` → `"unassigned"`, `severity` → `"unrated"`, `outcome` → `"none"`) so
 every breakdown sums back to its total instead of silently dropping nulls.
 
-### Auth (`auth.py`) — Phase 1: single hardcoded admin
-Two deliberately separated layers so later auth methods are cheap:
-- **Verification** (swappable): `authenticate()` matches ONE env-configured admin
-  (`ADMIN_USERNAME` + bcrypt `ADMIN_PASSWORD_HASH`; dev default `admin`/`admin`).
+### Auth (`auth.py`, `auth_entra.py`)
+Two deliberately separated layers, which is why adding Entra ID cost nothing
+downstream:
+- **Verification** (swappable): **Entra ID** (`auth_entra.py`) is the primary
+  path — a backend-driven OAuth authorization-code flow. `authenticate()` in
+  `auth.py` still matches ONE env-configured admin (`ADMIN_USERNAME` + bcrypt
+  `ADMIN_PASSWORD_HASH`; dev default `admin`/`admin`), kept as the escape hatch
+  for local dev and for the day the Entra client secret expires. It is gated by
+  `PASSWORD_LOGIN_ENABLED` (404 when off) and MUST be `false` in a deployment —
+  the default hash would otherwise be a way around SSO.
 - **Session** (stable seam): `issue_token()` mints a signed JWT carried in an
   **httpOnly `oil_session` cookie**; `get_current_user` (a FastAPI dependency)
   verifies it and guards every read route (declared once at the `api.py` router
-  level). The `/ws` handshake authenticates with the same cookie (browsers can't
-  set WS headers) — `?token=` fallback for non-browser clients; a bad/absent
-  token closes with code 1008 before the client is registered.
+  level). BOTH login paths funnel through `issue_token` + `set_auth_cookie`, so
+  they produce the same session. The `/ws` handshake authenticates with the same
+  cookie (browsers can't set WS headers) — `?token=` fallback for non-browser
+  clients; a bad/absent token closes with code 1008 before the client is
+  registered.
 
-Magic-link / SSO later = new login endpoints that mint the *same* JWT via
-`issue_token` and set the *same* cookie via `set_auth_cookie` — `get_current_user`,
+**Entra flow** (`GET /auth/entra/login` → Microsoft → `GET /auth/entra/callback`):
+`state`+`nonce` are stored in a signed 5-minute `oil_oauth_state` cookie
+(`SameSite=lax` — the callback hop is a cross-site top-level GET, `strict` would
+drop it); the callback exchanges the code via **MSAL** (synchronous, so wrapped
+in `asyncio.to_thread` — the loop also runs the consumers), verifies the nonce,
+mints the session, and redirects to `DASHBOARD_URL`. Every failure redirects to
+`{DASHBOARD_URL}/?auth_error=<bad_state|access_denied|exchange_failed|not_configured>`
+— never a raw error body, since the browser is mid-navigation on :8000. A token
+response with no claims is `exchange_failed`, not `bad_state`: missing claims mean
+a broken exchange, a wrong nonce means a replay. MSAL reserves
+`openid`/`profile`/`offline_access`, so the code requests NO scopes and takes
+identity from `preferred_username` (then `email`, then `oid`). No Graph call.
+Missing `ENTRA_*` config disables Entra (503 on the login route) rather than
+crashing. **Authorization is not enforced in code**: any account in the tenant
+that signs in gets access — restrict it in the Azure portal (Enterprise
+Application → "Assignment required" + user/group assignment), which needs no code
+change. `GET /auth/config` reports `{entra_enabled, password_login}` so the login
+screen knows what to render. Note logout clears only our cookie, not the Microsoft
+browser session, so signing back in may not re-prompt.
+
+Another auth method later = a new login endpoint that mints the *same* JWT via
+`issue_token` and sets the *same* cookie via `set_auth_cookie` — `get_current_user`,
 every guarded route, the WS check, and the frontend guard stay untouched. Don't
 put auth-method specifics in the JWT payload; keep it identity + expiry.
 
-Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `JWT_SECRET` (≥32 bytes in
+Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `PASSWORD_LOGIN_ENABLED`,
+`ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_REDIRECT_URI`,
+`JWT_SECRET` (≥32 bytes in
 deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS).
 The dev-run scripts (injector, replay) POST to the collector/RabbitMQ — NOT this
 API — so they are unaffected by auth. `passlib` needs `bcrypt<4.1` (pinned).
 
 Dashboard: `lib/auth.tsx` (`AuthProvider` calls `/auth/me` on load) +
 `components/auth/AuthGate.tsx` (renders `LoginScreen` when anonymous, the app
-when authenticated) + a logout control in the side-nav footer. All API/WS calls
+when authenticated) + a logout control in the side-nav footer. `LoginScreen`
+reads `/auth/config` to decide what to offer: "Sign In With Microsoft" (a
+full-page navigation to the backend, never `fetch` — OAuth needs a top-level
+navigation) plus the password form only when it is enabled. Neither
+`AuthProvider` nor `AuthGate` knows Entra exists — after the callback redirect
+the existing `/auth/me` call just succeeds. All API/WS calls
 use `credentials:"include"` so the cookie flows cross-origin (:3000 → :8000);
 backend CORS sets `allow_credentials=True` and allows `POST`/`OPTIONS`.
 
@@ -819,7 +858,12 @@ capacity), `DASHBOARD_URL` (dashboard base for journey links),
 `SEMCACHE_ENABLED=1`, `SEMCACHE_THRESHOLD=0.95` (cosine floor),
 `SEMCACHE_MAX_ENTRIES=500`, `SEMCACHE_MODEL=all-MiniLM-L6-v2`, `SEMCACHE_GUARD=1`,
 `SEMCACHE_SALIENT_EXTRA` (comma-sep extra guard words),
-plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
+`ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET` (all three required
+to enable Entra sign-in; absent = disabled, never a crash),
+`ENTRA_REDIRECT_URI=http://localhost:8000/auth/entra/callback` (must match the
+Azure app registration byte-for-byte), `PASSWORD_LOGIN_ENABLED=true` (set false in
+any deployment), plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
+above.
 
 ---
 
@@ -899,6 +943,11 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 - All LLM/provider wiring stays in one module (Azure AI Foundry today). The
   semantic-cache embedding model (sentence-transformers) is local, not a provider
   — it lives in `ai_service/semcache.py`, not `llm.py`.
+- Auth methods are added, never rewired: a new one mints the same JWT via
+  `issue_token` and sets the same cookie via `set_auth_cookie`. Never make a
+  route, the WS handshake, or the dashboard aware of *how* someone signed in.
+  The Entra `state`/`nonce` cookie must stay `SameSite=lax`, and MSAL calls must
+  stay off the event loop (`asyncio.to_thread`).
 - All datetimes ae UTC and timezone aware (timestamptz in Postgres,
   datetime.now(timezone.utc) in Python - never utcnow(), never naive
   datetimes). The 90s stalled journey arithmetic depends on this.

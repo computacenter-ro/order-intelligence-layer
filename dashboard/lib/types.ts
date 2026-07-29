@@ -154,7 +154,7 @@ export interface OverviewStats {
 
 /** Scope a question to one record — the "Ask about this" buttons. */
 export interface ChatContext {
-  kind: "alert" | "journey";
+  kind: "alert" | "journey" | "incident";
   id: string;
 }
 

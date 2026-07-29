@@ -16,6 +16,8 @@ chatbot must stay useful with the LLM completely down.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone as _tz
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -706,3 +708,394 @@ async def test_ask_degrades_when_the_ai_service_is_down():
     # An unreachable service retrieved nothing, so nothing was truncated — that
     # must not be reported as a capped result set.
     assert result["coverage"] == {"shown": 0, "limit": 4, "truncated": False}
+
+
+# =============================================================================
+# backend: incident scope (the "ask about this incident" button)
+# =============================================================================
+def _ts(offset_seconds: int) -> datetime:
+    """A tz-aware timestamp, `offset_seconds` after a fixed base."""
+    return datetime(2026, 7, 27, 16, 24, 2, tzinfo=_tz.utc) + timedelta(seconds=offset_seconds)
+
+
+class _Al:
+    """A minimal Alert stand-in for grouping/formatting."""
+
+    def __init__(self, alert_id, journey_id, level, message, emitted_at,
+                 order_id=None, event_id=None, explanation=None,
+                 app_name="cc-outbound-osw", logger="SapRfcClient"):
+        self.alert_id = alert_id
+        self.journey_id = journey_id
+        self.level = level
+        self.message = message
+        self.emitted_at = emitted_at
+        self.order_id = order_id
+        self.event_id = event_id
+        self.explanation = explanation
+        self.app_name = app_name
+        self.logger = logger
+
+
+class _Jn:
+    """A minimal Journey stand-in (only the fields the formatter reads)."""
+
+    def __init__(self, journey_id, outcome, first_ts, last_ts):
+        self.journey_id = journey_id
+        self.outcome = outcome
+        self.first_ts = first_ts
+        self.last_ts = last_ts
+
+
+class _Inc:
+    """A minimal Incident stand-in."""
+
+    def __init__(self, title="SAP_SUBMISSION_FAILED — SAP", status="open",
+                 department="backend", failure_subtype="SAP_SUBMISSION_FAILED",
+                 failing_service="SAP", error_token="RFC_COMMUNICATION_FAILURE",
+                 alert_count=999, journey_count=999):
+        self.incident_id = "INC-1"
+        self.title = title
+        self.status = status
+        self.department = department
+        self.failure_subtype = failure_subtype
+        self.failing_service = failing_service
+        self.error_token = error_token
+        # Deliberately absurd: the formatter must never read these.
+        self.alert_count = alert_count
+        self.journey_count = journey_count
+        # Clustering timestamps — must never reach the model.
+        self.first_ts = _ts(600)
+        self.last_ts = _ts(900)
+
+
+def test_incident_groups_one_per_order_ordered_by_recency():
+    from backend.api import _incident_order_groups
+
+    alerts = [
+        _Al("a1", "J1", "ERROR", "rfc failed", _ts(10), order_id="ORD-1"),
+        _Al("a2", "J2", "ERROR", "rfc failed", _ts(50), order_id="ORD-2"),
+    ]
+    journeys = [
+        _Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(10)),
+        _Jn("J2", "SAP_SUBMISSION_FAILED", _ts(40), _ts(50)),
+    ]
+    groups = _incident_order_groups(alerts, journeys)
+    assert [g["label"] for g in groups] == ["ORD-2", "ORD-1"]  # newest first
+    assert groups[0]["outcome"] == "SAP_SUBMISSION_FAILED"
+
+
+def test_incident_group_representative_is_the_last_error_not_the_last_alert():
+    """Mirrors dashboard/lib/incidents.ts::_pickOutcome — ERROR outranks a later
+    WARN, because emitted_at is PROCESSING time and a WARN can finish last."""
+    from backend.api import _incident_order_groups
+
+    alerts = [
+        _Al("a1", "J1", "ERROR", "the real failure", _ts(10), order_id="ORD-1"),
+        _Al("a2", "J1", "WARN", "benign noise", _ts(20), order_id="ORD-1"),
+    ]
+    groups = _incident_order_groups(alerts, [_Jn("J1", "X", _ts(0), _ts(20))])
+    assert len(groups) == 1
+    assert groups[0]["alert"].message == "the real failure"
+
+
+def test_incident_group_label_falls_back_to_event_id_then_alert_id():
+    """A pre-creation failure never gets an order id (correlation model)."""
+    from backend.api import _incident_order_groups
+
+    groups = _incident_order_groups(
+        [_Al("a1", "J1", "ERROR", "transform failed", _ts(10), event_id="evt-abc")],
+        [_Jn("J1", "INBOUND_TRANSFORM_FAILED", _ts(0), _ts(10))],
+    )
+    assert groups[0]["label"] == "evt-abc"
+
+    groups = _incident_order_groups(
+        [_Al("a2", "J2", "ERROR", "mystery", _ts(10))], []
+    )
+    assert groups[0]["label"] == "a2"
+
+
+def test_incident_alert_without_a_journey_becomes_its_own_group():
+    """Distinct degenerate case from the label fallbacks: an alert may be
+    clustered before it is linked to a journey. It must not be dropped."""
+    from backend.api import _incident_order_groups
+
+    groups = _incident_order_groups(
+        [
+            _Al("a1", "J1", "ERROR", "grouped", _ts(10), order_id="ORD-1"),
+            _Al("a2", None, "ERROR", "orphan", _ts(20), order_id="ORD-2"),
+        ],
+        [_Jn("J1", "X", _ts(0), _ts(10))],
+    )
+    assert len(groups) == 2
+    assert "orphan" in [g["alert"].message for g in groups]
+
+
+def test_incident_context_header_counts_come_from_rows_not_counters():
+    """The stored counters drift as orders join; a number in an agent-facing
+    answer must be one we just counted."""
+    from backend.api import format_incident_context
+
+    alerts = [
+        _Al("a1", "J1", "ERROR", "rfc failed", _ts(10), order_id="ORD-1"),
+        _Al("a2", "J1", "ERROR", "rfc failed again", _ts(20), order_id="ORD-1"),
+        _Al("a3", "J2", "ERROR", "rfc failed", _ts(30), order_id="ORD-2"),
+    ]
+    journeys = [
+        _Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(20)),
+        _Jn("J2", "SAP_SUBMISSION_FAILED", _ts(25), _ts(30)),
+    ]
+    out = format_incident_context(_Inc(), alerts, journeys)
+    assert "orders=2" in out
+    assert "alerts=3" in out
+    assert "999" not in out          # neither stored counter leaked
+
+
+def test_incident_context_never_exposes_clustering_timestamps():
+    """Incident.first_ts/last_ts are when the ENGINE noticed, not when anything
+    failed. The model quotes what it is given, so they are not given."""
+    from backend.api import format_incident_context
+
+    incident = _Inc()
+    out = format_incident_context(
+        incident,
+        [_Al("a1", "J1", "ERROR", "rfc failed", _ts(10), order_id="ORD-1")],
+        [_Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(10))],
+    )
+    assert "clustered" not in out.lower()
+    # The clustering stamps are at +600s/+900s (16:34:02 / 16:39:02); the real
+    # window is +0s..+10s. Neither clustering minute may appear.
+    assert "16:34:02" not in out
+    assert "16:39:02" not in out
+
+
+def test_incident_context_window_and_span_come_from_the_journeys():
+    from backend.api import format_incident_context
+
+    journeys = [
+        _Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(10)),
+        _Jn("J2", "SAP_SUBMISSION_FAILED", _ts(20), _ts(466)),   # +7m46s
+    ]
+    alerts = [
+        _Al("a1", "J1", "ERROR", "rfc failed", _ts(10), order_id="ORD-1"),
+        _Al("a2", "J2", "ERROR", "rfc failed", _ts(466), order_id="ORD-2"),
+    ]
+    out = format_incident_context(_Inc(), alerts, journeys)
+    assert "16:24:02" in out          # MIN(first_ts)
+    assert "16:31:48" in out          # MAX(last_ts)
+    assert "span 7m 46s" in out       # precomputed, not left to the model
+
+
+def test_incident_context_omits_the_window_when_no_journey_timestamps():
+    from backend.api import format_incident_context
+
+    out = format_incident_context(
+        _Inc(), [_Al("a1", None, "ERROR", "orphan", _ts(10))], []
+    )
+    assert "failures from" not in out
+    assert "span" not in out
+    assert "orders=1" in out          # still useful
+
+
+def test_incident_context_caps_orders_and_says_so():
+    from backend.api import _CONTEXT_ORDER_CAP, format_incident_context
+
+    total = _CONTEXT_ORDER_CAP + 6
+    alerts = [
+        _Al(f"a{i}", f"J{i}", "ERROR", f"boom {i}", _ts(i), order_id=f"ORD-{i}")
+        for i in range(total)
+    ]
+    journeys = [_Jn(f"J{i}", "SAP_SUBMISSION_FAILED", _ts(i), _ts(i)) for i in range(total)]
+    out = format_incident_context(_Inc(), alerts, journeys)
+    assert f"Affected orders ({total}, showing {_CONTEXT_ORDER_CAP})" in out
+    # One line per shown order, and the freshest survive the cut.
+    assert f"ORD-{total - 1}" in out
+    assert "ORD-0" not in out
+
+
+def test_incident_context_untruncated_reports_a_plain_count():
+    from backend.api import format_incident_context
+
+    out = format_incident_context(
+        _Inc(),
+        [_Al("a1", "J1", "ERROR", "rfc failed", _ts(10), order_id="ORD-1")],
+        [_Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(10))],
+    )
+    assert "Affected orders (1)" in out
+    assert "showing" not in out
+
+
+def test_incident_context_line_carries_outcome_service_and_explanation():
+    from backend.api import format_incident_context
+
+    out = format_incident_context(
+        _Inc(),
+        [_Al("a1", "J1", "ERROR", "RFC_COMMUNICATION_FAILURE on submit", _ts(10),
+             order_id="ORD-1", explanation="SAP could not be reached.")],
+        [_Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(10))],
+    )
+    assert "ORD-1 (SAP_SUBMISSION_FAILED)" in out
+    assert "ERROR cc-outbound-osw SapRfcClient" in out
+    assert "RFC_COMMUNICATION_FAILURE on submit" in out
+    assert "SAP could not be reached." in out
+
+
+def test_incident_context_states_that_one_line_is_shown_per_order():
+    """Without this the model reports "2 alerts" because it counted 2 lines."""
+    from backend.api import format_incident_context
+
+    alerts = [
+        _Al("a1", "J1", "ERROR", "x", _ts(10), order_id="ORD-1"),
+        _Al("a2", "J1", "ERROR", "y", _ts(20), order_id="ORD-1"),
+        _Al("a3", "J2", "ERROR", "z", _ts(30), order_id="ORD-2"),
+    ]
+    journeys = [
+        _Jn("J1", "X", _ts(0), _ts(20)), _Jn("J2", "X", _ts(25), _ts(30)),
+    ]
+    out = format_incident_context(_Inc(), alerts, journeys)
+    assert "one representative line shown per order" in out
+
+
+def test_incident_context_renders_in_the_requested_timezone():
+    from backend.api import format_incident_context
+
+    out = format_incident_context(
+        _Inc(),
+        [_Al("a1", "J1", "ERROR", "x", _ts(10), order_id="ORD-1")],
+        [_Jn("J1", "X", _ts(0), _ts(10))],
+        "Europe/Bucharest",
+    )
+    assert "19:24:02 EEST" in out
+
+
+class _SeqSession:
+    """Returns queued results in order — the incident branch runs 3 queries.
+
+    The existing _FakeSession answers every execute() with the same row, which
+    cannot represent "incident, then its alerts, then its journeys". An exhausted
+    queue yields an empty result, which is what the chat route's later
+    feedback-boosts query gets (and boosts_from([]) is {}).
+    """
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.statements = []
+
+    async def execute(self, stmt):
+        self.statements.append(stmt)
+        return self._results.pop(0) if self._results else _FakeResult(None)
+
+    async def commit(self):
+        pass
+
+
+def _incident_chat(monkeypatch, results, query="how bad is this", incident_id="INC-1"):
+    """POST /chat scoped to an incident; returns the query forwarded to the AI."""
+    from backend.auth import get_current_user
+    from backend.db import get_session
+    from backend.main import app
+
+    app.dependency_overrides[get_current_user] = lambda: "test-user"
+
+    async def _session_override():
+        yield _SeqSession(results)
+
+    app.dependency_overrides[get_session] = _session_override
+
+    seen: list[dict] = []
+
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+        seen.append({"query": query, "filters": filters})
+        return {"answer": "a", "sources": [], "mode": "ai"}
+
+    monkeypatch.setattr("backend.rag_client.ask", _fake_ask)
+    try:
+        resp = TestClient(app).post(
+            "/chat",
+            json={"query": query, "context": {"kind": "incident", "id": incident_id}},
+        )
+        assert resp.status_code == 200
+        return seen[0]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_backend_chat_incident_context_is_prepended(monkeypatch):
+    """The "ask about this incident" button: the incident's membership is
+    prepended to the question."""
+    alerts = [
+        _Al("a1", "J1", "ERROR", "RFC_COMMUNICATION_FAILURE", _ts(10), order_id="ORD-1"),
+        _Al("a2", "J2", "ERROR", "RFC_COMMUNICATION_FAILURE", _ts(20), order_id="ORD-2"),
+    ]
+    journeys = [
+        _Jn("J1", "SAP_SUBMISSION_FAILED", _ts(0), _ts(10)),
+        _Jn("J2", "SAP_SUBMISSION_FAILED", _ts(15), _ts(20)),
+    ]
+    call = _incident_chat(
+        monkeypatch,
+        [_FakeResult(_Inc()), _FakeResult(None, alerts), _FakeResult(None, journeys)],
+    )
+    forwarded = call["query"]
+    assert "SAP_SUBMISSION_FAILED — SAP" in forwarded   # the incident title
+    assert "orders=2" in forwarded                       # exact membership
+    assert "ORD-1" in forwarded and "ORD-2" in forwarded
+    assert "how bad is this" in forwarded                # ...and the question
+    assert forwarded.index("orders=2") < forwarded.index("how bad is this")
+
+
+def test_backend_chat_incident_scope_sends_no_filters(monkeypatch):
+    """An anchored conversation must not ALSO be narrowed by an order id lifted
+    out of the prose — the scope already anchors it."""
+    call = _incident_chat(
+        monkeypatch,
+        [_FakeResult(_Inc()), _FakeResult(None, []), _FakeResult(None, [])],
+        query="what about ORD-6001",
+    )
+    assert call["filters"] is None
+
+
+def test_backend_chat_unknown_incident_degrades_to_the_bare_question(monkeypatch):
+    """A stale id must not 404 the chat — the answer is merely unscoped."""
+    call = _incident_chat(monkeypatch, [_FakeResult(None)])
+    assert call["query"] == "how bad is this"
+
+
+def test_backend_chat_unknown_kind_degrades_to_the_bare_question(monkeypatch):
+    """Regression guard on _context_text's fall-through: kind is a plain str, so
+    an unrecognized value must be unscoped rather than an error."""
+    from backend.auth import get_current_user
+    from backend.db import get_session
+    from backend.main import app
+
+    app.dependency_overrides[get_current_user] = lambda: "test-user"
+
+    async def _session_override():
+        yield _SeqSession([])
+
+    app.dependency_overrides[get_session] = _session_override
+
+    seen: list[str] = []
+
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+        seen.append(query)
+        return {"answer": "a", "sources": [], "mode": "ai"}
+
+    monkeypatch.setattr("backend.rag_client.ask", _fake_ask)
+    try:
+        resp = TestClient(app).post(
+            "/chat",
+            json={"query": "hi", "context": {"kind": "nonsense", "id": "X"}},
+        )
+        assert resp.status_code == 200
+        assert seen[0] == "hi"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_backend_chat_incident_with_no_alerts_still_gives_a_header(monkeypatch):
+    """Possible briefly, before retry_unclustered_completions catches up."""
+    call = _incident_chat(
+        monkeypatch,
+        [_FakeResult(_Inc()), _FakeResult(None, []), _FakeResult(None, [])],
+    )
+    assert "SAP_SUBMISSION_FAILED — SAP" in call["query"]
+    assert "orders=0" in call["query"]

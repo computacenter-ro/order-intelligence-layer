@@ -4,8 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
-import { WarningIcon } from "@phosphor-icons/react";
+import { ChatCircleDotsIcon, WarningIcon } from "@phosphor-icons/react";
 import { fetchIncident, resolveIncident } from "@/lib/api";
+import { useChat } from "@/lib/chat";
 import { groupAlertsByOrder } from "@/lib/incidents";
 import { INCIDENT_STATUS_BADGE, INCIDENT_STATUS_LABEL } from "@/lib/incidentStatus";
 import { useWebSocket } from "@/lib/useWebSocket";
@@ -17,6 +18,7 @@ import type { IncidentDetail, WsEvent } from "@/lib/types";
 export default function IncidentDetailPage() {
   const params = useParams<{ incidentId: string }>();
   const router = useRouter();
+  const { openChat } = useChat();
   const [incident, setIncident] = useState<IncidentDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [resolving, setResolving] = useState(false);
@@ -110,7 +112,24 @@ export default function IncidentDetailPage() {
             {INCIDENT_STATUS_LABEL[incident.status]}
           </span>
           {incident.department && <Badge status="info">{capitalize(incident.department)}</Badge>}
-          <span style={{ marginLeft: "auto" }}>
+          <span style={{ marginLeft: "auto", display: "flex", gap: "8px" }}>
+            {/* Secondary, not primary: "Resolve" is this page's single primary
+                action (guidelines allow at most one), and the assistant is a
+                supporting action. Same treatment as AlertDetailDrawer's
+                "Ask About This". */}
+            <Button
+              variant="secondary"
+              size="compact"
+              leftIcon={<ChatCircleDotsIcon size={20} />}
+              onClick={() =>
+                openChat(
+                  { kind: "incident", id: incident.incident_id },
+                  `incident ${incident.title}`
+                )
+              }
+            >
+              Ask About This Incident
+            </Button>
             <Button
               variant="primary"
               size="compact"

@@ -41,8 +41,12 @@ export default function AlertFeedPage() {
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
+      // search is forced back to "" rather than restored: the dropdown selections
+      // are a standing preference ("I work on backend criticals"), but a search
+      // term is a one-off lookup. Reopening the tab to a pre-filtered list with an
+      // empty-looking cause is the confusing case this avoids.
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      if (raw) setFilters(sanitizeAlertFilters(JSON.parse(raw)));
+      if (raw) setFilters({ ...sanitizeAlertFilters(JSON.parse(raw)), search: "" });
     } catch {
       // corrupt/absent storage — fall back to the defaults already in state
     }
@@ -196,6 +200,7 @@ export default function AlertFeedPage() {
               onOpen={setSelected}
               onResolve={handleResolve}
               isSelected={selected?.alert_id === alert.alert_id}
+              search={filters.search.trim()}
             />
           ))
         )}
@@ -207,7 +212,11 @@ export default function AlertFeedPage() {
           </Button>
         </div>
       )}
-      <AlertDetailDrawer alert={selected} onClose={() => setSelected(null)} />
+      <AlertDetailDrawer
+        alert={selected}
+        onClose={() => setSelected(null)}
+        search={filters.search.trim()}
+      />
     </div>
   );
 }

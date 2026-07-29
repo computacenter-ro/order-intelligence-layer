@@ -7,12 +7,14 @@ import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
 import { useChat } from "@/lib/chat";
 import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
-import { renderInlineMarkdown } from "@/lib/richText";
+import { highlightRuns, renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
 interface AlertDetailDrawerProps {
   alert: ProcessedAlert | null;
   onClose: () => void;
+  /** Active search term, highlighted in the explanation and the raw log. */
+  search?: string;
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -49,7 +51,7 @@ function KeyValueRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
+export function AlertDetailDrawer({ alert, onClose, search }: AlertDetailDrawerProps) {
   const { openChat } = useChat();
 
   useEffect(() => {
@@ -128,7 +130,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
           }}
         >
           {alert.explanation
-            ? renderInlineMarkdown(alert.explanation)
+            ? renderInlineMarkdown(alert.explanation, search)
             : "Unprocessed — LLM unavailable. This alert was passed straight through as a fallback and needs manual triage."}
         </p>
         <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
@@ -170,20 +172,27 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
             overflowX: "auto",
           }}
         >
-          {JSON.stringify(
-            {
-              log_id: alert.log_id,
-              level: alert.level,
-              app_name: alert.app_name,
-              logger: alert.logger,
-              message: alert.message,
-              event_id: alert.event_id,
-              order_id: alert.order_id,
-              cart_header_id: alert.cart_header_id,
-              account_number: alert.account_number,
-            },
-            null,
-            2
+          {/* highlightRuns, not renderInlineMarkdown: this is a raw log dump, so a
+              backtick or ** in a log line is literal text, not a marker. Marking
+              the whole block is what surfaces a hit that exists only in
+              `message` — the term never appears in the explanation for those. */}
+          {highlightRuns(
+            JSON.stringify(
+              {
+                log_id: alert.log_id,
+                level: alert.level,
+                app_name: alert.app_name,
+                logger: alert.logger,
+                message: alert.message,
+                event_id: alert.event_id,
+                order_id: alert.order_id,
+                cart_header_id: alert.cart_header_id,
+                account_number: alert.account_number,
+              },
+              null,
+              2
+            ),
+            search
           )}
         </pre>
 

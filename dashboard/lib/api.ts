@@ -84,6 +84,10 @@ export interface AlertsFilter {
   severity?: string[];
   source?: string;
   level?: string;
+  // Free-text substring match over message OR explanation, case-insensitive
+  // server-side. Blank/whitespace-only is treated as absent by the backend, but
+  // callers should omit it rather than send "" so the URL stays clean.
+  search?: string;
   resolved?: boolean;
   // Semantic-cache provenance; orthogonal to `source` (cached alerts are all
   // source="ai"). Omitted = both.
@@ -126,6 +130,7 @@ function alertFilterParams(filter: AlertsFilter): URLSearchParams {
   (filter.severity ?? []).forEach((v) => params.append("severity", v));
   if (filter.source) params.set("source", filter.source);
   if (filter.level) params.set("level", filter.level);
+  if (filter.search) params.set("search", filter.search);
   if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
   if (filter.cached !== undefined) params.set("cached", String(filter.cached));
   return params;

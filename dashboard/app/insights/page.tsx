@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchStats } from "@/lib/api";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { NewAlertsBanner } from "@/components/alerts/NewAlertsBanner";
-import { humanizeKey } from "@/lib/format";
+import { formatDuration, humanizeKey } from "@/lib/format";
 import {
   OUTCOME_FAILED,
   OUTCOME_SUCCESS,
@@ -208,6 +208,11 @@ export default function InsightsPage() {
           // Signal color only when there is something to signal; the label says
           // "Critical" either way, so color is never the only cue.
           tone={criticalCount > 0 ? OUTCOME_FAILED : undefined}
+        />
+        <StatCard
+          label="Avg duration"
+          value={formatDuration(journeys.avg_duration_seconds)}
+          hint="first to last log"
         />
         <StatCard
           label="Timed out"

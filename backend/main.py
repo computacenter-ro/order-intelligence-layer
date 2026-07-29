@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend import teams
 from backend.api import router as api_router
 from backend.auth import router as auth_router
+from backend.auth_entra import router as entra_router
 from backend.consumers import run_consumers
 from backend.ws import manager as hub
 from backend.ws import router as ws_router
@@ -136,6 +137,7 @@ app.add_middleware(
     allow_credentials=True,
 )
 app.include_router(auth_router)
+app.include_router(entra_router)
 app.include_router(api_router)
 app.include_router(ws_router)
 

@@ -19,6 +19,7 @@ import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-m
 import { ChatPanel } from "@/components/chat/ChatPanel";
 import { useAuth } from "@/lib/auth";
 import { ChatProvider, useChat } from "@/lib/chat";
+import { displayName } from "@/lib/format";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
 
@@ -131,10 +132,13 @@ function AppShellInner({ children }: AppShellProps) {
         fontWeight: 500,
         cursor: "pointer",
       }}
+      // The full identity stays here and in the title: the row shows a name, but
+      // "which account am I signed in as" must still be answerable.
       aria-label={`Sign out${user ? ` (${user.username})` : ""}`}
+      title={user?.username}
     >
       <SignOutIcon size={20} />
-      <span>Sign Out{user ? ` · ${user.username}` : ""}</span>
+      <span>Sign Out{user ? ` · ${displayName(user.username)}` : ""}</span>
     </button>
   );
 

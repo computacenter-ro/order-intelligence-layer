@@ -56,6 +56,23 @@ JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", str(8 * 60 * 60)))
 COOKIE_NAME = "oil_session"
 COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true"
 
+
+# Read at CALL time, not import time, so a deployment (and the tests) can flip it
+# without re-importing the module. Any of false/0/no disables password login.
+def password_login_enabled() -> bool:
+    """Whether ``POST /auth/login`` is served at all.
+
+    Entra ID is the intended sign-in path; password login remains as the escape
+    hatch for local dev and for the day the Entra client secret expires. It MUST
+    be off in a real deployment — the default hash is bcrypt("admin"), which
+    would otherwise be a documented way around SSO.
+    """
+    return os.getenv("PASSWORD_LOGIN_ENABLED", "true").strip().lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+
 _pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -179,6 +196,9 @@ def authenticate(username: str, password: str) -> bool:
 
 @router.post("/login", response_model=UserOut)
 async def login(body: LoginRequest, response: Response) -> UserOut:
+    if not password_login_enabled():
+        # 404 rather than 403: the endpoint simply isn't there when disabled.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if not authenticate(body.username, body.password):
         # One message for both wrong-user and wrong-password — no user enumeration.
         raise HTTPException(

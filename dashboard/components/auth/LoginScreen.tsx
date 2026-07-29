@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import { useEffect, useState } from "react";
+import { ArrowLeft } from "@phosphor-icons/react";
 import { Button, TextInput } from "@computacenter-ro/style-guide/components";
 import ccLogoBlue from "@computacenter-ro/style-guide/logos/cc-logo-blue.png";
 import {
@@ -27,13 +28,21 @@ const AUTH_ERROR_TEXT: Record<string, string> = {
  * visit, expired cookie, or after logout). On success the AuthProvider flips to
  * `authenticated` and the gate swaps in the app.
  *
+ * Two steps: **choose a method, then use it.** Step 1 offers the enabled sign-in
+ * methods as equal-width buttons; step 2 is the chosen method's own screen, with a
+ * Back link. No form fields are visible until the user asks for them, which keeps
+ * the first screen to a single decision.
+ *
  * **Entra ID is the primary path**: the Microsoft button leaves the SPA for the
  * backend's redirect endpoint, and the browser returns here already carrying the
- * session cookie. The username/password form below it is the escape hatch for
- * local dev and for an expired Entra client secret — the backend gates it behind
+ * session cookie. The username/password form is the escape hatch for local dev
+ * and for an expired Entra client secret — the backend gates it behind
  * `PASSWORD_LOGIN_ENABLED`, and `GET /auth/config` is what tells us whether to
  * render it at all. The field is labelled "Email" but its value is sent as the
  * `username` (the hardcoded admin).
+ *
+ * With only ONE method enabled the chooser is skipped entirely — a menu of one is
+ * a wasted click — so the screen collapses back to exactly what it was before.
  */
 export function LoginScreen() {
   const { login } = useAuth();
@@ -43,6 +52,7 @@ export function LoginScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [step, setStep] = useState<"choose" | "password">("choose");
 
   useEffect(() => {
     // A failed Entra round trip lands here as ?auth_error=<reason>. Read it after
@@ -75,6 +85,12 @@ export function LoginScreen() {
   // appears only once confirmed, so it never flashes where it is disabled.
   const showEntra = config === null || config.entra_enabled;
   const showPassword = config?.password_login === true;
+  const bothAvailable = showEntra && showPassword;
+  // Two steps: choose a method, then use it. The chooser only earns its step when
+  // there are actually two methods — with one enabled, showing a menu of one
+  // would be a pointless click, so we land straight on it.
+  const onPasswordStep = showPassword && (!bothAvailable || step === "password");
+  const onChooserStep = !onPasswordStep && (showEntra || showPassword);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -162,42 +178,55 @@ export function LoginScreen() {
             Order Intelligence Layer.
           </p>
 
-          {showEntra && (
-            <Button
-              variant="primary"
-              size="md"
-              type="button"
-              onClick={() => window.location.assign(entraLoginUrl())}
-            >
-              Sign In With Microsoft
-            </Button>
-          )}
-
-          {showEntra && showPassword && (
-            <div
-              aria-hidden="true"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "12px",
-                margin: "24px 0",
-                color: "var(--cc-grey-three)",
-                fontSize: "14px",
-                lineHeight: "18px",
-              }}
-            >
-              <span
-                style={{ flex: 1, height: "1px", background: "var(--cc-grey-five)" }}
-              />
-              or
-              <span
-                style={{ flex: 1, height: "1px", background: "var(--cc-grey-five)" }}
-              />
+          {/* Step 1 — pick a method. Grid rather than flex: Button takes no
+              style/className prop, and grid items blockify, so both stretch to
+              the same full width. */}
+          {onChooserStep && (
+            <div style={{ display: "grid", gap: "12px" }}>
+              {showEntra && (
+                <Button
+                  variant="primary"
+                  size="md"
+                  type="button"
+                  onClick={() => window.location.assign(entraLoginUrl())}
+                >
+                  Sign In With Microsoft
+                </Button>
+              )}
+              {showPassword && (
+                <Button
+                  variant="hollow"
+                  size="md"
+                  type="button"
+                  onClick={() => {
+                    // Drop any Entra redirect error: it says nothing about the
+                    // password form the user is about to see.
+                    setAuthError(null);
+                    setStep("password");
+                  }}
+                >
+                  Sign In With Your Account
+                </Button>
+              )}
             </div>
           )}
 
-          {showPassword && (
+          {onPasswordStep && (
             <>
+              {/* Only offer Back when there is somewhere to go back to. */}
+              {bothAvailable && (
+                <div style={{ margin: "0 0 16px", marginLeft: "-16px" }}>
+                  <Button
+                    variant="ghost"
+                    size="compact"
+                    type="button"
+                    leftIcon={<ArrowLeft size={20} />}
+                    onClick={() => setStep("choose")}
+                  >
+                    Back
+                  </Button>
+                </div>
+              )}
               <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
                 <TextInput
                   label="Email"
@@ -219,8 +248,11 @@ export function LoginScreen() {
               </div>
 
               <div style={{ marginTop: "32px" }}>
+                {/* Primary is correct here despite the "one per page" rule: the
+                    Microsoft button belongs to the other step, so the two are
+                    never on screen together. */}
                 <Button
-                  variant="secondary"
+                  variant="primary"
                   size="md"
                   type="submit"
                   loading={submitting}
@@ -232,9 +264,9 @@ export function LoginScreen() {
             </>
           )}
 
-          {/* With the password form hidden there is no field to hang the error
-              on, so an Entra failure needs its own line. */}
-          {!showPassword && message && (
+          {/* On the chooser step there is no password field to hang the error on,
+              so an Entra redirect failure needs its own line. */}
+          {!onPasswordStep && message && (
             <p
               role="alert"
               style={{

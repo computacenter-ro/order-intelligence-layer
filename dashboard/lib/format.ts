@@ -12,6 +12,42 @@ export function levelLabel(level: LogLevel): string {
 }
 
 /**
+ * Turn a session identity into a person's name for display:
+ * `"larisa.muntean@computacenter.com"` -> `"Larisa Muntean"`.
+ *
+ * The backend's session identity is whatever Entra put in `preferred_username`
+ * (a UPN, i.e. an e-mail), so the raw value is what the sign-out row used to
+ * show. Only the display changes — the identity itself is untouched, and callers
+ * should keep the full value in a `title`/`aria-label` so nothing is lost.
+ *
+ * Everything after `@` is dropped, then `.` and `-` become word boundaries and
+ * each word is title-cased (hyphens are preserved: `anne-marie` ->
+ * `Anne-Marie`). Values with no `@` and no separator — notably the `admin` of
+ * password login — simply come back capitalised (`"Admin"`).
+ *
+ * The rest of each word is LOWERCASED, not left alone: some tenants store the
+ * UPN in caps, and `"MIHAI.POPESCU@..."` must not render as shouting in the nav.
+ * The cost is that intercaps get flattened (`McDonald` -> `Mcdonald`), which is
+ * the better trade for a directory whose addresses are conventionally lowercase.
+ */
+export function displayName(identity: string): string {
+  const local = identity.split("@")[0];
+  if (!local) return identity;
+  return local
+    .split(".")
+    .filter(Boolean)
+    .map((word) =>
+      word
+        .split("-")
+        .map((part) =>
+          part ? part.charAt(0).toUpperCase() + part.slice(1).toLowerCase() : part
+        )
+        .join("-")
+    )
+    .join(" ");
+}
+
+/**
  * Compact timestamp for lists and feeds: "13:46:55" for today, "26 Jul, 13:46"
  * for anything older.
  *

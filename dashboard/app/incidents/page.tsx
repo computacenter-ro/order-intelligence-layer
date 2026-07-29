@@ -9,7 +9,6 @@ import { useWebSocket } from "@/lib/useWebSocket";
 import { IncidentCard } from "@/components/incidents/IncidentCard";
 import { NewIncidentsBanner } from "@/components/incidents/NewIncidentsBanner";
 import { EmptyState } from "@/components/ui/EmptyState";
-import type { Incident, IncidentStatus, WsEvent } from "@/lib/types";
 import { FilterDropdown } from "@/components/alerts/FilterDropdown";
 import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
 import type { FilterOption } from "@/components/alerts/FilterDropdown";

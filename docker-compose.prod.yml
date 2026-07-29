@@ -325,12 +325,11 @@ secrets:
 #    allow_origins=["http://localhost:3000"]. Harmless while everything is
 #    same-origin behind Caddy; must be made env-driven before any split-origin
 #    deployment.
-# 2. Collector restart loses history. This file gives the collector a restart
-#    policy (it had none), so it now recovers from a crash — but it comes back
-#    with an EMPTY store while the poller's watermark (ai:last_to) persists in
-#    Redis. The poller then reads empty windows, advances the watermark anyway,
-#    and the logs emitted during the gap are lost: those journeys sit until they
-#    are swept as TIMED_OUT, which looks like a correlation bug rather than a
-#    restart. Needs a poller-side fix (see the deployment plan, phase 5).
-# 3. No Postgres backup. Take a pg_dump before the demo so there is a known-good
-#    restore point.
+# 2. Collector restart still loses the logs emitted during the gap — that is
+#    inherent to an in-memory store and is NOT recoverable. It is now at least
+#    loud rather than silent: the collector reports oldest_timestamp on /health
+#    and the poller warns and skips its watermark forward instead of quietly
+#    draining empty windows. The affected journeys are still swept as TIMED_OUT,
+#    so expect a burst of those in the logs after any collector restart.
+# 3. Backups are available but NOT automatic: run ./scripts/backup_db.sh, and
+#    cron it on the VM (see the header of that script).

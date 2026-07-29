@@ -160,7 +160,90 @@ def test_range_query_still_serves_logs_inside_the_window_after_eviction(monkeypa
 def test_health_reports_occupancy_and_capacity(monkeypatch, client):
     _capped(monkeypatch, 5)
     client.post("/logs", json=_log("a", "2026-07-14T08:00:00.000Z"))
-    assert client.get("/health").json() == {"status": "ok", "stored": 1, "capacity": 5}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "stored": 1,
+        "capacity": 5,
+        "oldest_timestamp": "2026-07-14T08:00:00.000Z",
+    }
+
+
+# --- retention floor (oldest_timestamp) --------------------------------------
+# The poller uses this to tell "quiet period" from "my watermark predates
+# everything I still hold" — the second case means logs were lost to eviction or
+# to a restart of this in-memory store.
+def test_oldest_timestamp_is_null_when_empty(client):
+    assert client.get("/health").json()["oldest_timestamp"] is None
+
+
+def test_oldest_timestamp_advances_as_logs_are_evicted(monkeypatch, client):
+    _capped(monkeypatch, 3)
+    for i in range(6):
+        client.post("/logs", json=_log(f"l{i}", f"2026-07-14T08:00:{i:02d}.000Z"))
+    # l0..l2 evicted; the floor is now l3's timestamp.
+    assert client.get("/health").json()["oldest_timestamp"] == "2026-07-14T08:00:03.000Z"
+
+
+def test_oldest_timestamp_is_the_minimum_not_the_first_inserted(monkeypatch, client):
+    """Eviction is by insertion order, but this is a claim about TIME.
+
+    Interleaved flows mean the left-most retained entry is not necessarily the
+    earliest, so returning ``_STORE[0]`` would overstate the floor and make the
+    poller skip past logs it actually still had.
+    """
+    _capped(monkeypatch, 3)
+    client.post("/logs", json=_log("first-in", "2026-07-14T08:00:20.000Z"))
+    client.post("/logs", json=_log("mid", "2026-07-14T08:00:30.000Z"))
+    client.post("/logs", json=_log("late-arrival", "2026-07-14T08:00:05.000Z"))
+    assert client.get("/health").json()["oldest_timestamp"] == "2026-07-14T08:00:05.000Z"
+
+
+# --- unfiltered query limit --------------------------------------------------
+def test_unfiltered_query_is_capped_by_default(monkeypatch, client):
+    """A no-params read must not serialize the whole store (~90 MB at 200k)."""
+    monkeypatch.setattr(mock_es, "DEFAULT_QUERY_LIMIT", 5)
+    for i in range(20):
+        client.post("/logs", json=_log(f"l{i}", f"2026-07-14T08:00:{i:02d}.000Z"))
+    got = client.get("/logs").json()
+    assert len(got) == 5
+    # The NEWEST ones — the only reason to read without a window is recent activity.
+    assert [log["log_id"] for log in got] == ["l15", "l16", "l17", "l18", "l19"]
+
+
+def test_explicit_limit_overrides_the_default(monkeypatch, client):
+    monkeypatch.setattr(mock_es, "DEFAULT_QUERY_LIMIT", 2)
+    for i in range(10):
+        client.post("/logs", json=_log(f"l{i}", f"2026-07-14T08:00:{i:02d}.000Z"))
+    assert len(client.get("/logs", params={"limit": 7}).json()) == 7
+
+
+def test_range_query_is_NOT_capped_by_the_default(monkeypatch, client):
+    """The poller's correctness depends on getting its ENTIRE window.
+
+    Silently truncating a windowed read would drop logs and starve journey
+    assembly — exactly the failure the limit is meant to avoid causing.
+    """
+    monkeypatch.setattr(mock_es, "DEFAULT_QUERY_LIMIT", 3)
+    for i in range(10):
+        client.post("/logs", json=_log(f"l{i}", f"2026-07-14T08:00:{i:02d}.000Z"))
+    got = client.get(
+        "/logs", params={"from": "2026-07-14T08:00:00.000Z", "to": "2026-07-14T08:00:10.000Z"}
+    ).json()
+    assert len(got) == 10        # all of them, despite the low default
+
+
+def test_id_query_is_NOT_capped_by_the_default(monkeypatch, client):
+    monkeypatch.setattr(mock_es, "DEFAULT_QUERY_LIMIT", 2)
+    for i in range(6):
+        client.post(
+            "/logs",
+            json=_log(f"l{i}", f"2026-07-14T08:00:{i:02d}.000Z", eventId="evt-same"),
+        )
+    assert len(client.get("/logs", params={"id": "evt-same"}).json()) == 6
+
+
+def test_limit_must_be_positive(client):
+    assert client.get("/logs", params={"limit": 0}).status_code == 422
 
 
 def test_max_logs_is_env_configurable(monkeypatch):

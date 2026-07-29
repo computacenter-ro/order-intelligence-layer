@@ -332,12 +332,22 @@ random orderId collided within a few dozen flows). The 19-digit width is fixed b
 
 FastAPI, in-memory storage. Intentionally dumb — **no journey logic here, ever**.
 
+Storage is a **capped ring buffer** (`deque(maxlen=MOCK_ES_MAX_LOGS)`, default
+200k lines): the store is unbounded by nature and the deployed simulation runs
+continuously (~170k lines/day at 2 flows/30s), so an uncapped list would OOM the
+container on a multi-day run. Evicting the oldest is safe because **nothing at
+runtime reads old logs** — the poller only ever asks for a ~20s window and
+`?id=` is debug-only. Eviction is by **insertion order, not timestamp**:
+concurrent flows interleave, so the newest arrival is not necessarily the latest
+timestamp, and evicting by timestamp could drop a just-arrived log that still
+sits inside the poller's window.
+
 | Endpoint | Behavior |
 |---|---|
 | `POST /logs` | Single log object or array. Validates `log_id` + `timestamp` (422 otherwise). Returns `{"ingested": N}`. |
 | `GET /logs?from=<iso>&to=<iso>` | `from <= timestamp < to`, sorted ascending. |
 | `GET /logs?id=<X>` | Logs where `eventId==X` OR `orderId==X` OR `cartHeaderId==X`, ascending. **Debug/ops tool only** — no runtime component depends on it. |
-| `GET /health` | `{"status":"ok","stored":N}` |
+| `GET /health` | `{"status":"ok","stored":N,"capacity":MOCK_ES_MAX_LOGS}` — `stored == capacity` means the buffer is evicting |
 
 Only the AI service's poller reads from it at runtime.
 
@@ -786,7 +796,8 @@ Env defaults: `ES_URL=http://localhost:9200`,
 `DATABASE_URL=postgresql://...`, `POLL_INTERVAL=10`, `WINDOW_START_OFFSET=25`,
 `WINDOW_END_OFFSET=5`, `MAX_WINDOW_SPAN=120` (poller catch-up cap),
 `ALERT_CONCURRENCY=4` (concurrent alert LLM calls), `STALLED_TIMEOUT=90`,
-`STALLED_SWEEP_INTERVAL=15`, `DASHBOARD_URL` (dashboard base for journey links),
+`STALLED_SWEEP_INTERVAL=15`, `MOCK_ES_MAX_LOGS=200000` (collector ring-buffer
+capacity), `DASHBOARD_URL` (dashboard base for journey links),
 `SEMCACHE_ENABLED=1`, `SEMCACHE_THRESHOLD=0.95` (cosine floor),
 `SEMCACHE_MAX_ENTRIES=500`, `SEMCACHE_MODEL=all-MiniLM-L6-v2`, `SEMCACHE_GUARD=1`,
 `SEMCACHE_SALIENT_EXTRA` (comma-sep extra guard words),

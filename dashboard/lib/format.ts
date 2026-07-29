@@ -28,6 +28,55 @@ export function levelLabel(level: LogLevel): string {
  * exact second no longer helps, and the day + time is what disambiguates.
  * Anyone needing the full value hovers for :func:`formatTimestampFull`.
  */
+/**
+ * Rewrite `27 Jul 2026 16:26:21 UTC` inside LLM-generated prose into the viewer's
+ * local zone.
+ *
+ * Two paths produce timestamps in a chat answer. A SCOPED question sends the
+ * browser's zone, so the backend already formats that context locally and the
+ * model quotes local time. But records from the INDEX carry UTC — they are shared
+ * by every viewer, so they cannot be pre-formatted per reader. This closes that
+ * second path.
+ *
+ * Deliberately conservative: it matches only the exact shape `human_time` emits.
+ * If the model reformats or paraphrases a timestamp the pattern misses it and the
+ * UTC value shows through — mildly unhelpful, never WRONG, which is the right
+ * failure direction for a display transform on generated text.
+ *
+ * The trailing " UTC" is dropped once converted: keeping it would label a local
+ * time as UTC, which is worse than no label.
+ */
+const UTC_STAMP_RE =
+  /\b(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}):(\d{2}):(\d{2}) UTC\b/g;
+
+export function localizeUtcStamps(text: string): string {
+  if (!text.includes(" UTC")) return text; // fast path — most answers have none
+  return text.replace(
+    UTC_STAMP_RE,
+    (whole, day, mon, year, hh, mm, ss) => {
+      const iso = `${year}-${String(MONTHS.indexOf(mon) + 1).padStart(2, "0")}-${String(
+        day
+      ).padStart(2, "0")}T${hh}:${mm}:${ss}Z`;
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return whole; // unparseable: leave it alone
+      return d.toLocaleString([], {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+    }
+  );
+}
+
+const MONTHS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 export function formatTime(iso: string): string {
   const d = new Date(iso);
   const now = new Date();

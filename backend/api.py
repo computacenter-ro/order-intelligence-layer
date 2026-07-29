@@ -27,10 +27,15 @@ Endpoints:
   single-valued, likewise 422 on anything else. ``cached=true|false`` narrows by
   semantic-cache provenance; it is orthogonal to ``source`` (every cached alert is
   ``source="ai"``), so it filters *within* AI answers rather than beside them.
+
+  ``search=`` is a free-text, case-insensitive substring match (``ILIKE``) over
+  ``message`` OR ``explanation``, ANDed with every other filter. Any text is
+  valid; blank/whitespace-only is treated as absent.
 * ``GET /alerts/facets`` — takes the same filter params as ``GET /alerts`` (no
   paging) and returns per-value counts for the three multi-select filters. Each
   facet is counted with every active filter EXCEPT its own, so ticking one value
-  never collapses that facet's own list. Filter conditions come from the shared
+  never collapses that facet's own list — but ``search`` has no facet of its own,
+  so it scopes all three. Filter conditions come from the shared
   :func:`alert_filter_conditions`, so the feed and its counts cannot disagree.
 * ``GET /journeys?status=`` — journeys filtered by ``status``.
 * ``GET /journeys/{journey_id}`` — one journey + its events (ordered by ``ts``)
@@ -45,21 +50,28 @@ Endpoints:
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import ColumnElement, Select, func, select, update
+from sqlalchemy import ColumnElement, Select, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user
-from backend.db import Alert, Incident, Journey, JourneyEvent, get_session
+from backend.db import Alert, ChatFeedback, Incident, Journey, JourneyEvent, get_session
+from backend.feedback import boosts_from
 from backend.pagination import apply_keyset, build_page
+# human_time lives in rag_client (the lower-level, shared module) so the indexer,
+# the backfill script and this route all format LLM-facing timestamps identically.
+from backend.rag_client import human_time
 from backend import stats
 from backend.schemas import (
     AlertFacets,
     AlertOut,
     ChatCoverage,
+    ChatFeedbackRequest,
+    ChatFeedbackResponse,
     ChatRequest,
     ChatResponse,
     ChatSource,
@@ -87,6 +99,20 @@ _FACET_COLUMNS = {
 }
 
 
+def _like_term(search: str) -> str:
+    """Wrap a search string as a ``%substring%`` LIKE pattern, wildcards escaped.
+
+    ``%`` and ``_`` are LIKE metacharacters, and the alert corpus is full of both
+    — margin messages quote percentages, and logger/service names are peppered
+    with underscores. Passing them through raw makes ``12%`` match every alert and
+    ``order_engine`` match ``orderXengine``, so a literal search silently returns
+    the wrong rows. Escaped here (with the escape char itself first, or escaping
+    would corrupt its own output), paired with ``escape="\\\\"`` at the call site.
+    """
+    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def alert_filter_conditions(
     since: datetime | None,
     department: list[str] | None,
@@ -96,6 +122,7 @@ def alert_filter_conditions(
     severity: list[str] | None = None,
     resolved: bool | None = None,
     cached: bool | None = None,
+    search: str | None = None,
 ) -> list[ColumnElement[bool]]:
     """The WHERE clauses for a set of alert filters — the one place they live.
 
@@ -116,6 +143,14 @@ def alert_filter_conditions(
     department. That is the same behaviour the single-value ``==`` had.
 
     ``level`` / ``source`` / ``resolved`` / ``cached`` stay single-valued.
+
+    ``search`` is a case-insensitive **substring** match (``ILIKE``) across
+    ``message`` OR ``explanation`` — the raw log line and the AI's plain-English
+    take on it, which is where an agent's search terms actually live. Whitespace
+    is stripped and a blank string is treated as absent, so a cleared search box
+    is "no filter" rather than a match-everything ``%%``. ``explanation`` is NULL
+    on fallback alerts; ``ILIKE`` on NULL is NULL (not true), so those still match
+    on ``message`` alone and are never wrongly excluded by the OR.
     """
     conditions: list[ColumnElement[bool]] = []
     if since is not None:
@@ -134,6 +169,14 @@ def alert_filter_conditions(
         conditions.append(Alert.severity.in_(severity))
     if cached is not None:
         conditions.append(Alert.cached == cached)
+    if search and search.strip():
+        term = _like_term(search.strip())
+        conditions.append(
+            or_(
+                Alert.message.ilike(term, escape="\\"),
+                Alert.explanation.ilike(term, escape="\\"),
+            )
+        )
     return conditions
 
 
@@ -146,6 +189,7 @@ def build_alerts_query(
     severity: list[str] | None = None,
     resolved: bool | None = None,
     cached: bool | None = None,
+    search: str | None = None,
 ) -> Select:
     """Select alerts matching the given filters (see :func:`alert_filter_conditions`).
 
@@ -163,6 +207,7 @@ def build_alerts_query(
             severity=severity,
             resolved=resolved,
             cached=cached,
+            search=search,
         )
     )
 
@@ -266,6 +311,10 @@ async def list_alerts(
     # source="ai", so ?cached=true narrows within AI answers rather than being an
     # alternative to them. Omitted = both.
     cached: Annotated[bool | None, Query()] = None,
+    # Free-text substring search over message OR explanation, case-insensitive.
+    # A free string by nature — no value to validate, and a blank one is treated
+    # as absent by alert_filter_conditions.
+    search: Annotated[str | None, Query()] = None,
     # Cursor pagination (see backend/pagination.py). limit is clamped to 1..100
     # rather than 422'd so a caller can pass anything and still get a sane page.
     limit: Annotated[int, Query()] = 16,
@@ -288,6 +337,7 @@ async def list_alerts(
             severity=list(severity) if severity else None,
             resolved=resolved,
             cached=cached,
+            search=search,
         ),
         sort_col,
         Alert.alert_id,
@@ -322,6 +372,7 @@ async def get_alert_facets(
         list[Literal["critical", "high", "medium", "low"]] | None, Query()
     ] = None,
     cached: Annotated[bool | None, Query()] = None,
+    search: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> AlertFacets:
     """Per-value alert counts for the three multi-select filters. Read-only.
@@ -343,6 +394,10 @@ async def get_alert_facets(
             severity=None if facet == "severity" else severities,
             resolved=resolved,
             cached=cached,
+            # Never excluded: search is not a facet (there is no list of values to
+            # count), so it scopes every facet. The counts therefore describe the
+            # search results, which is what makes them usable while searching.
+            search=search,
         )
 
     counts: dict[str, dict[str, int]] = {}
@@ -549,12 +604,64 @@ def _dashboard_link(metadata: dict, *, kind: str = "", record_id: str = "") -> s
     return f"{base}/journeys/{ref}"
 
 
-async def _context_text(session: AsyncSession, kind: str, record_id: str) -> str | None:
+# How many of a journey's log lines to include in the scoped context.
+#
+# A journey can carry 40+ events, most of them DEBUG/INFO filler. Sending all of
+# them would make every scoped question a large, slow prompt for little gain, so
+# the selection is: every WARN/ERROR (where the story is), plus the first and last
+# lines (where it started and how it ended), capped at this many.
+_CONTEXT_EVENT_CAP = 24
+
+
+def select_context_events(events: list) -> list:
+    """The log lines worth showing for a scoped journey question (pure).
+
+    Keeps WARN/ERROR lines plus the first and last event, in timestamp order,
+    truncated to :data:`_CONTEXT_EVENT_CAP`. Returns the ORM/dict rows unchanged so
+    the caller decides formatting.
+
+    Why not all of them: the summary alone could not answer "what came next?",
+    "how many retries?" or "what time did it fail?" — but the full DEBUG trace
+    would bury those answers and cost a large prompt on every question. The
+    WARN/ERROR lines are where a failure narrative actually lives.
+    """
+    if not events:
+        return []
+    keep: dict[int, object] = {}
+    for i, event in enumerate(events):
+        level = str((event.raw or {}).get("level", "")).upper()
+        if level in ("WARN", "ERROR") or i == 0 or i == len(events) - 1:
+            keep[i] = event
+    ordered = [keep[i] for i in sorted(keep)]
+    if len(ordered) <= _CONTEXT_EVENT_CAP:
+        return ordered
+    # Over the cap: keep the head and the tail, since a truncated middle costs
+    # less than losing either the start or the terminal line.
+    half = _CONTEXT_EVENT_CAP // 2
+    return ordered[:half] + ordered[-half:]
+
+
+def format_context_events(events: list, tz: str | None = None) -> str:
+    """Render selected journey events as one line each (pure, testable)."""
+    lines = []
+    for event in events:
+        raw = event.raw or {}
+        ts = human_time(raw.get("timestamp") or event.ts, tz) or ""
+        lines.append(
+            f"  {ts} {raw.get('level', '')} {raw.get('app_name', '')}: {raw.get('message', '')}"
+        )
+    return "\n".join(lines)
+
+
+async def _context_text(
+    session: AsyncSession, kind: str, record_id: str, tz: str | None = None
+) -> str | None:
     """The text of the record a question is scoped to, or None if absent.
 
     Read from THIS service's Postgres (the backend owns the DB) rather than asking
     the AI service — the index holds an embedded copy, but the DB is the source of
-    truth and may be newer.
+    truth and may be newer, and it has detail the index deliberately does not (the
+    per-journey log lines).
     """
     if kind == "alert":
         row = (
@@ -565,14 +672,62 @@ async def _context_text(session: AsyncSession, kind: str, record_id: str) -> str
         parts = [f"{row.app_name} {row.level} {row.logger}: {row.message}"]
         if row.explanation:
             parts.append(row.explanation)
-        return " ".join(parts)
+        # Ids + time so a scoped question can ask "when did this happen?" or
+        # "which journey is this part of?" — previously unanswerable because the
+        # context was only the message and the explanation.
+        facts = [f"at={human_time(row.emitted_at, tz)}" if row.emitted_at else ""]
+        for key, value in (
+            ("order_id", row.order_id),
+            ("event_id", row.event_id),
+            ("journey_id", row.journey_id),
+            ("department", row.department),
+            ("severity", row.severity),
+        ):
+            if value:
+                facts.append(f"{key}={value}")
+        return " ".join(parts) + " [" + " ".join(f for f in facts if f) + "]"
+
     if kind == "journey":
         row = (
             await session.execute(select(Journey).where(Journey.journey_id == record_id))
         ).scalar_one_or_none()
         if row is None:
             return None
-        return f"Journey {row.outcome or row.status}: {row.summary or ''}".strip()
+        header = f"Journey {row.outcome or row.status}"
+        facts = []
+        for key, value in (
+            ("order_id", row.order_id),
+            ("event_id", row.event_id),
+            ("cart_header_id", row.cart_header_id),
+            ("started", human_time(row.first_ts, tz)),
+            ("ended", human_time(row.last_ts, tz)),
+        ):
+            if value:
+                facts.append(f"{key}={value}")
+        blocks = [f"{header} [{' '.join(facts)}]"]
+        if row.summary:
+            blocks.append(row.summary.strip())
+
+        # The events are the point of this change: the summary is 2-4 sentences,
+        # while the DB holds the actual sequence the question is usually about.
+        events = (
+            (
+                await session.execute(
+                    select(JourneyEvent)
+                    .where(JourneyEvent.journey_id == record_id)
+                    .order_by(JourneyEvent.ts.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        selected = select_context_events(list(events))
+        if selected:
+            blocks.append(
+                f"Log lines ({len(selected)} of {len(events)} shown — "
+                f"WARN/ERROR plus first and last):\n{format_context_events(selected, tz)}"
+            )
+        return "\n".join(blocks)
     return None
 
 
@@ -605,10 +760,21 @@ async def chat(
 
     context_text = None
     if body.context is not None:
-        context_text = await _context_text(session, body.context.kind, body.context.id)
+        context_text = await _context_text(
+            session, body.context.kind, body.context.id, body.tz
+        )
+
+    # Agent feedback is the backend's data, but ranking happens in the AI service
+    # (which owns the index and must stay DB-free), so the counts travel WITH the
+    # request. Failure here is non-fatal: no boosts means ranking falls back to
+    # pure relevance, which is the pre-feedback behaviour.
+    boosts = await _feedback_boosts(session)
 
     result = await ask(
-        build_scoped_query(body.query, context_text), k=body.k, filters=body.filters
+        build_scoped_query(body.query, context_text),
+        k=body.k,
+        filters=body.filters,
+        boosts=boosts,
     )
     return ChatResponse(
         answer=result["answer"],
@@ -631,7 +797,94 @@ async def chat(
         # retrieval, and the dashboard renders it (a badge on counting answers)
         # rather than reading it out of the prose.
         coverage=ChatCoverage(**(result.get("coverage") or {})),
+        # Minted here so the dashboard can rate THIS answer. Not persisted until a
+        # vote actually arrives — an unrated answer leaves no row.
+        answer_id=uuid.uuid4().hex,
     )
+
+
+# Most recent votes to fold into the boosts. Bounded so one query stays cheap on
+# the chat path; older votes are decayed to near-nothing anyway
+# (backend/feedback.py HALF_LIFE_DAYS), so the tail contributes little.
+_FEEDBACK_SCAN_LIMIT = 2000
+
+
+def settings_feedback_weight() -> float:
+    """The configured blend weight, read from the AI service's settings.
+
+    Read at call time rather than import time so a test can monkeypatch it, and
+    kept in one function so the "is the feature on?" check has a single home.
+    """
+    from ai_service import settings as ai_settings
+
+    return float(getattr(ai_settings, "RAGINDEX_FEEDBACK_WEIGHT", 0.0))
+
+
+async def _feedback_boosts(session: AsyncSession) -> dict[str, float]:
+    """Per-record feedback boosts for ranking, or ``{}`` on any problem.
+
+    Returns ``{}`` — never raises — when the weight is 0 (feature off) or the query
+    fails: retrieval then ranks on relevance alone, exactly as it did before
+    feedback existed. Search must not break because a vote table is unavailable.
+    """
+    if settings_feedback_weight() <= 0.0:
+        return {}
+    try:
+        rows = (
+            await session.execute(
+                select(ChatFeedback).order_by(ChatFeedback.created_at.desc()).limit(
+                    _FEEDBACK_SCAN_LIMIT
+                )
+            )
+        ).scalars().all()
+        return boosts_from(rows)
+    except Exception as exc:  # noqa: BLE001 — ranking degrades, never fails
+        print(f"[chat] feedback boosts unavailable: {type(exc).__name__}: {exc}", flush=True)
+        return {}
+
+
+@router.post("/chat/feedback", response_model=ChatFeedbackResponse)
+async def chat_feedback(
+    body: ChatFeedbackRequest,
+    user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ChatFeedbackResponse:
+    """Record a thumbs up/down on one answer (auth required).
+
+    Upserts on ``answer_id``, so voting again REPLACES the previous vote rather
+    than stacking — an agent can change their mind without inflating the tally.
+
+    Stored per ANSWER, not per record: the vote rates the reply that was read, and
+    credit is attributed to its sources as a derivation (rank-weighted, see
+    ``backend/feedback.py``). That keeps the attribution rule changeable later.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    vote = 1 if body.liked else -1
+    values = {
+        "answer_id": body.answer_id,
+        "created_at": datetime.now(timezone.utc),
+        "vote": vote,
+        "query": body.query,
+        "record_ids": list(body.record_ids),
+        "answer_mode": body.answer_mode,
+        "scoped_kind": body.scoped_kind,
+        "scoped_id": body.scoped_id,
+        "username": user,
+    }
+    stmt = (
+        pg_insert(ChatFeedback)
+        .values(**values)
+        .on_conflict_do_update(
+            index_elements=["answer_id"],
+            # Refresh created_at too: a changed vote is new evidence, and recency
+            # decay should treat it as such.
+            set_={k: values[k] for k in ("vote", "created_at")},
+        )
+    )
+    await session.execute(stmt)
+    await session.commit()
+    return ChatFeedbackResponse(recorded=True, liked=body.liked)
 
 
 @router.get("/stats/insights", response_model=OverviewStats)

@@ -26,10 +26,12 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -261,3 +263,43 @@ class Incident(Base):
 
     alert_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     journey_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
+class ChatFeedback(Base):
+    """One thumbs up/down on one assistant answer.
+
+    Feedback is USER DATA, so unlike the retrieval index (in-memory + Redis,
+    rebuildable by ``backfill_rag``) it lives here, durably.
+
+    Keyed by ``answer_id`` — one row per answer, so voting again REPLACES rather
+    than stacks. Stored per ANSWER, never per cited record: a vote rates the reply
+    the agent read, and which sources deserve the credit is a derivation
+    (rank-weighted, see ``backend/feedback.py``). Storing it per record would bake
+    one attribution rule into the data and make it unchangeable later.
+
+    ``record_ids`` is ORDERED — position is the signal, since attribution weights
+    by citation rank.
+    """
+
+    __tablename__ = "chat_feedback"
+
+    answer_id: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    # +1 like / -1 dislike; a CHECK constraint keeps a stray 0 out of the ranking
+    # math, where it would silently skew every boost.
+    vote: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    record_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
+
+    # Context for later analysis; NOT used by the ranking math.
+    answer_mode: Mapped[str | None] = mapped_column(String, nullable=True)
+    scoped_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    scoped_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("vote IN (-1, 1)", name="ck_chat_feedback_vote"),
+    )

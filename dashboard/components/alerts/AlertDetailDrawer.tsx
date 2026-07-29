@@ -1,16 +1,20 @@
 import { useEffect } from "react";
 import Link from "next/link";
-import { XIcon } from "@phosphor-icons/react";
+import { ChatCircleDotsIcon, XIcon } from "@phosphor-icons/react";
+import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
 import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
+import { useChat } from "@/lib/chat";
 import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
-import { renderInlineMarkdown } from "@/lib/richText";
+import { highlightRuns, renderInlineMarkdown } from "@/lib/richText";
 import type { ProcessedAlert } from "@/lib/types";
 
 interface AlertDetailDrawerProps {
   alert: ProcessedAlert | null;
   onClose: () => void;
+  /** Active search term, highlighted in the explanation and the raw log. */
+  search?: string;
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -47,7 +51,8 @@ function KeyValueRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
+export function AlertDetailDrawer({ alert, onClose, search }: AlertDetailDrawerProps) {
+  const { openChat } = useChat();
 
   useEffect(() => {
     if (!alert) return;
@@ -125,7 +130,7 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
           }}
         >
           {alert.explanation
-            ? renderInlineMarkdown(alert.explanation)
+            ? renderInlineMarkdown(alert.explanation, search)
             : "Unprocessed — LLM unavailable. This alert was passed straight through as a fallback and needs manual triage."}
         </p>
         <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
@@ -167,31 +172,54 @@ export function AlertDetailDrawer({ alert, onClose }: AlertDetailDrawerProps) {
             overflowX: "auto",
           }}
         >
-          {JSON.stringify(
-            {
-              log_id: alert.log_id,
-              level: alert.level,
-              app_name: alert.app_name,
-              logger: alert.logger,
-              message: alert.message,
-              event_id: alert.event_id,
-              order_id: alert.order_id,
-              cart_header_id: alert.cart_header_id,
-              account_number: alert.account_number,
-            },
-            null,
-            2
+          {/* highlightRuns, not renderInlineMarkdown: this is a raw log dump, so a
+              backtick or ** in a log line is literal text, not a marker. Marking
+              the whole block is what surfaces a hit that exists only in
+              `message` — the term never appears in the explanation for those. */}
+          {highlightRuns(
+            JSON.stringify(
+              {
+                log_id: alert.log_id,
+                level: alert.level,
+                app_name: alert.app_name,
+                logger: alert.logger,
+                message: alert.message,
+                event_id: alert.event_id,
+                order_id: alert.order_id,
+                cart_header_id: alert.cart_header_id,
+                account_number: alert.account_number,
+              },
+              null,
+              2
+            ),
+            search
           )}
         </pre>
 
         <SectionLabel>Related</SectionLabel>
-        <Link
-          href={alert.journey_id ? `/journeys?highlight=${alert.journey_id}` : "/journeys"}
-          onClick={onClose}
-          style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
-        >
-          → View Full Order Journey
-        </Link>
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px", alignItems: "flex-start" }}>
+          <Link
+            href={alert.journey_id ? `/journeys?highlight=${alert.journey_id}` : "/journeys"}
+            onClick={onClose}
+            style={{ color: "var(--cc-heritage-blue)", fontSize: "14px", cursor: "pointer" }}
+          >
+            → View Full Order Journey
+          </Link>
+          {/* Secondary, not primary: this drawer has no primary action, and the
+              guidelines allow at most one per page. Closing first avoids two
+              stacked overlays fighting for Escape. */}
+          <Button
+            variant="secondary"
+            size="compact"
+            leftIcon={<ChatCircleDotsIcon size={20} />}
+            onClick={() => {
+              onClose();
+              openChat({ kind: "alert", id: alert.alert_id }, `alert ${alert.app_name}`);
+            }}
+          >
+            Ask About This
+          </Button>
+        </div>
       </aside>
     </>
   );

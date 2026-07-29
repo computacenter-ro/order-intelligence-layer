@@ -21,6 +21,7 @@ so what gets embedded is unit-testable without a running AI service.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -44,8 +45,82 @@ _UNAVAILABLE = (
 
 
 # --- pure text/metadata builders ---------------------------------------------
+def human_time(value, tz: str | None = None) -> str | None:
+    """Format a timestamp for the LLM: ``27 Jul 2026 16:26:21 UTC``.
+
+    The model QUOTES what it is given, so a raw ISO string with microseconds and
+    an offset (``2026-07-27T16:26:21.815188+00:00``) ends up verbatim in an
+    agent-facing answer, where it is unreadable. Formatting on the way IN is the
+    only fix that reaches everywhere the value can surface — a UI formatter cannot
+    reach inside generated prose.
+
+    ``tz`` is an IANA zone name (e.g. ``Europe/Bucharest``) supplied by the
+    browser, which is the only party that knows where the reader is. Given one, the
+    value is rendered in that zone with its abbreviation (``EEST``) so the model
+    quotes a time the reader recognises. Without one it falls back to UTC — always
+    LABELLED, because an unlabelled local-looking time is worse than an explicit
+    UTC one.
+
+    Only per-request text (the scoped context) can use ``tz``. The INDEXED text is
+    shared by every viewer, so it stays UTC; the dashboard rewrites those to local
+    on display. Metadata timestamps stay ISO-8601 throughout — they are for
+    equality filters and ordering, not for reading.
+
+    Accepts a datetime or an ISO string; ``None`` in, ``None`` out, so callers drop
+    the fact entirely rather than emitting an empty one. An unknown zone degrades
+    to UTC rather than raising: a wrong-looking time is worse than a labelled one.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value  # unparseable: pass through rather than lose the value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    target = timezone.utc
+    label = "UTC"
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+
+            target = ZoneInfo(tz)
+            label = ""  # %Z supplies the real abbreviation (EEST/CET/...)
+        except Exception:  # noqa: BLE001 — unknown/invalid zone: fall back to UTC
+            target, label = timezone.utc, "UTC"
+
+    local = value.astimezone(target)
+    stamp = local.strftime("%d %b %Y %H:%M:%S")
+    suffix = label or local.strftime("%Z") or "UTC"
+    return f"{stamp} {suffix}"
+
+
+def _facts(**pairs: object) -> str:
+    """Render non-null ``key=value`` pairs as a trailing fact clause.
+
+    These go in the embedded TEXT, not just the metadata, because the AI service
+    only ever shows the model ``text`` — metadata is used for filtering and link
+    building. Without this, "which journey is this alert part of?" and "what time
+    did it fail?" were unanswerable even though the DB held both: the values were
+    indexed but invisible to the composer.
+    """
+    parts = [f"{k}={v}" for k, v in pairs.items() if v not in (None, "")]
+    return f" [{' '.join(parts)}]" if parts else ""
+
+
 def alert_text(
-    app_name: str, level: str, logger: str, message: str, explanation: str | None
+    app_name: str,
+    level: str,
+    logger: str,
+    message: str,
+    explanation: str | None,
+    *,
+    order_id: str | None = None,
+    event_id: str | None = None,
+    journey_id: str | None = None,
+    ts: str | None = None,
 ) -> str:
     """The prose embedded for an alert.
 
@@ -53,15 +128,37 @@ def alert_text(
     margin check fail" is far more likely to match the explanation's wording than
     the raw log line's. Falls back to just the log fields for a ``fallback``
     alert (explanation is None there) rather than emitting a dangling separator.
+
+    The id/timestamp clause is appended last so it never outweighs the prose in
+    the embedding — it is there to be *read* by the composer, not matched on.
     """
     head = f"{app_name} {level} {logger}: {message}"
     tail = (explanation or "").strip()
-    return f"{head}. {tail}".strip() if tail else f"{head}."
+    body = f"{head}. {tail}".strip() if tail else f"{head}."
+    return body + _facts(
+        order_id=order_id, event_id=event_id, journey_id=journey_id, at=ts
+    )
 
 
-def journey_text(outcome: str, summary: str | None) -> str:
+def journey_text(
+    outcome: str,
+    summary: str | None,
+    *,
+    order_id: str | None = None,
+    event_id: str | None = None,
+    journey_id: str | None = None,
+    started: str | None = None,
+    ended: str | None = None,
+) -> str:
     """The prose embedded for a completed journey."""
-    return f"Journey {outcome}: {(summary or '').strip()}".strip()
+    body = f"Journey {outcome}: {(summary or '').strip()}".strip()
+    return body + _facts(
+        order_id=order_id,
+        event_id=event_id,
+        journey_id=journey_id,
+        started=started,
+        ended=ended,
+    )
 
 
 def _clean(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -113,6 +210,7 @@ async def ask(
     query: str,
     k: int = 5,
     filters: dict | None = None,
+    boosts: dict[str, float] | None = None,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> dict:
@@ -125,7 +223,9 @@ async def ask(
     same way an LLM outage does: no narrative, no sources, but not an error page.
     """
     url = f"{AI_SERVICE_URL}/chat"
-    body = {"query": query, "k": k, "filters": filters}
+    # boosts travel with the request: the backend owns the votes, the AI service
+    # owns the index and stays DB-free.
+    body = {"query": query, "k": k, "filters": filters, "boosts": boosts or {}}
     try:
         if client is not None:
             resp = await client.post(url, json=body, timeout=RAG_CHAT_TIMEOUT)
@@ -159,7 +259,16 @@ async def index_alert(alert, *, client: httpx.AsyncClient | None = None) -> bool
     return await push(
         alert.alert_id,
         "alert",
-        alert_text(log.app_name, log.level, log.logger, log.message, alert.explanation),
+        alert_text(
+            log.app_name,
+            log.level,
+            log.logger,
+            log.message,
+            alert.explanation,
+            order_id=log.orderId,
+            event_id=log.eventId,
+            ts=human_time(alert.emitted_at),
+        ),
         {
             "department": alert.department.value if alert.department is not None else None,
             "severity": alert.severity.value if alert.severity is not None else None,
@@ -189,7 +298,15 @@ async def index_journey(
     return await push(
         completion.journey_id,
         "journey",
-        journey_text(completion.outcome, summary),
+        journey_text(
+            completion.outcome,
+            summary,
+            order_id=journey.order_id,
+            event_id=journey.event_id,
+            journey_id=completion.journey_id,
+            started=human_time(journey.first_ts),
+            ended=human_time(journey.last_ts),
+        ),
         {
             "outcome": completion.outcome,
             "status": completion.status.value,

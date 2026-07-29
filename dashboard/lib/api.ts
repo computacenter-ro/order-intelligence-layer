@@ -1,4 +1,8 @@
 import type {
+  ChatFeedbackRequest,
+  ChatFeedbackResponse,
+  ChatRequest,
+  ChatResponse,
   Department,
   Incident,
   IncidentDetail,
@@ -81,6 +85,10 @@ export interface AlertsFilter {
   severity?: string[];
   source?: string;
   level?: string;
+  // Free-text substring match over message OR explanation, case-insensitive
+  // server-side. Blank/whitespace-only is treated as absent by the backend, but
+  // callers should omit it rather than send "" so the URL stays clean.
+  search?: string;
   resolved?: boolean;
   // Semantic-cache provenance; orthogonal to `source` (cached alerts are all
   // source="ai"). Omitted = both.
@@ -123,6 +131,7 @@ function alertFilterParams(filter: AlertsFilter): URLSearchParams {
   (filter.severity ?? []).forEach((v) => params.append("severity", v));
   if (filter.source) params.set("source", filter.source);
   if (filter.level) params.set("level", filter.level);
+  if (filter.search) params.set("search", filter.search);
   if (filter.resolved !== undefined) params.set("resolved", String(filter.resolved));
   if (filter.cached !== undefined) params.set("cached", String(filter.cached));
   return params;
@@ -218,4 +227,56 @@ export async function resolveIncident(incidentId: string): Promise<Incident> {
 /** Aggregate counters for the Insights page (backend GET /stats/insights). */
 export function fetchStats(): Promise<OverviewStats> {
   return getJson<OverviewStats>("/stats/insights");
+}
+
+// --- chat --------------------------------------------------------------------
+
+/**
+ * POST a question to the backend's authenticated chat proxy.
+ *
+ * `getJson` is GET-only, so this mirrors its contract for a body-carrying call:
+ * same `credentials: "include"` (the httpOnly session cookie must ride along
+ * cross-origin :3000 -> :8000) and the same `UnauthorizedError` on 401, so the
+ * caller handles an expired session exactly as every other API call does.
+ *
+ * Non-streaming by design for now: one request, one answer. The backend already
+ * degrades internally (an LLM outage returns `mode: "retrieval-only"` rather
+ * than an error), so a rejected promise here means a transport/auth failure —
+ * not "the assistant had nothing to say".
+ */
+export async function sendChat(body: ChatRequest): Promise<ChatResponse> {
+  const res = await fetch(`${API_URL}/chat`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`/chat failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<ChatResponse>;
+}
+
+/**
+ * Rate an assistant answer (thumbs up/down).
+ *
+ * Fire-and-forget from the UI's point of view: the panel updates optimistically
+ * and a failure here must not undo what the agent clicked or throw an error at
+ * them — the vote is a nicety, not the work. Returns null on any failure so the
+ * caller can decide whether to surface it.
+ */
+export async function sendChatFeedback(
+  body: ChatFeedbackRequest
+): Promise<ChatFeedbackResponse | null> {
+  try {
+    const res = await fetch(`${API_URL}/chat/feedback`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as ChatFeedbackResponse;
+  } catch {
+    return null;
+  }
 }

@@ -8,6 +8,8 @@ import { usePagination } from "@/lib/usePagination";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { IncidentCard } from "@/components/incidents/IncidentCard";
 import { NewIncidentsBanner } from "@/components/incidents/NewIncidentsBanner";
+import { EmptyState } from "@/components/ui/EmptyState";
+import type { Incident, IncidentStatus, WsEvent } from "@/lib/types";
 import { FilterDropdown } from "@/components/alerts/FilterDropdown";
 import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
 import type { FilterOption } from "@/components/alerts/FilterDropdown";
@@ -164,9 +166,15 @@ export default function IncidentsPage() {
         />
       </div>
       <NewIncidentsBanner count={pending.length} onReveal={handleReveal} />
-      {items.length === 0 && !loading && (
-        <p style={{ color: "var(--cc-grey-three)" }}>No incidents match this filter</p>
-      )}
+      {items.length === 0 && !loading &&
+        (status === "open" ? (
+          <EmptyState
+            title="No open incidents"
+            hint="Correlated alert bursts group here as they happen."
+          />
+        ) : (
+          <EmptyState title="No incidents match this filter" />
+        ))}
       {items.map((incident) => (
         <IncidentCard key={incident.incident_id} incident={incident} onResolve={handleResolve} />
       ))}

@@ -13,12 +13,14 @@ interface AlertCardProps {
   onOpen: (alert: ProcessedAlert) => void;
   onResolve: (alert: ProcessedAlert) => void;
   isSelected?: boolean;
+  /** Active search term, highlighted in the explanation. Omitted = no highlight. */
+  search?: string;
 }
 
 const FALLBACK_EXPLANATION =
   "Unprocessed — LLM unavailable. Raw log passed straight through; no explanation or routing.";
 
-export function AlertCard({ alert, onOpen, onResolve, isSelected = false }: AlertCardProps) {
+export function AlertCard({ alert, onOpen, onResolve, isSelected = false, search }: AlertCardProps) {
   const isFallback = alert.source === "fallback";
 
   const accentColor = isFallback
@@ -74,7 +76,7 @@ export function AlertCard({ alert, onOpen, onResolve, isSelected = false }: Aler
             margin: "0 0 12px",
           }}
         >
-          {alert.explanation ? renderInlineMarkdown(alert.explanation) : FALLBACK_EXPLANATION}
+          {alert.explanation ? renderInlineMarkdown(alert.explanation, search) : FALLBACK_EXPLANATION}
         </p>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           {alert.source === "ai" ? (

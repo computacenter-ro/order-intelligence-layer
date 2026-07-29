@@ -9,10 +9,12 @@ import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
 import {
   AlertFilterBar,
   DEFAULT_ALERT_FILTERS,
+  hasActiveFilters,
   sanitizeAlertFilters,
   toAlertsQuery,
   type AlertFilters,
 } from "@/components/alerts/AlertFilterBar";
+import { EmptyState } from "@/components/ui/EmptyState";
 import type { ProcessedAlert } from "@/lib/types";
 
 // Separate from the feed's "oil.alertFilters" so History and Feed remember their
@@ -33,8 +35,12 @@ export default function HistoryPage() {
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
+      // search is forced back to "" rather than restored: the dropdown selections
+      // are a standing preference ("I work on backend criticals"), but a search
+      // term is a one-off lookup. Reopening the tab to a pre-filtered list with an
+      // empty-looking cause is the confusing case this avoids.
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      if (raw) setFilters(sanitizeAlertFilters(JSON.parse(raw)));
+      if (raw) setFilters({ ...sanitizeAlertFilters(JSON.parse(raw)), search: "" });
     } catch {
       // corrupt/absent storage — fall back to the defaults already in state
     }
@@ -120,9 +126,15 @@ export default function HistoryPage() {
       </p>
       <AlertFilterBar value={filters} onChange={setFilters} facets={facets} />
       <div>
-        {items.length === 0 && !loading && (
-          <p style={{ color: "var(--cc-grey-three)" }}>No resolved alerts yet.</p>
-        )}
+        {items.length === 0 && !loading &&
+          (hasActiveFilters(filters) ? (
+            <EmptyState title="No resolved alerts match your filters" />
+          ) : (
+            <EmptyState
+              title="No resolved alerts yet"
+              hint="Resolve an alert from the feed and it'll land here."
+            />
+          ))}
         {items.map((alert) => (
           <AlertCard
             key={alert.alert_id}
@@ -130,6 +142,7 @@ export default function HistoryPage() {
             onOpen={setSelected}
             onResolve={handleResolve}
             isSelected={selected?.alert_id === alert.alert_id}
+            search={filters.search.trim()}
           />
         ))}
       </div>
@@ -140,7 +153,11 @@ export default function HistoryPage() {
           </Button>
         </div>
       )}
-      <AlertDetailDrawer alert={selected} onClose={() => setSelected(null)} />
+      <AlertDetailDrawer
+        alert={selected}
+        onClose={() => setSelected(null)}
+        search={filters.search.trim()}
+      />
     </div>
   );
 }

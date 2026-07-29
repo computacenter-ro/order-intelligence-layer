@@ -349,7 +349,7 @@ def _backend_client(monkeypatch, *, reply=None, capture=None):
 
     app.dependency_overrides[get_session] = _session_override
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         if capture is not None:
             capture.append({"query": query, "k": k, "filters": filters})
         return reply or {
@@ -381,11 +381,25 @@ class _FakeSession:
 
 
 class _FakeResult:
-    def __init__(self, one):
+    """Serves both access shapes the chat route uses.
+
+    ``_context_text`` calls ``scalar_one_or_none()`` for the record, then
+    ``scalars().all()`` for a journey's events — so a single fake must answer both
+    or the second query raises AttributeError.
+    """
+
+    def __init__(self, one, items=None):
         self._one = one
+        self._items = items or []
 
     def scalar_one_or_none(self):
         return self._one
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self._items
 
 
 def test_backend_chat_requires_auth():
@@ -468,6 +482,73 @@ def test_backend_chat_passes_through_retrieval_only_mode(monkeypatch):
 
 
 # --- the context ("ask about this record") path ------------------------------
+# --- scoped-context event selection (pure) -----------------------------------
+class _Ev:
+    """A minimal JourneyEvent stand-in (only .raw and .ts are read)."""
+
+    def __init__(self, level: str, message: str, ts: str = "2026-07-27T08:00:00Z"):
+        self.raw = {"level": level, "message": message, "app_name": "cc-x", "timestamp": ts}
+        self.ts = None
+
+
+def test_select_context_events_keeps_warn_error_plus_first_and_last():
+    """The summary alone could not answer "what came next?" or "how many retries?",
+    but the full DEBUG trace would bury those answers in a large prompt. Keep the
+    lines where a failure narrative actually lives."""
+    from backend.api import select_context_events
+
+    events = [
+        _Ev("INFO", "received"),          # first — kept for "where did it start"
+        _Ev("DEBUG", "noise 1"),
+        _Ev("WARN", "retrying"),          # kept
+        _Ev("DEBUG", "noise 2"),
+        _Ev("ERROR", "failed"),           # kept
+        _Ev("INFO", "moved to dlq"),     # last — kept for "how did it end"
+    ]
+    kept = [e.raw["message"] for e in select_context_events(events)]
+    assert kept == ["received", "retrying", "failed", "moved to dlq"]
+    assert "noise 1" not in kept and "noise 2" not in kept
+
+
+def test_select_context_events_is_empty_for_no_events():
+    from backend.api import select_context_events
+
+    assert select_context_events([]) == []
+
+
+def test_select_context_events_caps_the_total():
+    """A journey can carry 40+ events; an uncapped context would make every scoped
+    question a large, slow prompt."""
+    from backend.api import _CONTEXT_EVENT_CAP, select_context_events
+
+    events = [_Ev("ERROR", f"boom {i}") for i in range(_CONTEXT_EVENT_CAP * 2)]
+    kept = select_context_events(events)
+    assert len(kept) <= _CONTEXT_EVENT_CAP
+    # Head and tail survive: losing the terminal line would cost more than a
+    # truncated middle.
+    assert kept[0].raw["message"] == "boom 0"
+    assert kept[-1].raw["message"] == f"boom {_CONTEXT_EVENT_CAP * 2 - 1}"
+
+
+def test_format_context_events_renders_in_the_requested_timezone():
+    """The scoped context is per-request, so it CAN be localised — unlike indexed
+    text, which is shared by every viewer and stays UTC."""
+    from backend.api import format_context_events
+
+    ev = _Ev("ERROR", "failed", ts="2026-07-27T16:26:19+00:00")
+    assert "16:26:19 UTC" in format_context_events([ev])
+    assert "19:26:19 EEST" in format_context_events([ev], "Europe/Bucharest")
+
+
+def test_format_context_events_one_line_each():
+    from backend.api import format_context_events
+
+    out = format_context_events([_Ev("ERROR", "failed"), _Ev("WARN", "retrying")])
+    assert out.count("\n") == 1
+    assert "failed" in out and "retrying" in out
+    assert "ERROR" in out and "cc-x" in out
+
+
 def test_build_scoped_query_prepends_context():
     out = api_backend_build("why did this fail", "Journey FAILED: SAP was unreachable.")
     assert "Journey FAILED: SAP was unreachable." in out
@@ -504,7 +585,7 @@ def test_backend_chat_context_fetches_and_prepends_the_record(monkeypatch):
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -519,6 +600,61 @@ def test_backend_chat_context_fetches_and_prepends_the_record(monkeypatch):
         forwarded = seen[0]["query"]
         assert "SAP was unreachable after 3 retries." in forwarded
         assert "why did it fail" in forwarded
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_backend_chat_journey_context_includes_log_lines(monkeypatch):
+    """The point of the richer context: the forwarded question must carry the
+    journey's WARN/ERROR log lines, not just its 2-4 sentence summary."""
+    from backend.auth import get_current_user
+    from backend.db import Journey, get_session
+    from backend.main import app
+
+    journey = Journey(
+        journey_id="J1", status="FAILED", outcome="SAP_SUBMISSION_FAILED",
+        order_id="ORD-9", summary="SAP was unreachable.",
+    )
+
+    class _Session:
+        """First execute() returns the journey, the second returns its events."""
+
+        def __init__(self):
+            self._calls = 0
+
+        async def execute(self, stmt):
+            self._calls += 1
+            if self._calls == 1:
+                return _FakeResult(journey)
+            return _FakeResult(None, [_Ev("ERROR", "RFC_COMMUNICATION_FAILURE")])
+
+        async def commit(self):
+            pass
+
+    app.dependency_overrides[get_current_user] = lambda: "test-user"
+
+    async def _session_override():
+        yield _Session()
+
+    app.dependency_overrides[get_session] = _session_override
+
+    seen: list[str] = []
+
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+        seen.append(query)
+        return {"answer": "a", "sources": [], "mode": "ai"}
+
+    monkeypatch.setattr("backend.rag_client.ask", _fake_ask)
+    try:
+        resp = TestClient(app).post(
+            "/chat",
+            json={"query": "how many retries", "context": {"kind": "journey", "id": "J1"}},
+        )
+        assert resp.status_code == 200
+        forwarded = seen[0]
+        assert "SAP was unreachable." in forwarded          # the summary
+        assert "RFC_COMMUNICATION_FAILURE" in forwarded     # ...AND the log line
+        assert "order_id=ORD-9" in forwarded                # ...AND the ids
     finally:
         app.dependency_overrides.clear()
 
@@ -538,7 +674,7 @@ def test_backend_chat_missing_context_record_degrades_to_the_bare_question(monke
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "retrieval-only"}
 

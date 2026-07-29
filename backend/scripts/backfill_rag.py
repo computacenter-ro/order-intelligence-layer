@@ -35,6 +35,7 @@ from backend.rag_client import (
     AI_SERVICE_URL,
     RAG_INDEX_TIMEOUT,
     alert_text,
+    human_time,
     journey_text,
     push,
 )
@@ -52,7 +53,21 @@ async def _backfill_alerts(session, client: httpx.AsyncClient) -> tuple[int, int
         ok = await push(
             row.alert_id,
             "alert",
-            alert_text(row.app_name, row.level, row.logger, row.message, row.explanation),
+            alert_text(
+                row.app_name,
+                row.level,
+                row.logger,
+                row.message,
+                row.explanation,
+                order_id=row.order_id,
+                event_id=row.event_id,
+                # The backfill has this where the live push does not: an alert is
+                # indexed at persist time, when its journey may not be assembled
+                # yet. Re-running the backfill therefore ENRICHES older records —
+                # another reason the upsert-by-id idempotency matters.
+                journey_id=row.journey_id,
+                ts=human_time(row.emitted_at),
+            ),
             {
                 "department": row.department,
                 "severity": row.severity,
@@ -86,7 +101,15 @@ async def _backfill_journeys(session, client: httpx.AsyncClient) -> tuple[int, i
         ok = await push(
             row.journey_id,
             "journey",
-            journey_text(row.outcome or row.status, row.summary),
+            journey_text(
+                row.outcome or row.status,
+                row.summary,
+                order_id=row.order_id,
+                event_id=row.event_id,
+                journey_id=row.journey_id,
+                started=human_time(row.first_ts),
+                ended=human_time(row.last_ts),
+            ),
             {
                 "outcome": row.outcome or row.status,
                 "status": row.status,

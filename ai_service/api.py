@@ -74,6 +74,11 @@ class ChatRequest(BaseModel):
     query: str
     k: int = 5
     filters: dict | None = None
+    # Per-record feedback scores in (0,1), supplied by the CALLER. The backend owns
+    # the votes (they are user data, in Postgres); this service owns the index and
+    # must stay DB-free, so the counts arrive with the request. Absent/empty means
+    # rank on relevance alone.
+    boosts: dict[str, float] = {}
 
 
 class ChatSource(BaseModel):
@@ -263,7 +268,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
     of the system-wide "useful with the LLM completely down" guarantee: an
     outage costs you the narrative, never the search.
     """
-    results = ragindex.retrieve(req.query, k=req.k, filters=req.filters)
+    results = ragindex.retrieve(
+        req.query, k=req.k, filters=req.filters, boosts=req.boosts
+    )
     sources = [
         ChatSource(
             id=r["id"],

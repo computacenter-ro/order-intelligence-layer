@@ -10,6 +10,7 @@ import {
   ChartBarIcon,
   ChatCircleDotsIcon,
   ClockCounterClockwiseIcon,
+  GaugeIcon,
   MapTrifoldIcon,
   SignOutIcon,
   TreeStructureIcon,
@@ -89,6 +90,12 @@ function AppShellInner({ children }: AppShellProps) {
       href: "/insights",
       icon: <ChartBarIcon size={20} />,
       active: pathname === "/insights",
+    },
+    {
+      label: "AI Performance",
+      href: "/ai-performance",
+      icon: <GaugeIcon size={20} />,
+      active: pathname === "/ai-performance",
     },
     {
       label: "Assistant",

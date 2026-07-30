@@ -23,6 +23,7 @@ from langchain_core.messages import AIMessage
 from ai_service import settings
 from ai_service.breaker import CLOSED, HALF_OPEN, OPEN, CircuitBreaker
 from ai_service.graph import PipelineDeps, process
+from ai_service import llm
 from ai_service.llm import LLMError
 from ai_service.nodes import route
 from ai_service.publisher import Publisher
@@ -1125,3 +1126,93 @@ def test_summary_request_contract_shape():
     req = api.SummaryRequest(**_summary_request())
     assert req.journey_id and req.outcome
     assert isinstance(req.logs[0], LogLine)  # logs deserialize to the model
+
+
+# --- llm.py: per-model LangSmith tags ----------------------------------------
+#
+# Each factory tags its model with the logical role it plays so runs land in
+# LangSmith already labelled, instead of as N indistinguishable calls to the same
+# Azure endpoint. Asserted here because nothing downstream can see the tags —
+# nodes.py only ever awaits `.ainvoke()`.
+
+
+@pytest.fixture
+def _llm_configured(monkeypatch):
+    """Point llm.py at a fake Azure endpoint so _build() actually constructs.
+
+    The provider model builds offline (no network call at construction), so this
+    exercises the real code path without creds or a request.
+    """
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "https://fake.invalid/openai/v1")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "fake-key")
+    for name in (
+        "AZURE_DEPLOYMENT_EXPLAINER",
+        "AZURE_DEPLOYMENT_ROUTER",
+        "AZURE_DEPLOYMENT_SUMMARY",
+        "AZURE_DEPLOYMENT_CHAT",
+    ):
+        monkeypatch.setattr(settings, name, "fake-deployment")
+
+
+def test_explainer_model_is_tagged_explainer(_llm_configured):
+    model = llm.explainer_model()
+    assert model is not None
+    # with_config stores tags on the RunnableBinding's `config` dict — there is no
+    # `.tags` attribute in langchain-core 1.x, so read it the way the API exposes it.
+    assert "explainer" in model.config.get("tags", [])
+
+
+@pytest.mark.parametrize(
+    "factory, tag",
+    [
+        ("explainer_model", "explainer"),
+        ("router_model", "router"),
+        ("summary_model", "summary"),
+        ("chat_model", "chat"),
+    ],
+)
+def test_every_factory_tags_its_logical_role(_llm_configured, factory, tag):
+    model = getattr(llm, factory)()
+    assert model is not None
+    assert model.config.get("tags") == [tag]
+
+
+def test_tagged_model_still_supports_ainvoke(_llm_configured):
+    """The contract nodes.py depends on: a Runnable you can await, whose result
+    carries `.content`. with_config wraps the model in a RunnableBinding, so this
+    pins that the wrapper stays duck-type compatible."""
+    model = llm.explainer_model()
+    assert hasattr(model, "ainvoke")
+
+
+def test_chat_falls_back_to_summary_deployment_but_keeps_the_chat_tag(monkeypatch):
+    """The tag names the JOB, not the deployment — which is the whole point when
+    chat and summary share one deployment."""
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "https://fake.invalid/openai/v1")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "fake-key")
+    monkeypatch.setattr(settings, "AZURE_DEPLOYMENT_CHAT", "")
+    monkeypatch.setattr(settings, "AZURE_DEPLOYMENT_SUMMARY", "summary-deployment")
+
+    model = llm.chat_model()
+    assert model is not None
+    assert model.config.get("tags") == ["chat"]
+
+
+def test_factories_still_return_none_without_creds(monkeypatch):
+    """Tagging must not disturb the creds-free path — None means "take the
+    fallback", and every factory has to keep saying it."""
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "")
+    assert llm.explainer_model() is None
+    assert llm.router_model() is None
+    assert llm.summary_model() is None
+    assert llm.chat_model() is None
+
+
+def test_build_without_tags_returns_the_bare_model(_llm_configured):
+    """`with_config(tags=None)` is a pydantic ValidationError, so an untagged
+    build must not go through it. Guards the optional-parameter default."""
+    model = llm._build("fake-deployment")
+    assert model is not None
+    assert not hasattr(model, "config")  # not wrapped in a RunnableBinding
+    assert hasattr(model, "ainvoke")

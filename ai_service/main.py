@@ -17,11 +17,12 @@ will be served on :8100 alongside this loop.)
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 import redis.asyncio as aioredis
 import uvicorn
 
-from ai_service import api, llm, ragindex, semcache, settings
+from ai_service import api, langsmith_stats, llm, ragindex, semcache, settings
 from ai_service.breaker import CircuitBreaker
 from ai_service.graph import PipelineDeps
 from ai_service.poller import Poller
@@ -82,6 +83,14 @@ async def _run() -> None:
     )
     await ragindex.restore()
 
+    # LangSmith stats: same posture as the semantic cache — share the existing
+    # Redis for a rebuildable snapshot, restore it before the first cycle so a
+    # restart doesn't leave the AI-performance page blank. GET /llm-stats only ever
+    # reads that snapshot; the refresher task below is the only thing in the
+    # process that talks to LangSmith.
+    langsmith_stats.configure(redis_client)
+    await langsmith_stats.restore()
+
     poller = Poller(redis=redis_client, publisher=publisher, pipeline_deps=deps)
 
     # The summary API shares the same breaker + Redis; its model is the stronger
@@ -112,10 +121,19 @@ async def _run() -> None:
         f"retrieval index: {rag_mode}",
         flush=True,
     )
+    # An explicit task rather than a bare coroutine in the gather, so the finally
+    # below can stop it BEFORE the Redis client it persists through is closed.
+    refresher = asyncio.create_task(langsmith_stats.run_refresher())
     try:
-        # Poller loop + summary API on one event loop.
-        await asyncio.gather(poller.run(), server.serve())
+        # Poller loop + summary API + llm-stats refresher on one event loop.
+        await asyncio.gather(poller.run(), server.serve(), refresher)
     finally:
+        # Cancelled first, and awaited so the cancellation has actually landed:
+        # an in-flight persist() against an already-closed Redis client would log
+        # a confusing error on every shutdown.
+        refresher.cancel()
+        with suppress(asyncio.CancelledError):
+            await refresher
         await poller.aclose()
         await publisher.close()
         await redis_client.aclose()

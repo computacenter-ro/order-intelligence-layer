@@ -48,6 +48,10 @@ Endpoints:
   ``/chat`` and decorates each cited source with a dashboard link. An optional
   ``context: {kind, id}`` anchors the question to one ``alert`` / ``journey`` /
   ``incident``, whose text is read from Postgres and prepended to the query.
+  ``/chat`` and decorates each cited source with a dashboard link.
+* ``GET /llm-stats`` — the same authenticated front door for the AI service's
+  per-model LangSmith stats. Forwards to its ``/llm-stats`` and degrades to an
+  all-nulls body when that service is down, so the panel never 502s.
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ from backend.feedback import boosts_from
 from backend.pagination import apply_keyset, build_page
 # human_time lives in rag_client (the lower-level, shared module) so the indexer,
 # the backfill script and this route all format LLM-facing timestamps identically.
+from backend.llm_stats_client import fetch_llm_stats
 from backend.rag_client import human_time
 from backend import stats
 from backend.schemas import (
@@ -1062,6 +1067,21 @@ async def chat_feedback(
     return ChatFeedbackResponse(recorded=True, liked=body.liked)
 
 
+@router.get("/llm-stats")
+async def llm_stats(window: str = "24h") -> dict:
+    """Per-logical-model LLM stats, forwarded from the AI service. Read-only.
+
+    Guarded by the router-level ``get_current_user`` like every other route here,
+    so :8100 stays unreachable from the browser. ``window`` is passed through
+    untouched — the AI service owns which values it understands and treats an
+    unknown one as its default, so there is nothing to validate twice.
+
+    Never 5xx: an unreachable AI service yields the same all-nulls body it would
+    return with LangSmith unconfigured (see ``llm_stats_client.degraded``).
+    """
+    return await fetch_llm_stats(window)
+
+
 @router.get("/stats/insights", response_model=OverviewStats)
 async def get_overview_stats(
     session: AsyncSession = Depends(get_session),
@@ -1081,10 +1101,17 @@ async def get_overview_stats(
 
     alert_total = (await session.execute(stats.alert_total())).scalar_one()
     resolution = (await session.execute(stats.alerts_resolution_counts())).all()
+    cache = (await session.execute(stats.alerts_cache_counts())).all()
     by_department = (await session.execute(stats.alerts_by("department"))).all()
     by_severity = (await session.execute(stats.alerts_by("severity"))).all()
     by_level = (await session.execute(stats.alerts_by("level"))).all()
     by_source = (await session.execute(stats.alerts_by("source"))).all()
+
+    incident_total = (await session.execute(stats.incident_total())).scalar_one()
+    incidents_by_status = (await session.execute(stats.incidents_by_status())).all()
+    alerts_clustered = (
+        await session.execute(stats.alerts_clustered_count())
+    ).scalar_one()
 
     return stats.assemble_overview(
         journeys_by_status=by_status,
@@ -1096,5 +1123,9 @@ async def get_overview_stats(
         alerts_by_level=by_level,
         alerts_by_source=by_source,
         alerts_resolution=resolution,
+        alerts_cache=cache,
         alert_total=alert_total,
+        incidents_by_status=incidents_by_status,
+        incident_total=incident_total,
+        alerts_clustered=alerts_clustered,
     )

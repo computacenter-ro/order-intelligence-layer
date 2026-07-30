@@ -290,15 +290,42 @@ class JourneyStats(BaseModel):
 
 
 class AlertStats(BaseModel):
-    """Alert-side counters. ``open`` + ``resolved`` == ``total``."""
+    """Alert-side counters. ``open`` + ``resolved`` == ``total``, and so does
+    ``cached`` + ``fresh`` (the column is NOT NULL, so there is no third bucket).
+
+    ``cached`` counts alerts the semantic cache answered without calling the LLM.
+    It is a *modifier* on ``source="ai"``, never on a fallback — so it is always a
+    subset of ``by_source["ai"]`` and must not be read as a peer of it.
+    """
 
     total: int
     open: int
     resolved: int
+    cached: int
+    fresh: int
     by_department: dict[str, int]
     by_severity: dict[str, int]
     by_level: dict[str, int]
     by_source: dict[str, int]
+
+
+class IncidentStats(BaseModel):
+    """Incident-side counters — how much alert noise clustering absorbed.
+
+    ``alerts_clustered`` + ``alerts_unclustered`` == ``AlertStats.total``. The
+    split is load-bearing, not decorative: only FAILED / TIMED_OUT journeys are
+    clustered, so alerts belonging to successful orders never get an
+    ``incident_id`` and must not be counted into the compression ratio.
+
+    ``alerts_per_incident`` is ``alerts_clustered / total`` and is **null** when
+    no incident exists yet — "nothing to compress" rather than "no compression".
+    """
+
+    total: int
+    by_status: dict[str, int]
+    alerts_clustered: int
+    alerts_unclustered: int
+    alerts_per_incident: float | None
 
 
 class OverviewStats(BaseModel):
@@ -306,3 +333,4 @@ class OverviewStats(BaseModel):
 
     journeys: JourneyStats
     alerts: AlertStats
+    incidents: IncidentStats

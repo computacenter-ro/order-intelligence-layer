@@ -6,9 +6,9 @@ Three layers, no database and no broker:
   as ``build_alerts_query`` in test_api.py); they must group by the right column
   of the right table and execute nothing.
 * :func:`~backend.stats.assemble_overview` — pure, fed hand-written
-  ``(value, count)`` rows: counters, the success rate (including the zero
-  denominator), the explicit null buckets, and the "buckets sum to the total"
-  invariant.
+  ``(value, count)`` rows: counters, the success rate and the alerts-per-incident
+  ratio (both including the zero denominator), the explicit null buckets, and the
+  "buckets sum to the total" invariant.
 * the route — driven through ``dependency_overrides`` with a fake session that
   returns seeded group-by rows in execution order, asserting the response is a
   well-formed ``OverviewStats``.
@@ -70,6 +70,20 @@ def test_alerts_resolution_counts_groups_by_is_resolved():
     assert "GROUP BY alerts.is_resolved" in sql
 
 
+def test_alerts_cache_counts_groups_by_cached():
+    sql = _compiled(stats.alerts_cache_counts())
+    assert "FROM alerts" in sql
+    assert "GROUP BY alerts.cached" in sql
+
+
+def test_cached_is_not_exposed_to_the_generic_grouper():
+    """``cached`` is a bool and alerts_by() stringifies its group values, which
+    would leak the Python-capitalised keys "True"/"False" into the public JSON.
+    It gets its own builder + named scalars instead."""
+    with pytest.raises(KeyError):
+        stats.alerts_by("cached")
+
+
 def test_journey_totals_counts_and_averages_terminal_durations():
     stmt = stats.journey_totals()
     sql = _compiled(stmt)
@@ -97,6 +111,32 @@ def test_alert_total_counts_alerts():
     assert "GROUP BY" not in sql
 
 
+def test_incidents_by_status_groups_by_status():
+    sql = _compiled(stats.incidents_by_status())
+    assert "count(*)" in sql
+    assert "FROM incidents" in sql
+    assert "GROUP BY incidents.status" in sql
+
+
+def test_incident_total_counts_incidents():
+    sql = _compiled(stats.incident_total())
+    assert "count(*)" in sql
+    assert "FROM incidents" in sql
+    assert "GROUP BY" not in sql
+
+
+def test_alerts_clustered_count_counts_alerts_with_an_incident():
+    """Counted from the alerts side (the indexed FK), not by summing the
+    denormalized incidents.alert_count — that column is bumped once at
+    clustering time and never learns about later-arriving alerts."""
+    sql = _compiled(stats.alerts_clustered_count())
+    assert "count(*)" in sql
+    assert "FROM alerts" in sql
+    assert "alerts.incident_id IS NOT NULL" in sql
+    assert "incidents" not in sql
+    assert "GROUP BY" not in sql
+
+
 # --- assembler (pure; fed hand-written group-by rows) -----------------------
 
 
@@ -111,7 +151,11 @@ def _assemble(**over) -> OverviewStats:
         alerts_by_level=[("ERROR", 2), ("WARN", 1)],
         alerts_by_source=[("ai", 2), ("fallback", 1)],
         alerts_resolution=[(True, 1), (False, 2)],
+        alerts_cache=[(True, 1), (False, 2)],
         alert_total=3,
+        incidents_by_status=[("open", 1), ("resolved", 1)],
+        incident_total=2,
+        alerts_clustered=2,
     )
     base.update(over)
     return stats.assemble_overview(**base)
@@ -168,11 +212,18 @@ def test_assemble_overview_success_rate_is_zero_on_a_completely_empty_db():
         alerts_by_level=[],
         alerts_by_source=[],
         alerts_resolution=[],
+        alerts_cache=[],
         alert_total=0,
+        incidents_by_status=[],
+        incident_total=0,
+        alerts_clustered=0,
     )
     assert out.journeys.success_rate == 0.0
     assert out.journeys.by_status == {}
     assert out.alerts.open == 0 and out.alerts.resolved == 0
+    assert out.alerts.cached == 0 and out.alerts.fresh == 0
+    assert out.incidents.total == 0
+    assert out.incidents.alerts_per_incident is None
 
 
 def test_assemble_overview_buckets_null_department_and_severity():
@@ -206,6 +257,7 @@ def test_assemble_overview_buckets_sum_to_their_totals():
         alerts_by_level=[("ERROR", 2), ("WARN", 1)],
         alerts_by_source=[("ai", 2), ("fallback", 1)],
         alerts_resolution=[(True, 1), (False, 2)],
+        alerts_cache=[(True, 2), (False, 1)],
         alert_total=3,
     )
     assert sum(out.journeys.by_status.values()) == out.journeys.total
@@ -218,6 +270,14 @@ def test_assemble_overview_buckets_sum_to_their_totals():
     ):
         assert sum(bucket.values()) == out.alerts.total
     assert out.alerts.open + out.alerts.resolved == out.alerts.total
+    assert out.alerts.cached + out.alerts.fresh == out.alerts.total
+    # Same invariant on the incident split: an alert is either clustered or not,
+    # and neither side may be silently dropped.
+    assert (
+        out.incidents.alerts_clustered + out.incidents.alerts_unclustered
+        == out.alerts.total
+    )
+    assert sum(out.incidents.by_status.values()) == out.incidents.total
 
 
 def test_assemble_overview_splits_open_and_resolved():
@@ -231,11 +291,83 @@ def test_assemble_overview_handles_a_single_sided_resolution_group():
     assert (out.alerts.resolved, out.alerts.open) == (0, 3)
 
 
+def test_assemble_overview_splits_cached_and_fresh():
+    out = _assemble(alerts_cache=[(True, 380), (False, 140)], alert_total=520)
+    assert (out.alerts.cached, out.alerts.fresh) == (380, 140)
+
+
+def test_assemble_overview_handles_a_single_sided_cache_group():
+    """A cold cache yields no True row at all — that is 0 cached, not a KeyError."""
+    out = _assemble(alerts_cache=[(False, 3)], alert_total=3)
+    assert (out.alerts.cached, out.alerts.fresh) == (0, 3)
+
+
+def test_assemble_overview_cache_split_needs_no_null_bucket():
+    """``cached`` is NOT NULL on the model, so unlike department/severity the two
+    sides always sum to the total with no third bucket to account for."""
+    out = _assemble(alerts_cache=[(True, 4), (False, 6)], alert_total=10)
+    assert out.alerts.cached + out.alerts.fresh == out.alerts.total
+
+
 def test_assemble_overview_coerces_a_decimal_average_to_float():
     """Postgres ``avg()`` comes back as a Decimal; the wire contract is float."""
     out = _assemble(journey_avg_duration=Decimal("4.250"))
     assert isinstance(out.journeys.avg_duration_seconds, float)
     assert out.journeys.avg_duration_seconds == pytest.approx(4.25)
+
+
+def test_assemble_overview_folds_the_incident_counts():
+    out = _assemble()
+    assert out.incidents.total == 2
+    assert out.incidents.by_status == {"open": 1, "resolved": 1}
+    assert out.incidents.alerts_clustered == 2
+    assert out.incidents.alerts_per_incident == pytest.approx(1.0)
+
+
+def test_assemble_overview_ratio_is_over_clustered_alerts_not_every_alert():
+    """The load-bearing one. Only FAILED/TIMED_OUT journeys are clustered, so a
+    ratio computed from the ALERT TOTAL would inflate the compression claim: here
+    4 of 10 alerts reached 2 incidents, which is 2.0x — not 10/2 = 5.0x."""
+    out = _assemble(alert_total=10, alerts_clustered=4, incident_total=2)
+    assert out.incidents.alerts_per_incident == pytest.approx(2.0)
+    assert out.incidents.alerts_unclustered == 6
+
+
+def test_assemble_overview_ratio_is_none_when_no_incident_exists():
+    """None, not 0.0 — "nothing to compress" is not "compressed nothing"."""
+    out = _assemble(incidents_by_status=[], incident_total=0, alerts_clustered=0)
+    assert out.incidents.alerts_per_incident is None
+    assert out.incidents.total == 0
+    assert out.incidents.alerts_unclustered == out.alerts.total
+
+
+def test_assemble_overview_ratio_is_zero_when_incidents_have_no_alerts():
+    """Distinct from the None case above: incidents exist, none has an alert
+    attached, so the ratio is a real 0.0."""
+    out = _assemble(incident_total=2, alerts_clustered=0)
+    assert out.incidents.alerts_per_incident == 0.0
+
+
+def test_assemble_overview_clamps_a_torn_snapshot():
+    """The clustered count and the alert total are separate statements; under
+    READ COMMITTED an insert between them can leave clustered > total. Clamp to
+    zero rather than publishing a negative count."""
+    out = _assemble(alert_total=3, alerts_clustered=5)
+    assert out.incidents.alerts_unclustered == 0
+
+
+def test_assemble_overview_incident_status_stays_open_ended():
+    """Incident.status is a free string with no enum and no CHECK constraint, so
+    a new status must flow through without a schema change."""
+    out = _assemble(
+        incidents_by_status=[("open", 1), ("acknowledged", 2)], incident_total=3
+    )
+    assert out.incidents.by_status == {"open": 1, "acknowledged": 2}
+
+
+def test_assemble_overview_buckets_null_incident_status():
+    out = _assemble(incidents_by_status=[("open", 1), (None, 1)], incident_total=2)
+    assert out.incidents.by_status == {"open": 1, "unknown": 1}
 
 
 # --- the route ---------------------------------------------------------------
@@ -297,10 +429,14 @@ def _seed(**over):
         by_outcome=[("SUCCESS", 3), ("MARGIN_CHECK_FAILED", 1), (None, 1)],
         alert_total=[(3,)],
         resolution=[(True, 1), (False, 2)],
+        cache=[(True, 1), (False, 2)],
         by_department=[("backend", 2), (None, 1)],
         by_severity=[("critical", 1), (None, 2)],
         by_level=[("ERROR", 2), ("WARN", 1)],
         by_source=[("ai", 2), ("fallback", 1)],
+        incident_total=[(2,)],
+        incidents_by_status=[("open", 1), ("resolved", 1)],
+        alerts_clustered=[(2,)],
     )
     base.update(over)
     return [
@@ -311,10 +447,14 @@ def _seed(**over):
             "by_outcome",
             "alert_total",
             "resolution",
+            "cache",
             "by_department",
             "by_severity",
             "by_level",
             "by_source",
+            "incident_total",
+            "incidents_by_status",
+            "alerts_clustered",
         )
     ]
 
@@ -344,16 +484,22 @@ def test_overview_returns_the_assembled_stats():
     assert parsed.journeys.avg_duration_seconds == pytest.approx(4.5)
     assert parsed.alerts.total == 3
     assert (parsed.alerts.open, parsed.alerts.resolved) == (2, 1)
+    assert (parsed.alerts.cached, parsed.alerts.fresh) == (1, 2)
     assert parsed.alerts.by_department == {"backend": 2, "unassigned": 1}
     assert parsed.alerts.by_severity == {"critical": 1, "unrated": 2}
     assert parsed.alerts.by_level == {"ERROR": 2, "WARN": 1}
     assert parsed.alerts.by_source == {"ai": 2, "fallback": 1}
+    assert parsed.incidents.total == 2
+    assert parsed.incidents.by_status == {"open": 1, "resolved": 1}
+    assert parsed.incidents.alerts_clustered == 2
+    assert parsed.incidents.alerts_unclustered == 1
+    assert parsed.incidents.alerts_per_incident == pytest.approx(1.0)
 
 
 def test_overview_response_keys_are_exactly_the_schema():
     _use(_seed())
     body = TestClient(app).get("/stats/insights").json()
-    assert set(body) == {"journeys", "alerts"}
+    assert set(body) == {"journeys", "alerts", "incidents"}
     assert set(body["journeys"]) == {
         "total",
         "by_status",
@@ -365,29 +511,42 @@ def test_overview_response_keys_are_exactly_the_schema():
         "total",
         "open",
         "resolved",
+        "cached",
+        "fresh",
         "by_department",
         "by_severity",
         "by_level",
         "by_source",
     }
+    assert set(body["incidents"]) == {
+        "total",
+        "by_status",
+        "alerts_clustered",
+        "alerts_unclustered",
+        "alerts_per_incident",
+    }
 
 
 def test_overview_runs_the_stats_builders():
-    """The route executes the builders from backend/stats.py — nine grouped /
+    """The route executes the builders from backend/stats.py — thirteen grouped /
     aggregate statements, no ad-hoc SQL of its own."""
     session = _use(_seed())
     TestClient(app).get("/stats/insights")
     sql = [_compiled(s) for s in session.statements]
-    assert len(sql) == 9
+    assert len(sql) == 13
     assert sql[0] == _compiled(stats.journey_totals())
     assert sql[1] == _compiled(stats.journeys_by_status())
     assert sql[2] == _compiled(stats.journeys_by_outcome())
     assert sql[3] == _compiled(stats.alert_total())
     assert sql[4] == _compiled(stats.alerts_resolution_counts())
-    assert sql[5:] == [
+    assert sql[5] == _compiled(stats.alerts_cache_counts())
+    assert sql[6:10] == [
         _compiled(stats.alerts_by(c))
         for c in ("department", "severity", "level", "source")
     ]
+    assert sql[10] == _compiled(stats.incident_total())
+    assert sql[11] == _compiled(stats.incidents_by_status())
+    assert sql[12] == _compiled(stats.alerts_clustered_count())
 
 
 def test_overview_on_an_empty_database():
@@ -399,10 +558,14 @@ def test_overview_on_an_empty_database():
             by_outcome=[],
             alert_total=[(0,)],
             resolution=[],
+            cache=[],
             by_department=[],
             by_severity=[],
             by_level=[],
             by_source=[],
+            incident_total=[(0,)],
+            incidents_by_status=[],
+            alerts_clustered=[(0,)],
         )
     )
     r = TestClient(app).get("/stats/insights")
@@ -418,3 +581,14 @@ def test_overview_on_an_empty_database():
     assert body["alerts"]["total"] == 0
     assert body["alerts"]["open"] == 0
     assert body["alerts"]["resolved"] == 0
+    assert body["alerts"]["cached"] == 0
+    assert body["alerts"]["fresh"] == 0
+    assert body["incidents"] == {
+        "total": 0,
+        "by_status": {},
+        "alerts_clustered": 0,
+        "alerts_unclustered": 0,
+        # No incident yet: null, so the UI can say "nothing to compress" rather
+        # than rendering a 0.0x ratio that claims clustering failed.
+        "alerts_per_incident": None,
+    }

@@ -18,6 +18,11 @@ tzdata>=2024.1                   # IANA zones for zoneinfo (required on Windows)
 langgraph>=0.2
 langchain-core>=0.3
 langchain-azure-ai>=0.1          # Claude via Azure AI Foundry chat models
+# Tracing/observability. langchain-core already emits traces when LANGSMITH_*
+# env vars are set; this is the client the /llm-stats endpoint queries to read
+# them back (per-node run counts, latency, cost). Optional at runtime — with no
+# creds the endpoint returns nulls (deferred import in langsmith_stats.py).
+langsmith>=0.3
 # Semantic-cache embeddings (sentence-transformers + CPU torch) are heavy and
 # need PyTorch's CPU wheel index, so they live in a separate, fully-pinned file:
 #   pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu

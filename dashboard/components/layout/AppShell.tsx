@@ -12,6 +12,7 @@ import {
   ClockCounterClockwiseIcon,
   MapTrifoldIcon,
   SignOutIcon,
+  TreeStructureIcon,
   WarningIcon,
 } from "@phosphor-icons/react";
 import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
@@ -97,6 +98,14 @@ function AppShellInner({ children }: AppShellProps) {
       // would break the one-active-item-at-a-time rule against the real page
       // underneath it.
       active: false,
+    },
+    // A normal route, unlike the Assistant above it — so it takes a real href
+    // and highlights from the pathname like every other item.
+    {
+      label: "Architecture",
+      href: "/architecture",
+      icon: <TreeStructureIcon size={20} />,
+      active: pathname === "/architecture",
     },
   ];
 

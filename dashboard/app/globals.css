@@ -122,3 +122,66 @@ body {
   outline: 2px solid var(--cc-foundation-blue);
   outline-offset: 2px;
 }
+
+/* ── Architecture diagram ─────────────────────────────────────────────────── */
+
+/* Zoom/fit controls. Icon-only buttons per the Buttons spec: Horizon Blue tint
+   on hover/press, Foundation Blue focus ring. Classed rather than styled inline
+   because :hover/:focus-visible have no inline equivalent. */
+.oil-zoom-button {
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.oil-zoom-button:hover {
+  background-color: var(--cc-btn-secondary-fill);
+  border-color: var(--cc-horizon-blue);
+}
+
+.oil-zoom-button:active {
+  background-color: var(--cc-btn-secondary-pressed);
+}
+
+.oil-zoom-button:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+}
+
+/* The journey-replay Play/Stop control. A primary button when idle (Heritage
+   Blue fill) and a hollow one while playing, so "stop" never looks like the
+   page's main call to action. */
+.oil-journey-button {
+  transition: background-color 200ms ease, box-shadow 200ms ease;
+}
+
+.oil-journey-button:hover {
+  box-shadow: var(--cc-shadow-md);
+}
+
+.oil-journey-button:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+}
+
+/* Diagram nodes are focusable <g> elements. The default UA focus ring hugs the
+   glyph's bounding box (including the label), so it's replaced by an offset
+   Foundation Blue ring that traces the node the same way the hover halo does. */
+.oil-arch-node {
+  transition: opacity 120ms ease;
+}
+
+.oil-arch-node:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+/* The pan/zoom transform is applied directly, never animated, so there is no
+   zoom easing to disable. What remains are the hover transitions above; reduced
+   motion removes them so hover state changes instantly. */
+@media (prefers-reduced-motion: reduce) {
+  .oil-zoom-button,
+  .oil-journey-button,
+  .oil-arch-node {
+    transition: none;
+  }
+}

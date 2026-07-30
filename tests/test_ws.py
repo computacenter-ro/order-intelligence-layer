@@ -252,7 +252,6 @@ def _alert(source: str = "ai") -> ProcessedAlert:
         log=_log(message="boom", level="ERROR"),
         explanation=None if source == "fallback" else "explained",
         department=None if source == "fallback" else Department.backend,
-        confidence=None if source == "fallback" else 0.7,
         source=source,
     )
 

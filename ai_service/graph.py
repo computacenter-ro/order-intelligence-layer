@@ -10,7 +10,7 @@ Contract (matches ``ProcessedAlert``): ``source="ai"`` means BOTH LLM calls
 succeeded (explanation + a valid department). Anything less — no explainer
 model, explainer failure, breaker open, router failure, or a router answer
 outside the five departments — yields a clean fallback alert with
-``explanation=department=confidence=None``. There are no partial AI alerts.
+``explanation=department=severity=None``. There are no partial AI alerts.
 
 The chat models and the breaker are injected so the graph is exercised in tests
 with a fake model and a fake-redis breaker (no network, no creds).
@@ -44,7 +44,6 @@ class _State(TypedDict, total=False):
     explanation: str | None
     department: Department | None
     severity: Severity | None
-    confidence: float | None
     failed: bool          # set once any LLM step fails / is skipped → fallback
 
 
@@ -64,15 +63,15 @@ def build_pipeline(deps: PipelineDeps):
     async def router_node(state: _State) -> _State:
         # If the explainer already failed, don't route — go straight to fallback.
         if state.get("failed"):
-            return {"department": None, "severity": None, "confidence": None}
+            return {"department": None, "severity": None}
         log, explanation = state["log"], state["explanation"]
         result = await deps.breaker.call(
             lambda: nodes.route(log, explanation, deps.router), fallback=None
         )
         if result is None:
-            return {"failed": True, "department": None, "severity": None, "confidence": None}
-        department, severity, confidence = result
-        return {"department": department, "severity": severity, "confidence": confidence}
+            return {"failed": True, "department": None, "severity": None}
+        department, severity = result
+        return {"department": department, "severity": severity}
 
     graph = StateGraph(_State)
     graph.add_node("explainer", explainer_node)
@@ -192,7 +191,6 @@ def _alert_from_payload(log: LogLine, payload: semcache.CachePayload) -> Process
         explanation=explanation,
         department=department,
         severity=severity,
-        confidence=payload.confidence,
         source="ai",       # a cache hit is still an AI answer (routing unchanged)
         cached=True,
         embedding=embedding,
@@ -215,7 +213,6 @@ async def _maybe_store(log: LogLine, alert: ProcessedAlert) -> None:
         normalized_explanation=semcache.normalize(alert.explanation),
         department=alert.department.value,
         severity=alert.severity.value if alert.severity is not None else None,
-        confidence=alert.confidence,
     )
     deps.cache.store(log.message, payload)
     await semcache.persist()
@@ -233,7 +230,6 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
     explanation = state.get("explanation")
     department = state.get("department")
     severity = state.get("severity")
-    confidence = state.get("confidence")
     is_ai = not state.get("failed") and explanation is not None and department is not None
 
     deps_sc = semcache.get()
@@ -247,7 +243,6 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
             explanation=explanation,
             department=department,
             severity=severity,
-            confidence=confidence,
             source="ai",
             embedding=embedding,
         )
@@ -258,7 +253,6 @@ def _to_alert(log: LogLine, state: _State) -> ProcessedAlert:
         explanation=None,
         department=None,
         severity=None,
-        confidence=None,
         source="fallback",
         embedding=embedding,
     )

@@ -545,12 +545,18 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
 ```
 - **Explainer Node** — LLM call 1: plain-English explanation of the log for an
   IT-support agent (what happened, which service, likely cause).
-- **Router Node** — LLM call 2: pick a `department`, a per-log `severity`
-  (`critical`/`high`/`medium`/`low`), and a `confidence` (0–1), returned as one
-  JSON object. Both the department and the severity are validated against their
-  enums — an out-of-range value is an `LLMError` → fallback, never coerced.
-  Severity is per-log *technical* urgency judged from the log alone (not
+- **Router Node** — LLM call 2: pick a `department` and a per-log `severity`
+  (`critical`/`high`/`medium`/`low`), returned as one JSON object —
+  `{"department": ..., "severity": ...}` and **nothing else**. Both are validated
+  against their enums — an out-of-range value is an `LLMError` → fallback, never
+  coerced. Severity is per-log *technical* urgency judged from the log alone (not
   business impact, not journey-level).
+
+  There is **no `confidence`**. The router used to also return a 0–1 score; it was
+  removed end to end (prompt, parsing, `ProcessedAlert`, the `alerts` column, the
+  API response, the Teams card, and the dashboard). A model that volunteers a
+  `confidence` key anyway is *ignored* rather than rejected — dropping an
+  otherwise-valid route to fallback over an extra key would be a regression.
 
   **Department semantics (`_DEPARTMENT_GUIDE` + `_ROUTE_EXAMPLES` in `nodes.py`).**
   The prompt's ALLOWED list is generated from the `Department` enum, but the
@@ -595,7 +601,6 @@ class ProcessedAlert(BaseModel):
     explanation: str | None             # plain English; None when source="fallback"
     department: Department | None      # None when source="fallback"
     severity: Severity | None           # per-log technical severity; None when source="fallback"
-    confidence: float | None            # 0..1; None when source="fallback"
     source: Literal["ai", "fallback"]
     cached: bool = False                 # True when served from the semantic cache
                                          # (still source="ai"; routing unchanged)
@@ -723,8 +728,7 @@ possibly later than the alert that referenced it.
 ```
 alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
        event_id, order_id, cart_header_id, account_number,
-       explanation, department, severity, confidence, source, cached, journey_id FK NULL)
-       explanation, department, severity, confidence, source, journey_id FK NULL,
+       explanation, department, severity, source, cached, journey_id FK NULL,
        is_resolved, resolved_at NULL)
 journeys(journey_id PK, status, outcome NULL, first_ts, last_ts,
          event_id, order_id, cart_header_id, summary NULL)
@@ -866,9 +870,9 @@ Webhook per department channel + general, Teams channels like `#devops-logs`,
 ... , `#general-logs`:
 `TEAMS_WEBHOOK_NETWORKING`, `_DEVOPS`, `_BACKEND`, `_DATABASE`, `_GENERAL`.
 Card (simple title + fields, easy to adapt between an Incoming Webhook and a
-Power Automate flow): level/outcome, service, explanation (or "unprocessed —
-LLM unavailable" for `source="fallback"`), ids, confidence, `AI` vs `fallback`
-badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
+Power Automate flow): level/outcome, severity, department, service, explanation
+(or "unprocessed — LLM unavailable" for `source="fallback"`), ids, `AI` vs
+`fallback` badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
 `journey_id`/`order_id`. **If a channel's webhook env var is unset, print the
 card to stdout** — never crash on missing config.
 
@@ -885,7 +889,8 @@ failing sink so one never stops the other or the consumers.
 
 Connects to backend WS + REST. Feature contract:
 - Real-time alert feed with plain-English explanations.
-- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**, plus a
+- Department + severity per alert (no confidence score — it was removed end to
+  end); **badge `AI-analyzed` vs `fallback`**, plus a
   **`Cached` badge alongside `AI-analyzed`** when `ProcessedAlert.cached` is set
   (a cache hit is the same AI answer reused — a modifier, never a replacement, so
   the two badges show together). An "Answer" filter (`all` / `cached` / `fresh`)

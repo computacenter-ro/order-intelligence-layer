@@ -28,7 +28,6 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
-    Float,
     ForeignKey,
     Integer,
     SmallInteger,
@@ -133,7 +132,7 @@ class Alert(Base):
     """A processed WARN/ERROR alert (``processed.alerts`` payload persisted).
 
     ``source`` is ``"ai"`` or ``"fallback"``; for fallback pass-throughs
-    ``explanation`` / ``department`` / ``confidence`` are null.
+    ``explanation`` / ``department`` / ``severity`` are null.
     """
 
     __tablename__ = "alerts"
@@ -162,7 +161,6 @@ class Alert(Base):
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     department: Mapped[str | None] = mapped_column(String, nullable=True)
     severity: Mapped[str | None] = mapped_column(String, nullable=True)
-    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=False)
 
     # Semantic-cache provenance: True when the AI service reused a stored answer

@@ -5,7 +5,7 @@ Two idempotent consumers for the AI service's durable output queues:
 * ``processed.alerts`` — one ``ProcessedAlert`` per non-suppressed WARN/ERROR
   (AI-explained or a fallback pass-through). Each is persisted as an ``Alert``
   row (the original ``LogLine`` fields + ``explanation`` / ``department`` /
-  ``confidence`` / ``source``; the enrichment columns are null for
+  ``severity`` / ``source``; the enrichment columns are null for
   ``source="fallback"``).
 * ``raw.events`` — every deduped log line. Each is handed to the
   :class:`~backend.journeys.JourneyAssembler` for incremental journey assembly.
@@ -62,7 +62,7 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
     """Flatten a ``ProcessedAlert`` into the ``alerts`` table's columns.
 
     The full original log line's fields are hoisted onto the row; the AI
-    enrichment columns (``explanation`` / ``department`` / ``confidence``) are
+    enrichment columns (``explanation`` / ``department`` / ``severity``) are
     ``None`` for a fallback pass-through. ``journey_id`` is intentionally left
     unset — an alert may arrive before its journey is assembled from
     ``raw.events`` (CLAUDE.md: the FK is nullable and fills in later).
@@ -83,7 +83,6 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
         "explanation": alert.explanation,
         "department": alert.department.value if alert.department is not None else None,
         "severity": alert.severity.value if alert.severity is not None else None,
-        "confidence": alert.confidence,
         "source": alert.source,
         # Semantic-cache hit: the explanation/department were reused rather than
         # recomputed. Kept distinct from ``source`` on purpose — a hit is still

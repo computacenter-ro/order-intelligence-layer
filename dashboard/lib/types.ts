@@ -37,7 +37,6 @@ export interface ProcessedAlert {
   explanation: string | null;
   department: Department | null;
   severity: Severity | null;
-  confidence: number | null;
   source: "ai" | "fallback";
   // Semantic-cache hit: the AI answer was reused rather than recomputed. A
   // modifier on source="ai", not an alternative — cached alerts are still

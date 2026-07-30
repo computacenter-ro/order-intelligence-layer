@@ -28,7 +28,6 @@ def _alert_event(**over) -> dict:
         "account_number": "81036533",
         "explanation": "SPT pricing service was unreachable",
         "department": "backend",
-        "confidence": 0.82,
         "source": "ai",
         "journey_id": "J1",
     }
@@ -115,7 +114,9 @@ def test_build_card_ai_alert(monkeypatch):
     facts = _facts(card)
     assert facts["Level"] == "ERROR"
     assert facts["Department"] == "backend"
-    assert facts["Confidence"] == "0.82"
+    # The router no longer produces a confidence, so the card never shows one —
+    # not even when an upstream payload still carries the key.
+    assert "Confidence" not in facts
     assert facts["Order"] == "ORD-1"
     assert facts["Event"] == "evt-1"
     assert facts["Cart"] == "C1"
@@ -129,7 +130,7 @@ def test_build_card_ai_alert(monkeypatch):
 def test_build_card_badge_and_text_differ_between_ai_and_fallback():
     ai = build_card(_alert_event(source="ai"))
     fb = build_card(_alert_event(source="fallback", explanation=None,
-                                 department=None, confidence=None))
+                                 department=None))
     # badge differs
     assert "AI-analyzed" in _text_blocks(ai)
     assert "AI-analyzed" not in _text_blocks(fb)
@@ -141,10 +142,18 @@ def test_build_card_badge_and_text_differ_between_ai_and_fallback():
 
 def test_build_card_fallback_alert_uses_placeholder_explanation():
     card = build_card(_alert_event(source="fallback", explanation=None,
-                                   department=None, confidence=None))
+                                   department=None))
     assert "fallback" in _text_blocks(card)
     assert "unprocessed — LLM unavailable" in _text_blocks(card)
-    # no confidence fact when it is null
+    # the card never renders a confidence fact — the field no longer exists
+    assert "Confidence" not in _facts(card)
+
+
+def test_build_card_ignores_a_stale_confidence_in_the_payload():
+    """Defensive: an in-flight event from an older build could still carry a
+    ``confidence`` key. The card must ignore it rather than render a score the
+    system no longer produces."""
+    card = build_card(_alert_event(confidence=0.82))
     assert "Confidence" not in _facts(card)
 
 

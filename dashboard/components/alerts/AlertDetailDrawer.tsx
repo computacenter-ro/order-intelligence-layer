@@ -3,7 +3,6 @@ import Link from "next/link";
 import { ChatCircleDotsIcon, XIcon } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
-import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
 import { useChat } from "@/lib/chat";
 import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
@@ -144,7 +143,6 @@ export function AlertDetailDrawer({ alert, onClose, search }: AlertDetailDrawerP
                 </span>
               )}
               {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
-              {alert.confidence != null && <ConfidenceBar confidence={alert.confidence} />}
             </>
           ) : (
             <Badge status="inactive">Fallback → #general-logs</Badge>

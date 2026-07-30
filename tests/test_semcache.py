@@ -274,7 +274,6 @@ def _payload(expl: str = "Pricing for order <ORD> failed") -> CachePayload:
         normalized_explanation=expl,
         department=Department.backend.value,
         severity=Severity.high.value,
-        confidence=0.8,
     )
 
 
@@ -329,7 +328,7 @@ def test_dump_and_load_roundtrip():
     restored = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
     restored.load(blob)
     hit = restored.lookup("Get order by Order Number:ORD-7777")
-    assert hit is not None and hit.confidence == 0.8
+    assert hit is not None and hit.severity == Severity.high.value
 
 
 def test_load_tolerates_garbage():
@@ -337,6 +336,41 @@ def test_load_tolerates_garbage():
     cache.load("not json")          # no raise
     cache.load(None)                # no raise
     assert len(cache) == 0
+
+
+def test_payload_from_dict_ignores_a_stale_confidence_key():
+    """Upgrade path: the cache is persisted in Redis (``ai:semcache``) and
+    survives restarts, so a dump written before ``confidence`` was removed is
+    still out there. Loading it must ignore the dead key rather than raise —
+    otherwise the cache would fail to load and silently disable itself until
+    someone dropped the Redis key by hand."""
+    payload = CachePayload.from_dict({
+        "explanation": "Pricing for order <ORD> failed",
+        "department": Department.backend.value,
+        "severity": Severity.high.value,
+        "confidence": 0.8,          # written by an older build
+    })
+    assert payload.department == Department.backend.value
+    assert payload.severity == Severity.high.value
+    assert not hasattr(payload, "confidence")
+    # And a round-trip no longer emits it.
+    assert "confidence" not in payload.to_dict()
+
+
+def test_load_accepts_a_dump_containing_a_stale_confidence_key():
+    """The same guarantee through the real load path, not just the dataclass."""
+    import json
+
+    cache = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    cache.store("Get order by Order Number:ORD-6001", _payload())
+    blob = json.loads(cache.dump())
+    for entry in blob:
+        entry["payload"]["confidence"] = 0.8      # simulate an older dump
+
+    restored = SemanticCache(FakeEncoder(), threshold=0.95, max_entries=10)
+    restored.load(json.dumps(blob))               # must not raise
+    hit = restored.lookup("Get order by Order Number:ORD-7777")
+    assert hit is not None and hit.department == Department.backend.value
 
 
 # =============================================================================
@@ -376,7 +410,7 @@ def test_embed_does_not_affect_lookup_or_store():
 async def test_hit_skips_llm(install_cache):
     redis, cache = install_cache()
     explainer = CountingModel("SPT pricing for order ORD-6001 was unreachable.")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     # 1st log: miss → runs the LLM, stores the result.
@@ -396,7 +430,7 @@ async def test_hit_skips_llm(install_cache):
 async def test_hit_refills_current_order_id(install_cache):
     install_cache()
     explainer = CountingModel("SPT pricing for order ORD-6001 was unreachable.")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(_log(message="SPT price list unavailable", order_id="ORD-6001", log_id="L1"), deps)
@@ -412,7 +446,7 @@ async def test_hit_refills_current_order_id(install_cache):
 async def test_different_type_is_a_miss_and_calls_llm(install_cache):
     install_cache()
     explainer = CountingModel("expl for the log")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
@@ -424,7 +458,7 @@ async def test_different_type_is_a_miss_and_calls_llm(install_cache):
 async def test_retry_counter_difference_is_a_miss(install_cache):
     install_cache()
     explainer = CountingModel("expl")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(
@@ -442,7 +476,7 @@ async def test_retry_counter_difference_is_a_miss(install_cache):
 async def test_below_threshold_process_miss(install_cache):
     install_cache(threshold=0.999)  # effectively only exact matches hit
     explainer = CountingModel("expl")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(_log(message="SAP submission failed for the order", log_id="L1"), deps)
@@ -453,7 +487,7 @@ async def test_below_threshold_process_miss(install_cache):
 async def test_hit_miss_counters_increment(install_cache):
     redis, cache = install_cache()
     explainer = CountingModel("expl for order ORD-6001")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(_log(message="SPT price list unavailable", log_id="L1"), deps)  # miss
@@ -486,7 +520,7 @@ def get_deps_from(mod):
 async def test_cache_hit_alert_carries_embedding(install_cache):
     install_cache()
     explainer = CountingModel("SPT pricing for order ORD-6001 was unreachable.")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(_log(message="SPT price list unavailable", order_id="ORD-6001", log_id="L1"), deps)
@@ -501,7 +535,7 @@ async def test_cache_hit_alert_carries_embedding(install_cache):
 async def test_ai_alert_carries_embedding(install_cache):
     install_cache()
     explainer = CountingModel("expl")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
@@ -532,7 +566,7 @@ async def test_no_encoder_configured_yields_none_embedding(install_cache):
         SemCacheDeps(cache=disabled_cache, redis=redis, dump_key="k", hits_key="h", misses_key="m")
     )
     explainer = CountingModel("expl")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     alert = await process(_log(message="SPT price list unavailable", log_id="L1"), deps)
@@ -618,8 +652,8 @@ def test_diverges_on_missing_negation():
 
 
 # --- guard inside the cache (cosine forced to 1.0 by ConstantEncoder) --------
-def _payload_dept(dept=Department.backend, sev=Severity.high, conf=0.8, expl="x for <ORD>"):
-    return CachePayload(expl, dept.value, sev.value, conf)
+def _payload_dept(dept=Department.backend, sev=Severity.high, expl="x for <ORD>"):
+    return CachePayload(expl, dept.value, sev.value)
 
 
 def test_guard_vetoes_high_cosine_meaning_flip():
@@ -660,7 +694,7 @@ async def test_guard_forces_llm_on_meaning_flip(install_cache):
     semcache.get().cache._salient_words = SALIENT
 
     explainer = CountingModel("SAP submission result for order ORD-1")
-    router = CountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = CountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await process(_log(message="SAP submission succeeded for order ORD-1", log_id="L1"), deps)
@@ -693,7 +727,7 @@ class SlowCountingModel(CountingModel):
 async def test_concurrent_identical_logs_call_llm_once(install_cache):
     install_cache()
     explainer = SlowCountingModel("SPT pricing for order ORD-6001 failed")
-    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = SlowCountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     logs = [
@@ -717,7 +751,7 @@ async def test_follower_refills_its_own_ids_not_the_leaders(install_cache):
     install_cache()
     # The leader's explanation names ORD-6001 explicitly.
     explainer = SlowCountingModel("Pricing for order ORD-6001 failed")
-    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = SlowCountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     logs = [
@@ -802,7 +836,7 @@ async def test_inflight_registry_is_empty_after_work_settles(install_cache):
     """The in-flight map must not leak keys — including when the leader raises."""
     install_cache()
     explainer = SlowCountingModel("Pricing for order ORD-6001 failed")
-    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = SlowCountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     await asyncio.gather(
@@ -822,7 +856,7 @@ async def test_concurrent_distinct_types_each_call_the_llm(install_cache):
     be merged just because they raced."""
     install_cache()
     explainer = SlowCountingModel("some explanation")
-    router = SlowCountingModel('{"department": "backend", "severity": "high", "confidence": 0.8}')
+    router = SlowCountingModel('{"department": "backend", "severity": "high"}')
     deps = _healthy_deps(explainer, router)
 
     logs = [

@@ -45,7 +45,7 @@ def _alert(**over) -> ProcessedAlert:
     base = dict(
         alert_id="alert-1", emitted_at=BASE, log=_log(),
         explanation="The order was blocked because its margin fell below the threshold.",
-        department=Department.general, severity=Severity.medium, confidence=0.9, source="ai",
+        department=Department.general, severity=Severity.medium, source="ai",
     )
     base.update(over)
     return ProcessedAlert(**base)
@@ -308,7 +308,7 @@ async def test_index_alert_builds_text_and_metadata():
 async def test_index_alert_handles_a_fallback_alert():
     """A fallback alert has null enrichment; those keys must be dropped, not null."""
     client = _FakeClient()
-    alert = _alert(explanation=None, department=None, severity=None, confidence=None,
+    alert = _alert(explanation=None, department=None, severity=None,
                    source="fallback")
     assert await index_alert(alert, client=client) is True
     metadata = client.calls[0][1]["metadata"]

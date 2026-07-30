@@ -2,7 +2,6 @@ import { Card } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
 import { AlertActionsMenu } from "@/components/alerts/AlertActionsMenu";
 import { Badge } from "@/components/ui/Badge";
-import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
 import { SeverityPill } from "@/components/ui/SeverityPill";
 import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
@@ -90,7 +89,6 @@ export function AlertCard({ alert, onOpen, onResolve, isSelected = false, search
                 </span>
               )}
               {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
-              {alert.confidence != null && <ConfidenceBar confidence={alert.confidence} />}
             </>
           ) : (
             <>

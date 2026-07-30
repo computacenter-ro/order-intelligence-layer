@@ -127,7 +127,21 @@ services:
     profiles: ["app"]
     image: oil-app
     restart: on-failure          # same RabbitMQ startup-race guard as mock-services
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    # --proxy-headers + --forwarded-allow-ips: honor X-Forwarded-Proto/-For from a
+    # reverse proxy. A TLS terminator forwards PLAIN http over the internal network,
+    # so without these uvicorn believes every request is insecure http and (a) the
+    # Secure session cookie is mishandled — login appears to succeed then bounces
+    # straight back to the login screen — and (b) any absolute URL it builds comes
+    # out http:// and is blocked as mixed content. Harmless with no proxy in front
+    # (the headers simply aren't present).
+    #
+    # "*" trusts the headers from any peer, which is safe ONLY because nothing
+    # untrusted can reach this port: in the production compose the backend
+    # publishes no host port and is reachable solely on the Docker network. If port
+    # 8000 is ever published to the host, narrow this to the proxy's subnet.
+    command: >
+      uvicorn backend.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips=*
     env_file:
       - path: .env          # TEAMS_WEBHOOK_* / DASHBOARD_URL for Teams notifications
         required: false     # optional: stdout fallback when absent (e.g. CI/teammates)
@@ -150,6 +164,14 @@ services:
     profiles: ["app"]
     build:
       context: ./dashboard
+      # NEXT_PUBLIC_* are BUILD args, not runtime env: Next inlines them into the
+      # browser bundle during `npm run build`, so a runtime `environment:` entry
+      # has no effect (see dashboard/Dockerfile). Absolute values here because this
+      # dev/demo compose publishes ports directly with no reverse proxy; the
+      # production compose builds with the relative defaults (/api, /ws) instead.
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
       # NPM_TOKEN is passed as a build SECRET (not an arg), so it never appears
       # in the build log or `docker history`. Sourced from the NPM_TOKEN env var
       # via the top-level `secrets:` block below. Put NPM_TOKEN in .env
@@ -158,12 +180,8 @@ services:
         - npm_token
     ports:
       - "3000:3000"
-    environment:
-      # These are BROWSER-side vars (the Next app runs in the user's browser),
-      # so they must point at the host-published backend port, not the compose
-      # service name. Names must match what the code reads (dashboard/lib).
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-      NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
+    # No `environment:` for NEXT_PUBLIC_* — they are build args above. Setting them
+    # here would look like configuration but change nothing at runtime.
     depends_on:
       backend:
         condition: service_started

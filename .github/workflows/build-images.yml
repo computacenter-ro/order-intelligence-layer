@@ -1,0 +1,132 @@
+name: Build & push images
+
+# Builds the two deployment images and pushes them to GHCR, so the VM only ever
+# PULLS. Building on the VM would need ~4 vCPUs (torch + the Next bundle) and
+# would put the private-registry npm token on the box; neither is necessary.
+#
+# Two images:
+#   ghcr.io/<owner>/oil-app        — all Python services (differ only by command)
+#   ghcr.io/<owner>/oil-dashboard  — the Next.js app
+#
+# Trigger: pushes to prep-for-prod / dev / main that touch something an image
+# contains, plus manual dispatch. Docs-only pushes don't rebuild.
+on:
+  push:
+    branches: [prep-for-prod, dev, main]
+    paths:
+      - "Dockerfile"
+      - "requirements*.txt"
+      - "ai_service/**"
+      - "backend/**"
+      - "pipeline/**"
+      - "shared/**"
+      - "alembic.ini"
+      - "dashboard/**"
+      - ".github/workflows/build-images.yml"
+  workflow_dispatch:
+    inputs:
+      public_url:
+        description: "Base URL the dashboard bundle is built for (blank = relative /api and /ws, correct behind the reverse proxy)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  app:
+    name: oil-app (Python services)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # required to push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is injected by Actions — no secret to manage.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Lowercased by the action: GHCR rejects uppercase in a repository name
+          # and the org has a capital letter risk.
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/oil-app
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub-hosted cache: the torch layer is ~200 MB compressed and
+          # otherwise re-downloads on every run.
+          cache-from: type=gha,scope=oil-app
+          cache-to: type=gha,scope=oil-app,mode=max
+
+  dashboard:
+    name: oil-dashboard (Next.js)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/oil-dashboard
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dashboard
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # NEXT_PUBLIC_* are BUILD args: Next inlines them into the browser
+          # bundle, so they cannot be set at deploy time. Empty defaults mean the
+          # Dockerfile's own relative /api and /ws, which is what the
+          # reverse-proxied deployment wants — the image then carries no hostname
+          # and works for any PUBLIC_HOST. Pass public_url on a manual run only
+          # for a split-origin deployment.
+          build-args: |
+            ${{ inputs.public_url && format('NEXT_PUBLIC_API_URL={0}/api', inputs.public_url) || '' }}
+            ${{ inputs.public_url && format('NEXT_PUBLIC_WS_URL={0}/ws', inputs.public_url) || '' }}
+          # The private @computacenter-ro/style-guide package needs a registry
+          # token. Passed as a build SECRET (not an arg) so it never appears in
+          # the build log or `docker history` — matches dashboard/Dockerfile's
+          # `--mount=type=secret,id=npm_token`. Reuses the NODE_AUTH_TOKEN secret
+          # that ci.yml already relies on.
+          secrets: |
+            npm_token=${{ secrets.NODE_AUTH_TOKEN }}
+          cache-from: type=gha,scope=oil-dashboard
+          cache-to: type=gha,scope=oil-dashboard,mode=max

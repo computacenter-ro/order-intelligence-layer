@@ -347,7 +347,25 @@ sits inside the poller's window.
 | `POST /logs` | Single log object or array. Validates `log_id` + `timestamp` (422 otherwise). Returns `{"ingested": N}`. |
 | `GET /logs?from=<iso>&to=<iso>` | `from <= timestamp < to`, sorted ascending. |
 | `GET /logs?id=<X>` | Logs where `eventId==X` OR `orderId==X` OR `cartHeaderId==X`, ascending. **Debug/ops tool only** — no runtime component depends on it. |
-| `GET /health` | `{"status":"ok","stored":N,"capacity":MOCK_ES_MAX_LOGS}` — `stored == capacity` means the buffer is evicting |
+| `GET /health` | `{"status":"ok","stored":N,"capacity":MOCK_ES_MAX_LOGS,"oldest_timestamp":ISO\|null}` — `stored == capacity` means the buffer is evicting; `oldest_timestamp` is the **retention floor** (the MINIMUM timestamp held, not the left-most entry) |
+
+`GET /logs` with **no params** is capped at `MOCK_ES_QUERY_LIMIT` (default 5000,
+newest first) — an uncapped read serializes the whole store (~90 MB at the 200k
+cap) on an endpoint no runtime component uses. **Windowed (`from`/`to`) and `id`
+queries are never capped**: the poller's correctness depends on receiving its
+entire window, so truncating one would silently drop logs.
+
+**Retention floor and the poller watermark.** This store is in-memory while the
+poller's watermark (`ai:last_to`) persists in Redis, so a collector restart — or
+eviction outrunning the poller — leaves the poller asking for a window whose logs
+are gone. It used to read `[]`, advance the watermark, and lose that data
+silently; the journeys involved were then swept as `TIMED_OUT`, which reads like a
+correlation bug rather than lost input. The poller now compares its watermark
+against `oldest_timestamp` **only when a window came back empty** (so the healthy
+path costs no extra request), logs a WARNING naming the gap, and skips the
+watermark forward to the floor so the cycle resumes on real data. The logs in the
+gap are genuinely unrecoverable — this makes the loss loud, it does not prevent
+it. Expect a burst of `TIMED_OUT` journeys after any collector restart.
 
 Only the AI service's poller reads from it at runtime.
 

@@ -1,0 +1,78 @@
+# Reverse proxy + TLS terminator for the production deployment.
+#
+# Purpose: put the dashboard and the backend on ONE origin
+# (https://$PUBLIC_HOST). That is what makes the session cookie same-site, keeps
+# CORS out of the picture, and lets the dashboard bundle be built with RELATIVE
+# URLs (/api, /ws) so no hostname is baked into the image.
+#
+# TLS is automatic: Caddy provisions and renews a Let's Encrypt certificate for
+# PUBLIC_HOST on first start. That requires (a) PUBLIC_HOST to be a real DNS name
+# resolving to this VM, and (b) ports 80 and 443 reachable from the internet
+# (the HTTP-01 challenge uses :80). The cert lives in the caddy_data volume —
+# see the volume note in docker-compose.prod.yml.
+#
+# {$PUBLIC_HOST} and {$ACME_EMAIL} are substituted from the environment by Caddy
+# itself (compose passes them through), so this file is not per-environment.
+{
+	# Where Let's Encrypt sends expiry warnings. Optional but recommended.
+	email {$ACME_EMAIL}
+}
+
+{$PUBLIC_HOST} {
+	encode gzip
+
+	# --- WebSocket ---------------------------------------------------------
+	# Declared BEFORE the /api route only for readability; Caddy matches by
+	# specificity, not order. The backend serves the WS endpoint at its ROOT
+	# /ws (backend/ws.py: @router.websocket("/ws")), and the browser connects to
+	# wss://$PUBLIC_HOST/ws — same path both sides, so nothing is stripped here.
+	#
+	# No special "upgrade" config is needed: reverse_proxy passes the
+	# Connection/Upgrade headers through and Caddy handles WS natively.
+	handle /ws {
+		reverse_proxy backend:8000
+	}
+
+	# --- Entra ID OAuth callback -------------------------------------------
+	# MUST be routed to the backend WITHOUT the /api prefix, and separately from
+	# the /api/* rule below.
+	#
+	# Reason: this URL is not called by our frontend — MICROSOFT redirects the
+	# user's browser to it, using the exact ENTRA_REDIRECT_URI registered in the
+	# Azure app registration (https://$PUBLIC_HOST/auth/entra/callback). That has
+	# no /api segment, so without this rule the catch-all below would hand
+	# Microsoft's callback to the Next.js app, which has no such route: sign-in
+	# would end on a 404 after the user had already authenticated.
+	#
+	# (The dashboard's own call to start the flow goes to /api/auth/entra/login
+	# and is handled by the /api/* rule, which strips the prefix. Both therefore
+	# reach the backend at its real /auth/entra/* routes.)
+	handle /auth/entra/* {
+		reverse_proxy backend:8000
+	}
+
+	# --- REST API ----------------------------------------------------------
+	# handle_path (NOT handle) STRIPS the /api prefix before proxying:
+	#   browser GET /api/alerts  ->  backend GET /alerts
+	#
+	# This is load-bearing. The backend registers its routes at the root
+	# (/alerts, /auth/login, /journeys), so forwarding /api/alerts unstripped
+	# would 404 EVERY api call while both containers still reported healthy.
+	# Stripping here also means the backend needs no root_path/prefix change and
+	# behaves identically when hit directly on :8000 in local dev.
+	handle_path /api/* {
+		reverse_proxy backend:8000
+	}
+
+	# --- Dashboard (everything else) ---------------------------------------
+	# Must come last: this is the catch-all for the Next.js app, including its
+	# /_next/* static assets.
+	handle {
+		reverse_proxy dashboard:3000
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -140,8 +140,23 @@ def set_auth_cookie(response: Response, token: str) -> None:
 
 
 def clear_auth_cookie(response: Response) -> None:
-    """Delete the session cookie (logout)."""
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+    """Delete the session cookie (logout).
+
+    ``secure``/``samesite`` MUST mirror :func:`set_auth_cookie` exactly. A browser
+    treats a cookie's identity as name + Path + Domain, but it will reject an
+    incoming ``Set-Cookie`` that drops ``Secure`` on a secure page — so a deletion
+    sent without it can be ignored, leaving the session cookie in place and logout
+    silently not logging the user out. This only shows up once
+    ``AUTH_COOKIE_SECURE=true`` (i.e. in the real HTTPS deployment), never on
+    local http, which is exactly why it is stated here rather than left implicit.
+    """
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite="lax",
+    )
 
 
 # --- dependency: the trust boundary every protected route reuses -------------

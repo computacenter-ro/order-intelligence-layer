@@ -108,3 +108,137 @@ def test_cli_continuous_requires_positive_interval():
 def test_cli_scenario_and_all_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         _parse_args(["--scenario", "1", "--all"])
+
+
+def test_cli_count_defaults_to_one():
+    assert _parse_args(["--mode", "continuous"]).count == 1
+
+
+def test_cli_count_is_parsed():
+    assert _parse_args(["--mode", "continuous", "--count", "2"]).count == 2
+
+
+def test_cli_rejects_count_below_one():
+    with pytest.raises(SystemExit):
+        _parse_args(["--mode", "continuous", "--count", "0"])
+
+
+# --- continuous mode: batching + cycling -------------------------------------
+# The deployed injector runs `--mode continuous --interval 60 --count 2`: two
+# scenarios start together, run to completion on their own, then 60s later the
+# next two start. These tests pin that batching/cycling contract without a broker:
+# _run_one is replaced by a recorder and asyncio.sleep by a controlled abort.
+
+
+class _StopLoop(Exception):
+    """Breaks out of the infinite continuous loop after N sleeps."""
+
+
+@pytest.fixture
+def continuous_runner(monkeypatch):
+    """Run ``_run_continuous`` for a fixed number of ticks, recording firings.
+
+    Returns a callable ``(count, ticks) -> list[list[int]]`` — one inner list of
+    scenario ids per tick, in the order they were fired.
+    """
+    import asyncio as _asyncio
+
+    from pipeline.injector import inject as mod
+
+    def run(count: int, ticks: int) -> list[list[int]]:
+        batches: list[list[int]] = []
+        current: list[int] = []
+
+        async def fake_run_one(scenario_id, rabbitmq_url):
+            current.append(scenario_id)
+
+        async def fake_sleep(_seconds):
+            # A tick ends at its sleep: bank the batch, stop after `ticks` of them.
+            batches.append(list(current))
+            current.clear()
+            if len(batches) >= ticks:
+                raise _StopLoop
+
+        monkeypatch.setattr(mod, "_run_one", fake_run_one)
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        try:
+            _asyncio.run(mod._run_continuous(60.0, None, count))
+        except _StopLoop:
+            pass
+        return batches
+
+    return run
+
+
+def test_continuous_fires_count_scenarios_per_tick(continuous_runner):
+    batches = continuous_runner(2, 3)
+    assert [len(b) for b in batches] == [2, 2, 2]
+
+
+def test_continuous_default_count_fires_one_at_a_time(continuous_runner):
+    """The pre-existing behaviour must be unchanged when --count is not given."""
+    assert continuous_runner(1, 4) == [[1], [2], [3], [4]]
+
+
+def test_continuous_pairs_scenarios_in_order(continuous_runner):
+    """The requested sequence: (1,2) then (3,4) then (5,6)."""
+    assert continuous_runner(2, 3) == [[1, 2], [3, 4], [5, 6]]
+
+
+def test_continuous_cycle_wraps_without_losing_the_offset(continuous_runner):
+    """With an ODD scenario count, pairs must straddle the wrap.
+
+    17 scenarios / count=2 → ... (15,16) (17,1) (2,3) ... A "current batch index"
+    implementation would restart at (1,2) after the wrap and fire scenario 1 twice
+    as often as the rest; a single stride-advancing counter does not.
+    """
+    total = len(SCENARIOS)
+    ticks = total  # enough to pass the wrap and resume
+    batches = continuous_runner(2, ticks)
+
+    expected = [
+        [((2 * t + k) % total) + 1 for k in range(2)]
+        for t in range(ticks)
+    ]
+    assert batches == expected
+
+    # Every scenario fired, and no scenario fired twice as often as another.
+    fired = [sid for batch in batches for sid in batch]
+    assert set(fired) == set(SCENARIOS)
+    counts = {sid: fired.count(sid) for sid in set(fired)}
+    assert max(counts.values()) - min(counts.values()) <= 1
+
+
+def test_continuous_batch_is_fired_concurrently(monkeypatch):
+    """The batch must start together (gather), not one-after-another.
+
+    Pinned by making the FIRST firing block until the second has started: with
+    sequential awaits this deadlocks (and the test times out / fails), so it can
+    only pass if both coroutines are in flight at once.
+    """
+    import asyncio as _asyncio
+
+    from pipeline.injector import inject as mod
+
+    started = _asyncio.Event()
+
+    async def fake_run_one(scenario_id, rabbitmq_url):
+        if scenario_id == 1:
+            await _asyncio.wait_for(started.wait(), timeout=1.0)  # needs #2 running
+        else:
+            started.set()
+
+    async def fake_sleep(_seconds):
+        raise _StopLoop
+
+    monkeypatch.setattr(mod, "_run_one", fake_run_one)
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+
+    async def go():
+        try:
+            await mod._run_continuous(60.0, None, 2)
+        except _StopLoop:
+            pass
+
+    _asyncio.run(go())  # completes only if both ran concurrently
+    assert started.is_set()

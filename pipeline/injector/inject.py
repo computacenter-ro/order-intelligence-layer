@@ -110,35 +110,60 @@ async def _run_all(stagger: float, rabbitmq_url: str | None) -> None:
         await asyncio.sleep(stagger)  # stagger so flows interleave realistically
 
 
-async def _run_continuous(interval: float, rabbitmq_url: str | None) -> None:
+async def _run_continuous(
+    interval: float, rabbitmq_url: str | None, count: int = 1
+) -> None:
+    """Fire ``count`` scenarios at once, then wait ``interval`` seconds; forever.
+
+    Each scenario is fired exactly as the one-shot paths fire it — same baton,
+    same step chain. ``count`` only changes how many start per tick.
+
+    The batch is launched with ``gather`` so the flows start **together** rather
+    than one-after-another: sequential awaits would stagger them by however long
+    each publish takes, and the point of a batch is concurrent journeys.
+
+    A single counter advances by ``count`` per tick, so the cycle wraps across
+    batch boundaries instead of restarting: with 17 scenarios and count=2 that
+    gives (1,2) (3,4) ... (15,16) (17,1) (2,3) ... — every scenario fired equally
+    often. Tracking a "current batch" index instead would drop the offset and
+    replay (1,2) after (17,1).
+    """
     scenarios = all_scenarios()
     i = 0
     while True:
-        scenario = scenarios[i % len(scenarios)]
-        await _run_one(scenario.id, rabbitmq_url)
-        i += 1
+        batch = [scenarios[(i + k) % len(scenarios)].id for k in range(count)]
+        await asyncio.gather(*(_run_one(sid, rabbitmq_url) for sid in batch))
+        i += count
         await asyncio.sleep(interval)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Start simulated order flows.")
     group = parser.add_mutually_exclusive_group(required=True)
+    # Scenario ids come from SCENARIOS so the help text can't drift from the
+    # actual count (it has grown before).
+    _ids = sorted(SCENARIOS)
     group.add_argument("--scenario", type=int, metavar="N",
-                       help="fire a single scenario (1-10)")
+                       help=f"fire a single scenario ({_ids[0]}-{_ids[-1]})")
     group.add_argument("--all", action="store_true",
-                       help="fire all 10 scenarios, staggered")
+                       help=f"fire all {len(_ids)} scenarios, staggered")
     group.add_argument("--mode", choices=["continuous"],
-                       help="continuous injection (use with --interval)")
+                       help="continuous injection (use with --interval/--count)")
     parser.add_argument("--interval", type=float, default=5.0,
-                        help="seconds between flows in continuous mode (default 5)")
+                        help="seconds between batches in continuous mode (default 5)")
+    parser.add_argument("--count", type=int, default=1,
+                        help="scenarios fired together per batch in continuous "
+                             "mode (default 1)")
     parser.add_argument("--stagger", type=float, default=1.0,
                         help="seconds between flows in --all mode (default 1)")
     args = parser.parse_args(argv)
 
     if args.scenario is not None and args.scenario not in SCENARIOS:
-        parser.error(f"--scenario must be one of {sorted(SCENARIOS)}")
+        parser.error(f"--scenario must be one of {_ids}")
     if args.mode == "continuous" and args.interval <= 0:
         parser.error("--interval must be > 0")
+    if args.mode == "continuous" and args.count < 1:
+        parser.error("--count must be >= 1")
     return args
 
 
@@ -150,7 +175,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.all:
         asyncio.run(_run_all(args.stagger, url))
     elif args.mode == "continuous":
-        asyncio.run(_run_continuous(args.interval, url))
+        asyncio.run(_run_continuous(args.interval, url, args.count))
 
 
 if __name__ == "__main__":

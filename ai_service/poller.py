@@ -153,6 +153,22 @@ class Poller:
         resp.raise_for_status()
         return resp.json()
 
+    async def fetch_oldest_timestamp(self) -> str | None:
+        """The collector's retention floor, or None if unknown/empty.
+
+        Best-effort: any failure (older collector without the field, network blip,
+        malformed body) returns None, which the caller treats as "cannot tell" and
+        proceeds exactly as before. This must never break a poll cycle — it is a
+        diagnostic, not a dependency.
+        """
+        try:
+            resp = await self._http.get(f"{self._es_url}/health")
+            resp.raise_for_status()
+            value = resp.json().get("oldest_timestamp")
+        except Exception:  # noqa: BLE001 — never let a diagnostic break polling
+            return None
+        return value if isinstance(value, str) and value else None
+
     async def is_new(self, log_id: str) -> bool:
         """True the first time ``log_id`` is seen (SETNX); False on any repeat."""
         return bool(
@@ -182,6 +198,37 @@ class Poller:
         last_to = await self._read_watermark()
         from_iso, to_iso = window_from_watermark(last_to, now)
         raw_logs = await self.fetch_logs(from_iso, to_iso)
+
+        # Detect a watermark that has fallen behind what the collector still holds.
+        #
+        # The collector's store is IN-MEMORY while this watermark lives in Redis,
+        # which persists — so a collector restart leaves us asking for a window
+        # whose logs no longer exist. It is also reachable without a restart, if
+        # eviction outruns us. Either way the window comes back empty, the
+        # watermark advances below, and those logs are never processed: the
+        # journeys they belong to sit half-assembled until the backend sweeps them
+        # as TIMED_OUT, which reads like a correlation bug rather than lost input.
+        #
+        # There is nothing to recover (the logs are genuinely gone), so this does
+        # not retry — it makes the loss LOUD instead of silent, and skips the
+        # watermark forward so we resume from real data instead of grinding
+        # through empty windows. Only checked when the window came back empty, so
+        # the healthy path costs no extra request.
+        if last_to and not raw_logs:
+            oldest = await self.fetch_oldest_timestamp()
+            if oldest and oldest > from_iso:
+                print(
+                    f"[poller] WARNING: watermark {from_iso} predates the "
+                    f"collector's oldest retained log {oldest} — logs in that gap "
+                    f"are lost (collector restart or eviction). Skipping the "
+                    f"watermark forward to {oldest}; affected journeys will be "
+                    f"swept as TIMED_OUT.",
+                    flush=True,
+                )
+                # Re-read from the retention floor so this cycle still does useful
+                # work instead of returning 0 and waiting for the next interval.
+                from_iso = oldest
+                raw_logs = await self.fetch_logs(from_iso, to_iso)
 
         alertable: list[LogLine] = []
         processed = 0

@@ -319,7 +319,7 @@ def test_assembler_lazy_across_batches():
 
 # =============================================================================
 # Fixture-driven end-to-end: the 10 canonical flows
-# (pipeline/data/mock-order-flows-v2.json — the reference-system log samples).
+# (pipeline/data/mock-order-flows-v6.json — the reference-system log samples).
 #
 # Each flow is a real captured log stream ("events") plus its expected
 # "outcome". We push every flow's events through the *pure* pipeline —
@@ -335,7 +335,7 @@ from backend.stitching import Stitcher  # noqa: F401 — used via JourneyAssembl
 
 FIXTURE = (
     Path(__file__).resolve().parent.parent
-    / "pipeline" / "data" / "mock-order-flows-v4.json"
+    / "pipeline" / "data" / "mock-order-flows-v6.json"
 )
 
 # The order-creation-response ack: inbound's ResponseListener line. In v3 it
@@ -428,9 +428,13 @@ def _split(logs: list[LogLine], n: int) -> list[list[LogLine]]:
     return [logs[i : i + size] for i in range(0, len(logs), size)]
 
 
-def test_fixture_loads_fifteen_flows():
-    assert len(FLOWS) == 15
-    assert {f["scenario"] for f in FLOWS} == set(range(1, 16))
+def test_fixture_covers_every_scenario():
+    # Length-derived, not a hardcoded count: v6 is captured from all of
+    # shared/scenarios.py's scenarios, so the fixture and SCENARIOS must agree.
+    from shared.scenarios import SCENARIOS
+
+    assert len(FLOWS) == len(SCENARIOS)
+    assert {f["scenario"] for f in FLOWS} == set(SCENARIOS)
 
 
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)

@@ -64,7 +64,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
 │   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
 │   │   dump_backend.py           # dev harness: dump backend DB state to JSON
-│   └── data/                     # reference fixtures (mock-order-flows-v2.json / -v3.json)
+│   └── data/                     # reference fixtures (v6 = current; v2..v5 kept for history)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 │   ├── semcache.py               # semantic cache (normalize + embed + LRU) — skips LLM on repeat log types
@@ -92,12 +92,25 @@ A microservice order pipeline. One order's path in the real system:
    order** (persists cart header to BM DB, generates the order number), and
    publishes a **creation response** to `order.response.queue`, which inbound
    reads (→ *bridge event*, see Correlation Model).
-4. cc-order-engine then enriches the order via HTTP/Feign calls:
-   **SPT** (pricing/price lists), **RSM** (rebates/PVC), **SOLR** (product
-   search), **Settings** (margin thresholds, SQL-backed, pushed from
-   Salesforce), **JAM** (user auth/privileges → JWT), **Checker** (margin
-   check — can block the order), **Avalara** (US ship-to address verification,
-   US orders only).
+4. cc-order-engine then enriches the order via HTTP/Feign calls, in **this
+   exact order** (`ENRICH_SATELLITES` in `shared/scenarios.py` — ground truth):
+
+   ```
+   Settings → SPT → RSM → SOLR → JAM → Checker → Avalara (US only, last)
+   ```
+
+   **Settings is FIRST**: the engine reads the account's margin thresholds and
+   settings before it prices anything. Then **SPT** (pricing/price lists),
+   **RSM** (rebates/PVC), **SOLR** (product search / id resolution), **JAM**
+   (user auth/privileges → JWT), **Checker** (margin check — can block the
+   order), and finally **Avalara** (US ship-to address verification, **US orders
+   only**, the last enrichment step before dispatch).
+
+   All seven are **standalone services with their own emitters** and their own
+   `serve` block. SOLR and Avalara used to be folded in elsewhere (SOLR inside
+   the order engine, Avalara inside cc-validator-service); they are now
+   first-class, and the validator no longer emits Avalara lines, so the ship-to
+   verification appears exactly once.
 5. **cc-validator-service** runs validation strategies; then RabbitMQ
    `order.outbound.queue` → **cc-outbound-osw** submits to SAP fulfilment
    (RFC) → **cc-track-trace** registers the order for tracking
@@ -218,8 +231,13 @@ never crosses journeys, because that line already belongs to exactly one).
 
 Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
 NOT stitch — it processes individual logs. The reference fixture reflecting the
-honest bridge is **`pipeline/data/mock-order-flows-v3.json`** (v2 retained for
-history).
+honest bridge is **`pipeline/data/mock-order-flows-v6.json`** — the current
+reference fixture, and the one the tests read. It is **captured from the
+emitters** (never hand-written), so it always reflects what the services
+actually produce: the Settings-first enrichment order, `cc-solr-service` events
+in every flow that reaches SOLR, and `cc-avalara-service` events in the US
+success flow. v2–v5 are retained for history (v5 still shows the older
+SPT-first order and has no SOLR/Avalara events).
 
 ---
 
@@ -236,7 +254,8 @@ tells the next service "your turn to emit", carrying the flow context.
   "flow_id": "internal-uuid",
   "scenario": 6,
   "steps": [["inbound","receive"],["order_engine","create"],["inbound","bridge"],
-            ["order_engine","enrich"],["spt","serve"], "..."],
+            ["order_engine","enrich_settings_call"],["settings","serve"],
+            ["order_engine","enrich_settings_resp"],["order_engine","enrich_spt_call"], "..."],
   "cursor": 3,
   "ctx": {
     "eventId": "evt-...",
@@ -261,6 +280,22 @@ tells the next service "your turn to emit", carrying the flow context.
   defines the exact (service, block) sequence, including satellite
   interleaving during enrichment (OE client log → satellite server log → OE
   response log) and early termination on failures.
+  - Satellite ORDER comes from `ENRICH_SATELLITES` =
+    `[SETTINGS, SPT, RSM, SOLR, JAM, CHECKER]`. Nothing hardcodes it: the order
+    engine derives which satellite owns the one-off orchestration preamble from
+    `ENRICH_SATELLITES[0]`, so reordering the list moves the preamble with it.
+  - **AVALARA is deliberately NOT in that list.** It is US-only, so the chain
+    compiler appends its call→serve→resp trio conditionally on
+    `ctx.country == "US"`, after CHECKER, as the last enrichment step. Its
+    order-engine handlers are still registered unconditionally, or a US chain
+    would dispatch to a missing block.
+  - A scenario that fails **at Settings** (15/16/17) now fails at the *first*
+    enrichment step, so its flow contains **no other satellite**. That is
+    correct, not a truncation bug.
+  - SOLR needs no special-casing per scenario: it is included automatically in
+    every flow that reaches it (successes and failures that fail later — JAM,
+    margin, validation, SAP) and absent from those that die earlier (transform,
+    create, Settings failure, SPT-down, RSM).
 - **Timing:** a service sleeps 10–110 ms (random) between its log lines, and
   the baton hop adds natural delay — so timestamps (always real `utcnow`)
   interleave realistically across concurrently running flows.
@@ -287,29 +322,39 @@ tells the next service "your turn to emit", carrying the flow context.
 | order_engine | cc-order-engine | CCECMEWEBT001 | `create` (fills ids; creation-response publish log), `enrich` (client `--->`/`<---` Feign-style logs around each satellite), `dispatch` (publish to order.outbound.queue log). Fail `create`: BM-DB timeout ×3 → failure response (still eventId-only). |
 | spt | cc-spt-service | CCECMSRVT001 | price list lookup logs. Fail `spt`: OE logs timeouts ×3 → `"Order processing aborted"`. |
 | rsm | cc-rsm-service | CCECMSRVT001 | rebates / PVC rates logs. |
-| solr | cc-solr-service | CCECMSRVT001 | product search / id resolution logs. |
+| solr | cc-solr-service | CCECMSRVT001 | `serve`: product search / id resolution logs. Standalone satellite (after RSM, before JAM). Success-path only — no failure variant. |
 | jam | cc-jam-service | CCECMSRVT001 | auth + privileges + JWT logs. Fail `jam`: 403 account disabled → abort. |
 | settings | cc-settings-service | CCECMSRVT002 | margin threshold settings; Hibernate-style SQL log. |
 | checker | cc-checker-service | CCECMSRVT002 | per-line margin logs. Fail `margin`: below threshold → `"blocked by margin check"`. |
-| avalara | cc-avalara-service | CCECMSRVT002 | US address verification (US flows only). |
-| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs. Fail `udf`: missing `costCenter` UDF → 422 → abort. |
+| avalara | cc-avalara-service | CCECMSRVT002 | `serve`: US ship-to address verification (**US flows only**), the last enrichment step, after Checker. Standalone satellite — the validator no longer emits these lines. Success-path only — no failure variant. |
+| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs (the ship-to strategy is one, for every country — the real Avalara call moved to `cc-avalara-service`). Fail `udf`: missing `costCenter` UDF → 422 → abort. |
 | outbound_osw | cc-outbound-osw | CCECMEWEBT002 | SAP submission logs. Fail `sap`: RFC failure ×3 → `"moved to order.outbound.queue_error"`. |
 | track_trace | cc-track-trace | CCECMEWEBT002 | `"Registered order ... for tracking"` (**success terminal**). |
 
 ### The 10 canonical scenarios (`shared/scenarios.py` — ground truth for tests)
 
-| # | Outcome | fail_at | bridge_ids |
-|---|---|---|---|
-| 1 | `SUCCESS` (UK, 3 lines) | — | both |
-| 2 | `SUCCESS` (DE via Salesforce) | — | order |
-| 3 | `SUCCESS` (US, Avalara runs) | — | cart |
-| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) |
-| 5 | `ORDER_CREATION_FAILED` | create | — (never created) |
-| 6 | `MARGIN_CHECK_FAILED` | margin | order |
-| 7 | `VALIDATION_FAILED` | udf | both |
-| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart |
-| 9 | `AUTH_FAILED` (JAM 403) | jam | order |
-| 10 | `SAP_SUBMISSION_FAILED` | sap | both |
+The **Satellites** column is derived, not configured — it is what the chain
+compiler produces. `SOLR` appears in every flow that reaches it; `Avalara` only
+in the US flow that gets all the way to the end of enrichment.
+
+| # | Outcome | fail_at | bridge_ids | Satellites reached |
+|---|---|---|---|---|
+| 1 | `SUCCESS` (UK, 3 lines) | — | both | settings → spt → rsm → **solr** → jam → checker |
+| 2 | `SUCCESS` (DE via Salesforce) | — | order | settings → spt → rsm → **solr** → jam → checker |
+| 3 | `SUCCESS` (US, Avalara runs) | — | cart | settings → spt → rsm → **solr** → jam → checker → **avalara** |
+| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) | — (dies in phase 1) |
+| 5 | `ORDER_CREATION_FAILED` | create | — (never created) | — (dies in phase 1) |
+| 6 | `MARGIN_CHECK_FAILED` | margin | order | settings → spt → rsm → **solr** → jam → checker |
+| 7 | `VALIDATION_FAILED` | udf | both | settings → spt → rsm → **solr** → jam → checker |
+| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart | settings → spt (no solr — dies here) |
+| 9 | `AUTH_FAILED` (JAM 403) | jam | order | settings → spt → rsm → **solr** → jam |
+| 10 | `SAP_SUBMISSION_FAILED` | sap | both | settings → spt → rsm → **solr** → jam → checker |
+
+Scenarios 11–17 (clustering / novel-failure cases, also in `shared/scenarios.py`)
+follow the same rules: 11/12 are SPT-down (settings → spt only, and 12 is US but
+never reaches Avalara — country alone is not sufficient), 13 is a margin failure
+(reaches solr), 14 is SAP-down (reaches solr), and 15/16/17 fail **at Settings**,
+so they reach `settings` and nothing else.
 
 ### Injector (`pipeline/injector/inject.py`)
 Mints **only** `eventId` (= `evt-<uuid>`) — per the correlation model the order

@@ -30,12 +30,12 @@ from pipeline.services.registry import BLOCKS
 from shared.models import Baton, BatonContext, LogLine
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v4.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v6.json"
 
 # Importing the service modules registers their blocks (import side-effect).
 _SERVICE_MODULES = [
-    "inbound", "order_engine", "spt", "rsm", "settings",
-    "jam", "checker", "validator", "outbound_osw", "track_trace",
+    "inbound", "order_engine", "spt", "rsm", "solr", "settings",
+    "jam", "checker", "avalara", "validator", "outbound_osw", "track_trace",
 ]
 for _m in _SERVICE_MODULES:
     importlib.import_module(f"pipeline.services.{_m}")
@@ -249,6 +249,135 @@ async def test_emitted_identity_matches_fixture():
         # Loggers: every emitted logger must be a real one for that service.
         unknown = slot["loggers"] - ident[app_name]["loggers"]
         assert not unknown, f"{app_name}: emitted logger(s) not in reference dataset: {unknown}"
+
+
+# =============================================================================
+# SOLR + Avalara as first-class standalone services, and Settings-first ordering.
+#
+# These assert on the EMITTED lines (what live journeys actually contain), not
+# just on the compiled chain — that is the difference between "the chain says so"
+# and "the dashboard will show it".
+# =============================================================================
+_SAT_APP = {
+    "cc-settings-service": "settings",
+    "cc-spt-service": "spt",
+    "cc-rsm-service": "rsm",
+    "cc-solr-service": "solr",
+    "cc-jam-service": "jam",
+    "cc-checker-service": "checker",
+    "cc-avalara-service": "avalara",
+}
+
+
+def _satellite_sequence(logs: list[LogLine]) -> list[str]:
+    """The satellite services touched, in order, deduped for adjacency."""
+    seq: list[str] = []
+    for l in logs:
+        sat = _SAT_APP.get(l.app_name)
+        if sat and (not seq or seq[-1] != sat):
+            seq.append(sat)
+    return seq
+
+
+@pytest.mark.asyncio
+async def test_settings_is_the_first_enrichment_service_emitted():
+    """SETTINGS IS FIRST — asserted on the emitted stream, for every flow that
+    enriches at all."""
+    for sid in (1, 2, 3, 6, 7, 9, 10, 13, 14):
+        logs, _ctx = await _drive(sid)
+        seq = _satellite_sequence(logs)
+        assert seq and seq[0] == "settings", f"S{sid}: satellites start with {seq[:2]}"
+
+
+@pytest.mark.asyncio
+async def test_emitted_enrichment_order_is_canonical():
+    """Settings -> SPT -> RSM -> SOLR -> JAM -> Checker (+ Avalara, US only)."""
+    logs, _ = await _drive(1)
+    assert _satellite_sequence(logs) == ["settings", "spt", "rsm", "solr", "jam", "checker"]
+    us, _ = await _drive(3)
+    assert _satellite_sequence(us) == [
+        "settings", "spt", "rsm", "solr", "jam", "checker", "avalara",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 9, 10, 13, 14])
+async def test_solr_emits_in_every_flow_that_reaches_it(sid):
+    """SOLR appears in successes AND in journeys that fail LATER (margin check 6/13,
+    validation 7, auth 9, SAP 10/14) — this is the live-journey guarantee."""
+    logs, _ctx = await _drive(sid)
+    solr = [l for l in logs if l.app_name == "cc-solr-service"]
+    assert solr, f"S{sid}: no cc-solr-service lines emitted"
+    # And they are real phase-2 lines (order ids, never eventId).
+    for l in solr:
+        assert l.orderId is not None and l.cartHeaderId is not None
+        assert l.eventId is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", [4, 5, 8, 11, 12, 15, 16, 17])
+async def test_solr_absent_from_flows_that_die_before_it(sid):
+    """Absent from transform (4), create (5), SPT-down (8/11/12) and the Settings
+    failures (15/16/17) — Settings now fails at the FIRST enrichment step, so
+    those journeys contain no other satellite at all."""
+    logs, _ctx = await _drive(sid)
+    assert not [l for l in logs if l.app_name == "cc-solr-service"]
+
+
+@pytest.mark.asyncio
+async def test_avalara_emits_only_for_the_us_flow():
+    """Avalara is US-only AND must be reached: S3 (US success) has it; S1/S2
+    (UK/DE) do not; S12 is US but dies at SPT, so it does not either."""
+    us, _ = await _drive(3)
+    avalara = [l for l in us if l.app_name == "cc-avalara-service"]
+    assert avalara, "S3 (US) emitted no cc-avalara-service lines"
+    assert any("Ship-to address verified" in l.message for l in avalara)
+    for sid in (1, 2, 6, 7, 9, 10, 12, 13, 14):
+        logs, _ = await _drive(sid)
+        assert not [l for l in logs if l.app_name == "cc-avalara-service"], (
+            f"S{sid}: non-US (or not-reached) flow emitted Avalara lines"
+        )
+
+
+@pytest.mark.asyncio
+async def test_avalara_is_the_last_enrichment_service_before_dispatch():
+    """Avalara runs after Checker, as the last enrichment step."""
+    logs, _ = await _drive(3)
+    seq = _satellite_sequence(logs)
+    assert seq[-1] == "avalara" and seq[-2] == "checker"
+
+
+@pytest.mark.asyncio
+async def test_validator_no_longer_emits_avalara_verification_lines():
+    """Ownership moved to cc-avalara-service, so the validator must NOT emit the
+    verification (or its AvalaraClient request) — otherwise a US journey would
+    show the address verified twice."""
+    for sid in range(1, 18):
+        logs, _ctx = await _drive(sid)
+        validator = [l for l in logs if l.app_name == "cc-validator-service"]
+        assert not [l for l in validator if l.logger.endswith("client.AvalaraClient")], (
+            f"S{sid}: validator still emits AvalaraClient lines"
+        )
+        assert not [l for l in validator if "Ship-to address verified" in l.message], (
+            f"S{sid}: validator still emits the ship-to verification"
+        )
+        # The benign "Not implemented" ship-to strategy WARN is still expected
+        # (it is in the AI service's suppression list) — it is not a duplicate.
+        ship_to = [
+            l for l in validator
+            if l.logger.endswith("ValidateShipToWithAvalara")
+        ]
+        assert all(l.message == "Not implemented" for l in ship_to)
+
+
+@pytest.mark.asyncio
+async def test_us_verification_is_emitted_exactly_once():
+    """The whole point of moving Avalara out of the validator: exactly one
+    ship-to verification line in a US journey."""
+    logs, _ = await _drive(3)
+    verified = [l for l in logs if "Ship-to address verified" in l.message]
+    assert len(verified) == 1, f"expected 1 verification line, got {len(verified)}"
+    assert verified[0].app_name == "cc-avalara-service"
 
 
 # =============================================================================

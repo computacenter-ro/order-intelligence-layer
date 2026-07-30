@@ -58,6 +58,11 @@ PROFILES: dict[str, ServiceProfile] = {
     "rsm": ServiceProfile(
         "rsm", "cc-rsm-service", "CCECMSRVT001", "6341", "http-nio-8080-exec-8"
     ),
+    # SOLR sits on the same satellite host as SPT/RSM/JAM (CCECMSRVT001); the
+    # process_id continues that host's 634x block.
+    "solr": ServiceProfile(
+        "solr", "cc-solr-service", "CCECMSRVT001", "6343", "http-nio-8080-exec-5"
+    ),
     "settings": ServiceProfile(
         "settings", "cc-settings-service", "CCECMSRVT002", "5890", "http-nio-8080-exec-2"
     ),
@@ -67,9 +72,13 @@ PROFILES: dict[str, ServiceProfile] = {
     "checker": ServiceProfile(
         "checker", "cc-checker-service", "CCECMSRVT002", "5891", "http-nio-8080-exec-1"
     ),
-    # The validator also emits the Avalara satellite logs in the real system
-    # (logger c.c.validator.client.AvalaraClient) — Avalara is not its own
-    # service. See services/validator.py.
+    # Avalara is its own service (US ship-to verification, the last enrichment
+    # step). It runs on the CCECMSRVT002 satellite host beside settings/checker,
+    # continuing that host's 589x process_id block. The validator no longer
+    # emits Avalara lines — see services/avalara.py and services/validator.py.
+    "avalara": ServiceProfile(
+        "avalara", "cc-avalara-service", "CCECMSRVT002", "5893", "http-nio-8080-exec-3"
+    ),
     "validator": ServiceProfile(
         "validator", "cc-validator-service", "CCECMSRVT002", "5892", "http-nio-8080-exec-4"
     ),

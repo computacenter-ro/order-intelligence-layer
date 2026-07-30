@@ -524,7 +524,9 @@ export function AlertFilterBar({ value, onChange, facets }: AlertFilterBarProps)
                 gap: semanticSpacing.xs,
                 height: "32px",
                 padding: `0 ${semanticSpacing.md}`,
-                background: "transparent",
+                // No `background` here on purpose — the transparent resting fill
+                // comes from .oil-filter-toggle. Setting it inline would win on
+                // specificity and kill that class's :hover / :active states.
                 border: "none",
                 borderRadius: radii.md,
                 color: "var(--cc-heritage-blue)",

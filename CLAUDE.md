@@ -534,6 +534,57 @@ LLM-written summary (services touched, where it stopped, why). Called by the
 backend **on journey completion**. Same breaker; when LLM is down return a
 plain template built from journey meta (`source: "fallback"`).
 
+### LLM observability (`langsmith_stats.py`) — `GET /llm-stats`
+Per-logical-model run stats (calls, p50/p99 latency, error rate, cost, tokens)
+read back from LangSmith, split by the tag `llm.py` puts on each model
+(`explainer` / `router` / `summary` / `chat`), plus what the semantic cache saved.
+The backend forwards it (`backend/llm_stats_client.py`) so :8100 stays off the
+browser; the dashboard renders it at `/ai-performance`.
+
+**LangSmith is NOT on the read path.** A background task (`run_refresher`, started
+in `main.py` beside the poller) refreshes a snapshot of all 3 windows x 4 tags on a
+timer; `GET /llm-stats` is a pure snapshot read, so no user click can produce a
+request to LangSmith. That is a rate-limit fix and it had to be structural: with a
+TTL cache, volume was driven by clicks — 1h/24h/7d are three keys, so the first
+visit to each cost 4 queries, i.e. 12 requests in a few seconds, and no TTL helps a
+*first* visit. Load is now a constant function of time (12 requests per interval),
+independent of how many people are watching.
+
+Two disciplines inside the refresher:
+- **Every request is spaced** by `LLM_STATS_STAGGER_SECONDS`, including across the
+  window boundary — 12 back-to-back requests is the burst `/runs/stats` rejects
+  even when the average rate is low. The arithmetic (12 x stagger = cycle
+  duration) lives in the knob's comment in `settings.py`; keep it in step.
+- **A failure never overwrites a good value.** A tag that fails this cycle keeps
+  its previous number, so one 429 can't blank a card. Never a fabricated 0 — a
+  value that was never read is `null`.
+
+Three fields travel the whole chain into the UI (route → `llm_stats_client`,
+including its `degraded()` shape → `lib/types.ts`) so the page can explain a null
+node instead of guessing:
+
+- **`fetched_at`** — ISO UTC, `null` until a cycle completes. Stamped at the END of
+  a cycle, never the start: a cycle takes ~18s, and stamping it early would date
+  the numbers from before they were gathered. Wall clock, not monotonic (it is
+  persisted and displayed).
+- **`langsmith_configured`** — separates "no credentials" from "nothing collected
+  yet". Together with `fetched_at` these give the three distinct reasons a node is
+  null: collecting / not configured / that tag's query failed. The page used to
+  report all three as "not configured yet".
+- **`refresh_interval_s`** — the configured period. The UI adds it to `fetched_at`
+  ("next update in ~Xs") and multiplies it (`STALE_INTERVALS`) to decide the
+  refresher has died, so the backend substitutes a positive default rather than
+  forwarding a zero.
+
+**The age on screen is the refresher's only health signal.** It publishes into a
+snapshot, so a dead task keeps serving its last numbers — plausible, well-formed,
+increasingly wrong, with no error anywhere. Past `3 x refresh_interval_s` the label
+says so in words. Pure logic for all of this lives in
+`dashboard/lib/aiPerformance.ts` (tested with `npm test` — Node's built-in runner,
+no jest/vitest); the page polls the snapshot every 30s and has **no per-second
+timer** — the data moves once a cycle, so a ticking seconds counter was false
+precision.
+
 ### LLM config — Claude via Azure AI Foundry
 All provider wiring in ONE module, via LangChain's chat-model abstraction:
 ```
@@ -757,6 +808,7 @@ Connects to backend WS + REST. Feature contract:
 | `ai:breaker:state` | hash | — | circuit breaker state |
 | `ai:semcache` | string | — | semantic-cache dump (LRU entries persisted across restarts). Rebuildable — safe to drop. |
 | `ai:semcache:hits` / `:misses` | string | — | semantic-cache hit/miss counters (the demo number; `GET /semcache/stats`) |
+| `ai:llmstats:snapshot` | string | — | LangSmith per-model stats snapshot + its `fetched_at` (all 3 windows x 4 tags), refreshed on a timer and read by `GET /llm-stats`. Rebuildable — safe to drop; it exists so a restart doesn't blank `/ai-performance` until the first cycle lands. |
 
 Journey state lives in Postgres — the backend owns journeys.
 
@@ -777,6 +829,7 @@ python -m pipeline.services.run_all           # [1] all mock services (baton con
 python -m ai_service.main                     # [3] poller + graph + api (:8100)
 python -m backend.main                        # [5] api + consumers + ws (:8000)
 cd dashboard && npm run dev                   # [6] :3000
+cd dashboard && npm test                      # [6] pure-logic unit tests (node --test)
 python -m pipeline.injector.inject --all      # fire the 10 scenarios
 ```
 
@@ -790,7 +843,16 @@ Env defaults: `ES_URL=http://localhost:9200`,
 `SEMCACHE_ENABLED=1`, `SEMCACHE_THRESHOLD=0.95` (cosine floor),
 `SEMCACHE_MAX_ENTRIES=500`, `SEMCACHE_MODEL=all-MiniLM-L6-v2`, `SEMCACHE_GUARD=1`,
 `SEMCACHE_SALIENT_EXTRA` (comma-sep extra guard words),
+`LANGSMITH_API_KEY` + `LANGSMITH_PROJECT` (both required before `/llm-stats`
+queries anything; absent = a 200 full of nulls),
+`LLM_STATS_REFRESH_INTERVAL_SECONDS=60` (one cycle = 12 requests, so this alone
+sets the average rate), `LLM_STATS_STAGGER_SECONDS=1.5` (pause between EVERY
+request in a cycle; sized for 12 requests, not 4 — see `settings.py` for the
+arithmetic), `LLM_STATS_SNAPSHOT_KEY=ai:llmstats:snapshot`,
 plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
+
+`LLM_STATS_CACHE_TTL_SECONDS` was **removed** with the TTL cache it belonged to —
+reads no longer fetch, so there is nothing to expire.
 
 ---
 

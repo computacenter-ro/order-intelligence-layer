@@ -106,16 +106,38 @@ body {
   box-shadow: 0 0 0 1px var(--cc-heritage-blue);
 }
 
-/* The filter bar's "More/Fewer Filters" disclosure toggle. Carries the ghost
-   button's states (transparent -> Horizon Blue hover fill, Foundation Blue focus
-   ring) as a class because it must be a plain <button> to take aria-expanded /
-   aria-controls, which the style-guide Button does not forward. */
+/* The ghost/Clear button used where a plain <button> is required — the filter
+   bar's "More/Fewer Filters" disclosure (needs aria-expanded / aria-controls) and
+   the AI-performance "Update" control. The style-guide Button does not forward
+   those attributes, so the ghost variant's states live here instead.
+
+   The transparent resting fill BELONGS IN THIS CLASS, not in each call site's
+   inline style: `style={{ background: "transparent" }}` sets the property with
+   inline specificity, which silently beats the :hover rule below, so both users of
+   this class had a hover that never fired. Keeping the whole state machine —
+   resting, hover, pressed, busy — in one place is what makes it actually work. */
 .oil-filter-toggle {
+  background-color: transparent;
   transition: background-color 200ms ease;
 }
 
 .oil-filter-toggle:hover {
   background-color: var(--cc-btn-secondary-fill);
+}
+
+/* Pressed. A distinct, deeper step from hover so the click is acknowledged even
+   when the resulting work finishes too fast to see. */
+.oil-filter-toggle:active {
+  background-color: var(--cc-btn-secondary-pressed);
+}
+
+/* In flight. aria-busy is the state, so the visual and the announced state cannot
+   drift apart. Pointer events stay on: this control is idempotent, and blocking
+   the cursor mid-request reads as a frozen UI. */
+.oil-filter-toggle[aria-busy="true"] {
+  background-color: var(--cc-btn-secondary-fill);
+  cursor: progress;
+  opacity: 0.7;
 }
 
 .oil-filter-toggle:focus-visible {

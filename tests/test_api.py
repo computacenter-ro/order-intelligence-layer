@@ -23,6 +23,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
+import httpx
+
+from backend import api, llm_stats_client
 from backend.main import app
 from backend.db import get_session, Alert, Journey, JourneyEvent
 from backend.api import (
@@ -173,7 +176,9 @@ def _event(**over) -> JourneyEvent:
 # --- auth enforcement --------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/alerts", "/journeys", "/journeys/J1"])
+@pytest.mark.parametrize(
+    "path", ["/alerts", "/journeys", "/journeys/J1", "/alerts/facets", "/llm-stats"]
+)
 def test_requires_auth(path):
     """Without a valid session, every read route is 401 — no cookie, no data."""
     app.dependency_overrides.clear()  # drop the autouse stub user for this test
@@ -1069,6 +1074,74 @@ def test_get_alerts_invalid_filter_value_is_422(params):
     # error body names the offending query param, so the message is actionable
     locs = [tuple(err["loc"]) for err in r.json()["detail"]]
     assert any("query" in loc for loc in locs)
+
+
+# --- GET /llm-stats (forwarded to the AI service) ----------------------------
+#
+# The dashboard cannot reach :8100 (loopback + unauthenticated), so this route is
+# the front door. Its contract is that it always answers: a stopped AI service
+# must look like "no data", never like a broken dashboard.
+
+
+def test_llm_stats_forwards_and_returns_the_body(monkeypatch):
+    captured = {}
+
+    async def _fake(window, *, client=None):
+        captured["window"] = window
+        return {
+            "window": window,
+            "nodes": {"explainer": {"run_count": 7}, "router": None,
+                      "summary": None, "chat": None},
+            "cache_savings": {"hits": 3, "misses": 1, "hit_rate": 0.75,
+                              "estimated_saved_usd": 0.5},
+        }
+
+    monkeypatch.setattr(api, "fetch_llm_stats", _fake)
+    r = TestClient(app).get("/llm-stats", params={"window": "7d"})
+    assert r.status_code == 200
+    assert captured["window"] == "7d"
+    assert r.json()["nodes"]["explainer"]["run_count"] == 7
+
+
+def test_llm_stats_defaults_to_24h(monkeypatch):
+    captured = {}
+
+    async def _fake(window, *, client=None):
+        captured["window"] = window
+        return llm_stats_client.degraded(window)
+
+    monkeypatch.setattr(api, "fetch_llm_stats", _fake)
+    assert TestClient(app).get("/llm-stats").status_code == 200
+    assert captured["window"] == "24h"
+
+
+def test_llm_stats_is_200_when_the_ai_service_is_stopped(monkeypatch):
+    """The acceptance criterion. A refused connection is what a stopped service
+    looks like from here, and it must degrade rather than 502."""
+
+    async def _refused(url, params=None, timeout=None):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _refused)
+    r = TestClient(app).get("/llm-stats")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["nodes"] == {tag: None for tag in llm_stats_client.NODES}
+    assert body["cache_savings"]["estimated_saved_usd"] is None
+
+
+def test_llm_stats_window_is_not_validated_by_the_backend(monkeypatch):
+    """The AI service owns which windows it understands (and defaults unknown
+    ones), so the backend passes the value through instead of 422-ing on it."""
+    captured = {}
+
+    async def _fake(window, *, client=None):
+        captured["window"] = window
+        return llm_stats_client.degraded(window)
+
+    monkeypatch.setattr(api, "fetch_llm_stats", _fake)
+    assert TestClient(app).get("/llm-stats", params={"window": "banana"}).status_code == 200
+    assert captured["window"] == "banana"
 
 
 # --- GET /journeys -----------------------------------------------------------

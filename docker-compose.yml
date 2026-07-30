@@ -111,6 +111,19 @@ services:
       AZURE_AI_FOUNDRY_DEPLOYMENT_EXPLAINER: ${AZURE_AI_FOUNDRY_DEPLOYMENT_EXPLAINER:-}
       AZURE_AI_FOUNDRY_DEPLOYMENT_ROUTER: ${AZURE_AI_FOUNDRY_DEPLOYMENT_ROUTER:-}
       AZURE_AI_FOUNDRY_DEPLOYMENT_SUMMARY: ${AZURE_AI_FOUNDRY_DEPLOYMENT_SUMMARY:-}
+      # LangSmith. TRACING/ENDPOINT/API_KEY are read by langchain-core itself to
+      # WRITE traces; API_KEY + PROJECT are what langsmith_stats reads them back
+      # with for GET /llm-stats. All unset => no traces written and /llm-stats
+      # answers nulls (never an error).
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-}
+      # How hard the background refresher hits /runs/stats. Passed through so the
+      # rate can be tuned from .env without rebuilding the image — which is the
+      # whole point, since these two are what a 429 would send you to change.
+      LLM_STATS_REFRESH_INTERVAL_SECONDS: ${LLM_STATS_REFRESH_INTERVAL_SECONDS:-60}
+      LLM_STATS_STAGGER_SECONDS: ${LLM_STATS_STAGGER_SECONDS:-1.5}
     depends_on:
       rabbitmq:
         condition: service_healthy

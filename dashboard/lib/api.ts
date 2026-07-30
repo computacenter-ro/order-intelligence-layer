@@ -7,6 +7,7 @@ import type {
   IncidentDetail,
   IncidentStatus,
   Journey,
+  LlmStats,
   OverviewStats,
   ProcessedAlert,
 } from "@/lib/types";
@@ -221,6 +222,21 @@ export async function resolveIncident(incidentId: string): Promise<Incident> {
 /** Aggregate counters for the Insights page (backend GET /stats/insights). */
 export function fetchStats(): Promise<OverviewStats> {
   return getJson<OverviewStats>("/stats/insights");
+}
+
+/**
+ * Per-logical-model LLM run stats + semantic-cache savings.
+ *
+ * The window is a closed set here because the backend passes it straight through
+ * to the AI service, which silently defaults anything it doesn't recognise — so a
+ * typo would return 24h data under a "7d" label rather than an error. The union
+ * makes that unreachable from this side.
+ *
+ * Resolves even when the AI service or LangSmith is unavailable: the response is
+ * then the same shape with nulls (see `LlmStats`), not a rejection.
+ */
+export function fetchLlmStats(window: "1h" | "24h" | "7d" = "24h"): Promise<LlmStats> {
+  return getJson<LlmStats>(`/llm-stats?window=${window}`);
 }
 
 // --- chat --------------------------------------------------------------------

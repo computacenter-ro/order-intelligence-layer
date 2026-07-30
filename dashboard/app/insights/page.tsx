@@ -31,6 +31,13 @@ const NON_TERMINAL_OUTCOMES = new Set(["none", "IN_PROGRESS", "unknown"]);
 // the reader is looking for. "unrated" trails as the absence of a severity.
 const SEVERITY_ORDER = [...Object.keys(SEVERITY_RAMP), "unrated"];
 
+/** The alerts-per-incident ratio as a tile value. `null` means no incident has
+ *  been raised yet, which is not a ratio of zero — the em dash says "nothing to
+ *  measure" where "0.0x" would claim clustering achieved nothing. */
+function formatRatio(ratio: number | null): string {
+  return ratio === null ? "—" : `${ratio.toFixed(1)}×`;
+}
+
 /** `{key: count}` -> chart rows, largest first (nominal categories, so ranking
  *  by value is the useful order). */
 function toRows(
@@ -149,11 +156,12 @@ export default function InsightsPage() {
     );
   }
 
-  const { journeys, alerts } = stats;
+  const { journeys, alerts, incidents } = stats;
   const criticalCount = alerts.by_severity.critical ?? 0;
   const timedOut = journeys.by_status.TIMED_OUT ?? 0;
   const inProgress = journeys.by_status.IN_PROGRESS ?? 0;
   const finished = journeys.total - inProgress;
+  const openIncidents = incidents.by_status.open ?? 0;
 
   return (
     <div>
@@ -176,7 +184,7 @@ export default function InsightsPage() {
         Order pipeline health and alert load across everything ingested so far
       </p>
 
-      {/* KPI row — six headline numbers. A tile per number, not a chart per
+      {/* KPI row — eight headline numbers. A tile per number, not a chart per
           number: a one-bar bar chart says less in more space. */}
       <div
         style={{
@@ -208,6 +216,25 @@ export default function InsightsPage() {
           // Signal color only when there is something to signal; the label says
           // "Critical" either way, so color is never the only cue.
           tone={criticalCount > 0 ? OUTCOME_FAILED : undefined}
+        />
+        {/* How much alert noise clustering absorbed. The hint carries BOTH the
+            numerator and the alert total on purpose: "N of M alerts" is what
+            stops the ratio being read as if every alert had been clustered,
+            when in fact only failed/timed-out journeys are. */}
+        <StatCard
+          label="Alerts per incident"
+          value={formatRatio(incidents.alerts_per_incident)}
+          hint={
+            incidents.total > 0
+              ? `${incidents.alerts_clustered.toLocaleString()} of ${alerts.total.toLocaleString()} alerts, in ${incidents.total.toLocaleString()} incidents`
+              : "no incidents raised yet"
+          }
+        />
+        <StatCard
+          label="Open incidents"
+          value={openIncidents.toLocaleString()}
+          hint={`${incidents.total.toLocaleString()} raised in total`}
+          tone={openIncidents > 0 ? OUTCOME_FAILED : undefined}
         />
         <StatCard
           label="Avg duration"
@@ -288,7 +315,7 @@ export default function InsightsPage() {
 
         <ChartCard
           title="Alert mix"
-          subtitle="The three binary splits across all alerts"
+          subtitle="The four binary splits across all alerts"
         >
           <SplitBar
             label="Level"
@@ -299,6 +326,15 @@ export default function InsightsPage() {
             label="Analysis"
             primary={{ label: "AI-analyzed", count: alerts.by_source.ai ?? 0 }}
             secondary={{ label: "fallback", count: alerts.by_source.fallback ?? 0 }}
+          />
+          {/* Sits under "Analysis" because it refines that split rather than
+              standing beside it: a cached alert IS an AI answer, reused. `cached`
+              takes the accent because it is the number this row exists to show —
+              the filled share reads directly as the cache hit rate. */}
+          <SplitBar
+            label="Answer"
+            primary={{ label: "cached", count: alerts.cached }}
+            secondary={{ label: "fresh", count: alerts.fresh }}
           />
           <SplitBar
             label="Triage"

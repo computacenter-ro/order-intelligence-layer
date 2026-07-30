@@ -657,6 +657,144 @@ async def test_log_missing_id_is_skipped():
     assert n == 0 and not pub.raw
 
 
+# --- watermark vs the collector's retention floor ----------------------------
+# The collector's store is IN-MEMORY; this watermark lives in Redis and persists.
+# So a collector restart (now that it has a restart policy) leaves the poller
+# asking for a window whose logs are gone. Silently draining empty windows makes
+# the affected journeys look like a correlation bug — they are swept as TIMED_OUT
+# with no failure logs. These tests pin the loud-and-skip-forward behaviour.
+
+def _ts(seconds: int) -> str:
+    """A collector-format timestamp ``seconds`` BEFORE now.
+
+    Relative to now, not a fixed date: ``window_from_watermark`` clamps a
+    watermark older than MAX_WINDOW_SPAN (120s) forward to ``to - 120s``, so a
+    fixed past date would never reach poll_once as written and these tests would
+    exercise the clamp instead of the retention check.
+    """
+    from datetime import timedelta
+
+    from ai_service.poller import _format_ts
+
+    return _format_ts(datetime.now(timezone.utc) - timedelta(seconds=seconds))
+
+
+def _poller_with_retention(
+    *, oldest: str | None, windows: dict[str, list[dict]] | None = None
+):
+    """A Poller whose /health reports ``oldest`` and whose fetch_logs is per-``from``.
+
+    ``windows`` maps a ``from`` value to the logs returned for it, so a test can
+    show an empty first read and a populated re-read after the skip.
+    """
+    redis = FakeRedis()
+    pub = FakePublisher()
+    deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+    poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+
+    calls: list[str] = []
+
+    async def fetch_logs(from_iso, to_iso):
+        calls.append(from_iso)
+        return list((windows or {}).get(from_iso, []))
+
+    async def fetch_oldest():
+        return oldest
+
+    poller.fetch_logs = fetch_logs  # type: ignore[method-assign]
+    poller.fetch_oldest_timestamp = fetch_oldest  # type: ignore[method-assign]
+    return poller, pub, calls
+
+
+async def test_stale_watermark_is_skipped_forward_and_rereads(capsys):
+    """Watermark behind the retention floor → warn, then re-read from the floor."""
+    stale, floor = _ts(100), _ts(40)  # watermark 100s ago, floor only 40s ago
+    recovered = _raw_dict("ERROR", "boom", "L1")
+    poller, pub, calls = _poller_with_retention(
+        oldest=floor, windows={floor: [recovered]}
+    )
+    await poller._write_watermark(stale)
+
+    n = await poller.poll_once()
+
+    # Re-read from the retention floor, so the cycle still does useful work.
+    assert calls == [stale, floor]
+    assert n == 1 and [l.log_id for l in pub.raw] == ["L1"]
+    # And the loss is LOUD, not silent.
+    out = capsys.readouterr().out
+    assert "WARNING" in out and floor in out
+
+
+async def test_empty_window_within_retention_is_not_treated_as_loss(capsys):
+    """A genuinely quiet period must not warn or re-read."""
+    watermark, floor = _ts(30), _ts(100)  # floor is OLDER → nothing was lost
+    poller, pub, calls = _poller_with_retention(oldest=floor, windows={})
+    await poller._write_watermark(watermark)
+
+    n = await poller.poll_once()
+
+    assert n == 0
+    assert calls == [watermark]  # no second fetch
+    assert "WARNING" not in capsys.readouterr().out
+
+
+async def test_retention_check_is_skipped_when_the_window_had_logs():
+    """The healthy path must not pay for an extra /health request."""
+    # Bind once: _ts() is relative to now, so recomputing it would not match.
+    watermark = _ts(30)
+    poller, pub, calls = _poller_with_retention(
+        oldest=_ts(100), windows={watermark: [_raw_dict("INFO", "ok", "L1")]}
+    )
+    await poller._write_watermark(watermark)
+
+    checked = []
+
+    async def spy():
+        checked.append(True)
+        return _ts(100)
+
+    poller.fetch_oldest_timestamp = spy  # type: ignore[method-assign]
+
+    await poller.poll_once()
+    assert checked == []          # never consulted
+    assert calls == [watermark]
+
+
+async def test_cold_start_does_not_report_loss(capsys):
+    """No watermark yet → nothing can have been lost."""
+    poller, pub, calls = _poller_with_retention(oldest=_ts(50), windows={})
+    n = await poller.poll_once()   # no watermark written
+    assert n == 0
+    assert "WARNING" not in capsys.readouterr().out
+
+
+async def test_unavailable_retention_floor_degrades_silently(capsys):
+    """An older collector (no oldest_timestamp) must poll exactly as before."""
+    watermark = _ts(30)
+    poller, pub, calls = _poller_with_retention(oldest=None, windows={})
+    await poller._write_watermark(watermark)
+    n = await poller.poll_once()
+    assert n == 0
+    assert calls == [watermark]    # no skip attempted
+    assert "WARNING" not in capsys.readouterr().out
+
+
+async def test_fetch_oldest_timestamp_never_raises():
+    """It is a diagnostic: any transport/shape failure returns None."""
+    redis = FakeRedis()
+    deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+    poller = Poller(
+        redis=redis, publisher=FakePublisher(), pipeline_deps=deps, http=object()
+    )
+
+    class Boom:
+        async def get(self, *a, **k):
+            raise RuntimeError("collector down")
+
+    poller._http = Boom()  # type: ignore[assignment]
+    assert await poller.fetch_oldest_timestamp() is None
+
+
 # --- alert content: fallback when LLM down -----------------------------------
 async def test_alert_is_fallback_when_llm_down():
     poller, pub = _make_poller([_raw_dict("ERROR", "boom", "L1")])  # explainer=None
@@ -875,6 +1013,104 @@ def test_summarize_journey_falls_back_to_template_when_no_model():
     assert "ENRICHMENT_FAILED" in body["summary"]
     assert "ORD-6008" in body["summary"]
     assert "cc-spt-service" in body["summary"]  # the app_name from the logs
+
+
+def _summary_request_unrecognized() -> dict:
+    req = _summary_request()
+    req["outcome"] = "UNRECOGNIZED_FAILURE"
+    req["logs"] = [
+        _log(level="INFO", message="Get order by Order Number:ORD-6015").model_dump(mode="json"),
+        _log(level="ERROR", message="ConnectionPoolExhaustedError: settings cache unavailable").model_dump(mode="json"),
+    ]
+    return req
+
+
+def test_summarize_journey_returns_suggested_label_for_unrecognized_failure():
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake('{"summary": "The order stalled at settings enrichment.", '
+                    '"label": "Settings cache connection pool exhausted"}'),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["summary"] == "The order stalled at settings enrichment."
+    assert body["suggested_label"] == "Settings cache connection pool exhausted"
+
+
+def test_summarize_journey_no_label_for_recognized_outcomes():
+    # Every existing outcome (named subtypes, SUCCESS, plain TIMED_OUT) must
+    # never get a label, regardless of what the model would say — the branch
+    # only exists for UNRECOGNIZED_FAILURE.
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("Order ORD-6008 was created then failed at SPT enrichment."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())  # outcome=ENRICHMENT_FAILED
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("suggested_label") is None
+    assert "SPT" in body["summary"]  # existing behavior, byte-for-byte unchanged
+
+
+def test_summarize_journey_label_falls_back_to_none_when_breaker_open():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "fallback"
+    assert body.get("suggested_label") is None
+    assert "UNRECOGNIZED_FAILURE" in body["summary"]  # existing template, unchanged
+
+
+def test_summarize_journey_degrades_gracefully_on_malformed_json_label_reply():
+    # The model ignores the JSON instruction and replies with plain prose —
+    # must still produce a usable summary, just no label. Never raises.
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("The settings cache could not be reached."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["summary"] == "The settings cache could not be reached."
+    assert body.get("suggested_label") is None
+
+
+from ai_service.nodes import SummaryResult, _parse_summary_with_label  # noqa: E402
+
+
+def test_parse_summary_with_label_happy_path():
+    result = _parse_summary_with_label(
+        '{"summary": "Settings cache was unreachable.", "label": "Settings cache down"}'
+    )
+    assert result == SummaryResult(summary="Settings cache was unreachable.", suggested_label="Settings cache down")
+
+
+def test_parse_summary_with_label_tolerates_surrounding_prose():
+    result = _parse_summary_with_label(
+        'Sure, here you go:\n{"summary": "It failed.", "label": "X"}\nHope that helps!'
+    )
+    assert result.summary == "It failed."
+    assert result.suggested_label == "X"
+
+
+def test_parse_summary_with_label_degrades_when_not_json():
+    result = _parse_summary_with_label("It just failed, no idea why.")
+    assert result.summary == "It just failed, no idea why."
+    assert result.suggested_label is None
+
+
+def test_parse_summary_with_label_degrades_when_label_key_missing():
+    result = _parse_summary_with_label('{"summary": "It failed."}')
+    assert result.summary == "It failed."
+    assert result.suggested_label is None
 
 
 def test_template_summary_is_deterministic_and_llm_free():

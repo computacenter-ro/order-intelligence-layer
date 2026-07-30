@@ -66,7 +66,9 @@ def _utcnow() -> datetime:
 
 SUCCESS = "SUCCESS"
 TIMED_OUT = "TIMED_OUT"
-FAILED = "FAILED"  # generic fallback subtype for an unclassified fatal abort
+UNRECOGNIZED_FAILURE = "UNRECOGNIZED_FAILURE"  # a real ERROR occurred but no
+# _FAILURE_RULES marker matched it — distinct from TIMED_OUT (which means no
+# ERROR signal was ever seen at all). See _state()'s stall branch below.
 
 INBOUND_TRANSFORM_FAILED = "INBOUND_TRANSFORM_FAILED"
 ORDER_CREATION_FAILED = "ORDER_CREATION_FAILED"
@@ -181,6 +183,20 @@ class Completion:
     outcome: str  # subtype (== status value for SUCCESS / TIMED_OUT)
 
 
+@dataclass
+class SummaryResult:
+    """What the injected ``summarizer`` callable returns: the journey summary
+    text, plus (only for the UNRECOGNIZED_FAILURE outcome) a suggested
+    incident-title label the AI service derived from the causal line. Both
+    fields are ``None`` when the AI service is unreachable or the LLM is
+    down — the callable itself never raises, mirroring every other
+    best-effort integration point in this codebase.
+    """
+
+    summary: str | None
+    suggested_label: str | None = None
+
+
 # --- Incremental assembly + persistence --------------------------------------
 
 
@@ -259,6 +275,8 @@ class JourneyAssembler:
         if outcome is not None:
             return status_for(outcome), outcome
         if journey.last_ts is not None and is_stalled(journey.last_ts, now, self._timeout):
+            if any(log.level == "ERROR" for log in journey.logs):
+                return JourneyStatus.FAILED, UNRECOGNIZED_FAILURE
             return JourneyStatus.TIMED_OUT, TIMED_OUT
         return JourneyStatus.IN_PROGRESS, None
 
@@ -282,8 +300,12 @@ class JourneyAssembler:
 
         When ``on_event`` is given (else no-op), after a successful commit it
         emits — for every journey this chunk grew but did not finish — a
-        ``journey.updated`` event, and a ``journey.completed`` event for each
-        journey that reached a terminal state. Emitting after commit means we
+        ``journey.updated`` event, a ``journey.completed`` event for each
+        journey that reached a terminal state, and an ``incident.updated``
+        event for each incident that just absorbed a late-arriving orphan
+        alert (backend/linking.py's backfill_journey_alerts — a journey can
+        already have an incident here if it completed and clustered before
+        this batch of orphan alerts caught up). Emitting after commit means we
         never broadcast state that failed to persist.
         """
         new_events = self.add(logs)
@@ -291,7 +313,7 @@ class JourneyAssembler:
         # Parents before children: the journeys rows must exist before
         # journey_events (FK journey_events.journey_id -> journeys.journey_id),
         # otherwise the event insert raises a ForeignKeyViolationError.
-        await self._upsert_journeys(session, touched)
+        updated_incidents = await self._upsert_journeys(session, touched)
         await self._persist_events(session, new_events)
         completions = self.evaluate(now)
         summaries = await self._summaries_for(completions)
@@ -310,9 +332,14 @@ class JourneyAssembler:
             for completion in completions:
                 await on_event(
                     _journey_completed_event(
-                        completion, summaries.get(completion.journey_id)
+                        completion, _summary_text(summaries.get(completion.journey_id))
                     )
                 )
+            if updated_incidents:
+                from backend.incidents import _incident_updated_event
+
+                for incident in updated_incidents:
+                    await on_event(_incident_updated_event(incident))
         return completions
 
     async def sweep_stalled(
@@ -339,7 +366,7 @@ class JourneyAssembler:
             for completion in completions:
                 await on_event(
                     _journey_completed_event(
-                        completion, summaries.get(completion.journey_id)
+                        completion, _summary_text(summaries.get(completion.journey_id))
                     )
                 )
         return completions
@@ -365,15 +392,19 @@ class JourneyAssembler:
         await session.execute(stmt)
 
     @staticmethod
-    async def _upsert_journeys(session, journeys) -> None:
+    async def _upsert_journeys(session, journeys) -> list:
         """Insert in-progress journey rows; on re-touch, refresh span + aliases.
 
         Never overwrites ``status`` / ``outcome`` here — those are set at insert
         (IN_PROGRESS) and by :meth:`_finalize_journey`, so a late log arriving
         for an already-finalized journey cannot revert it to in-progress.
+
+        Returns the ``Incident`` rows that just absorbed a backfilled orphan
+        alert (see :func:`backend.linking.backfill_journey_alerts`), for the
+        caller to broadcast ``incident.updated`` for each after its own commit.
         """
         if not journeys:
-            return
+            return []
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from backend.db import Journey
 
@@ -405,11 +436,11 @@ class JourneyAssembler:
         # "fills in later").
         from backend.linking import backfill_journey_alerts
 
-        await backfill_journey_alerts(session, journeys)
+        return await backfill_journey_alerts(session, journeys)
 
     @staticmethod
     async def _finalize_journey(
-        session, completion: Completion, summary: str | None = None
+        session, completion: Completion, summary_result: "SummaryResult | None" = None
     ) -> None:
         from sqlalchemy import update
         from backend.db import Journey
@@ -424,10 +455,13 @@ class JourneyAssembler:
             "order_id": journey.order_id,
             "cart_header_id": journey.cart_header_id,
         }
-        # Only overwrite summary when we actually got one — a failed/absent
-        # summary must not clobber a summary a prior finalize may have stored.
-        if summary is not None:
-            values["summary"] = summary
+        # Only overwrite summary/label when we actually got one — a failed/absent
+        # result must not clobber a value a prior finalize may have stored.
+        if summary_result is not None:
+            if summary_result.summary is not None:
+                values["summary"] = summary_result.summary
+            if summary_result.suggested_label is not None:
+                values["suggested_failure_label"] = summary_result.suggested_label
         stmt = (
             update(Journey)
             .where(Journey.journey_id == completion.journey_id)
@@ -435,12 +469,12 @@ class JourneyAssembler:
         )
         await session.execute(stmt)
 
-    async def _summaries_for(self, completions) -> dict[str, str | None]:
+    async def _summaries_for(self, completions) -> dict[str, "SummaryResult"]:
         """Fetch summaries for completed journeys (empty if no summarizer set).
 
-        Best-effort: the summarizer itself never raises (returns None on any
-        failure), so a slow/down AI service degrades to summary=None without
-        breaking completion.
+        Best-effort: the summarizer itself never raises (returns a
+        SummaryResult with both fields None on any failure), so a slow/down AI
+        service degrades without breaking completion.
 
         Also pushes each completed journey to the retrieval index, since this is
         the one place that has both the completion and its summary. Gated on
@@ -449,12 +483,12 @@ class JourneyAssembler:
         """
         if self._summarizer is None or not completions:
             return {}
-        summaries: dict[str, str | None] = {}
+        results: dict[str, SummaryResult] = {}
         for completion in completions:
-            summary = await self._summarizer(completion)
-            summaries[completion.journey_id] = summary
-            await self._index_journey_safely(completion, summary)
-        return summaries
+            result = await self._summarizer(completion)
+            results[completion.journey_id] = result
+            await self._index_journey_safely(completion, result.summary)
+        return results
 
     async def _index_journey_safely(self, completion: Completion, summary: str | None) -> None:
         """Push a completed journey to the retrieval index; swallow everything.
@@ -477,6 +511,10 @@ class JourneyAssembler:
 
 def _as_list(logs) -> list[LogLine]:
     return list(logs)
+
+
+def _summary_text(result: "SummaryResult | None") -> str | None:
+    return result.summary if result is not None else None
 
 
 def _distinct_journeys(new_events) -> list[StitchedJourney]:

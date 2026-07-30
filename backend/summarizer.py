@@ -21,7 +21,7 @@ import os
 
 import httpx
 
-from backend.journeys import Completion
+from backend.journeys import Completion, SummaryResult
 
 # Default matches the docker-compose service name; localhost for native dev.
 AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://localhost:8100").rstrip("/")
@@ -47,13 +47,14 @@ def build_request(completion: Completion) -> dict:
 
 async def fetch_summary(
     completion: Completion, *, client: httpx.AsyncClient | None = None
-) -> str | None:
-    """POST the completed journey to the AI service; return its summary text.
+) -> SummaryResult:
+    """POST the completed journey to the AI service; return its SummaryResult.
 
-    Returns ``None`` on any failure (unreachable, timeout, non-2xx, malformed
-    body) — a summary is best-effort and must never break journey completion.
-    ``client`` may be injected (tests / connection reuse); otherwise a
-    short-lived client is used.
+    Never raises and always returns a SummaryResult (never bare None): any
+    failure (unreachable, timeout, non-2xx, malformed body) degrades to
+    ``SummaryResult(summary=None, suggested_label=None)`` — best-effort, must
+    never break journey completion. ``client`` may be injected (tests /
+    connection reuse); otherwise a short-lived client is used.
     """
     body = build_request(completion)
     url = f"{AI_SERVICE_URL}/summarize-journey"
@@ -64,12 +65,14 @@ async def fetch_summary(
             async with httpx.AsyncClient(timeout=SUMMARY_TIMEOUT) as http:
                 resp = await http.post(url, json=body)
         resp.raise_for_status()
-        summary = resp.json().get("summary")
-        return summary or None
+        payload = resp.json()
+        summary = payload.get("summary") or None
+        suggested_label = payload.get("suggested_label") or None
+        return SummaryResult(summary=summary, suggested_label=suggested_label)
     except Exception as exc:  # noqa: BLE001 — best-effort; never break completion
         print(
             f"[summarizer] journey {completion.journey_id} summary unavailable "
             f"({type(exc).__name__}: {exc})",
             flush=True,
         )
-        return None
+        return SummaryResult(summary=None, suggested_label=None)

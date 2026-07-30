@@ -3,6 +3,7 @@ import type {
   ChatFeedbackResponse,
   ChatRequest,
   ChatResponse,
+  Department,
   Incident,
   IncidentDetail,
   IncidentStatus,
@@ -73,6 +74,27 @@ export async function login(username: string, password: string): Promise<Current
 /** Clear the session cookie. */
 export async function logout(): Promise<void> {
   await fetch(`${API_URL}/auth/logout`, { method: "POST", credentials: "include" });
+}
+
+/** Which sign-in methods the backend offers (GET /auth/config, unauthenticated). */
+export interface AuthConfig {
+  entra_enabled: boolean;
+  password_login: boolean;
+}
+
+export async function fetchAuthConfig(): Promise<AuthConfig> {
+  const res = await fetch(`${API_URL}/auth/config`, { credentials: "include" });
+  if (!res.ok) throw new Error(`/auth/config failed: ${res.status}`);
+  return res.json() as Promise<AuthConfig>;
+}
+
+/**
+ * Where the Microsoft sign-in starts. Used as a full-page navigation target, NOT
+ * with fetch: OAuth needs a real top-level navigation, and an XHR could neither
+ * pass CORS nor render Microsoft's sign-in page.
+ */
+export function entraLoginUrl(): string {
+  return `${API_URL}/auth/entra/login`;
 }
 
 export interface AlertsFilter {
@@ -191,6 +213,10 @@ export function fetchJourney(journeyId: string): Promise<Journey> {
 
 export interface IncidentsFilter {
   status?: IncidentStatus;
+  // Multi-valued, same convention as AlertsFilter.department: sent as
+  // repeated params (?department=backend&department=devops), OR'd server
+  // side. [] and undefined both mean "no filter".
+  department?: Department[];
   limit?: number;
   cursor?: string;
 }
@@ -198,6 +224,7 @@ export interface IncidentsFilter {
 export function fetchIncidents(filter: IncidentsFilter = {}): Promise<Page<Incident>> {
   const params = new URLSearchParams();
   if (filter.status) params.set("status", filter.status);
+  (filter.department ?? []).forEach((v) => params.append("department", v));
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.cursor) params.set("cursor", filter.cursor);
   const query = params.toString();

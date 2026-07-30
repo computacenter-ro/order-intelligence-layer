@@ -45,6 +45,9 @@ Endpoints:
   ``backend/stats.py`` (pure + unit-tested); this route only executes them.
 * ``POST /chat`` — the authenticated front door for the AI service's grounded
   chat (:8100 is loopback + unauthenticated by design). Forwards to its
+  ``/chat`` and decorates each cited source with a dashboard link. An optional
+  ``context: {kind, id}`` anchors the question to one ``alert`` / ``journey`` /
+  ``incident``, whose text is read from Postgres and prepended to the query.
   ``/chat`` and decorates each cited source with a dashboard link.
 * ``GET /llm-stats`` — the same authenticated front door for the AI service's
   per-model LangSmith stats. Forwards to its ``/llm-stats`` and degrades to an
@@ -251,11 +254,20 @@ def build_journeys_query(status: str | None) -> Select:
     return stmt
 
 
-def build_incidents_query(status: str | None) -> Select:
-    """Select incidents, optionally filtered by ``status`` ('open'/'resolved')."""
+def build_incidents_query(status: str | None, department: list[str] | None = None) -> Select:
+    """Select incidents, optionally filtered by ``status`` ('open'/'resolved')
+    and/or ``department``.
+
+    ``department`` is multi-valued, same convention as the alerts filters: a
+    non-empty list becomes an ``IN (...)`` (OR within the category); ``None``
+    and an empty list both mean "no filter" (an ``IN ()`` would instead match
+    nothing and empty the page).
+    """
     stmt = select(Incident)
     if status is not None:
         stmt = stmt.where(Incident.status == status)
+    if department:
+        stmt = stmt.where(Incident.department.in_(department))
     return stmt
 
 
@@ -485,13 +497,14 @@ async def get_journey(
 @router.get("/incidents", response_model=Page[IncidentOut])
 async def list_incidents(
     status: Annotated[Literal["open", "resolved"] | None, Query()] = None,
+    department: Annotated[list[Department] | None, Query()] = None,
     limit: Annotated[int, Query()] = 16,
     cursor: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> Page[IncidentOut]:
     limit = max(1, min(limit, 100))
     stmt = apply_keyset(
-        build_incidents_query(status),
+        build_incidents_query(status, department),
         Incident.last_ts,
         Incident.incident_id,
         cursor=cursor,
@@ -647,6 +660,145 @@ def format_context_events(events: list, tz: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# How many affected orders to include in an incident's scoped context.
+#
+# An INFRA-classed incident can absorb many orders (journey_count grows as more
+# hit the same failure), so this is bounded like _CONTEXT_EVENT_CAP is. One
+# representative line per order rather than every alert: breadth is what an
+# incident question needs, and the per-journey detail is what the JOURNEY scope
+# already provides.
+_CONTEXT_ORDER_CAP = 12
+
+
+def _incident_order_groups(alerts: list, journeys: list) -> list[dict]:
+    """One entry per affected order, freshest first (pure).
+
+    Mirrors ``dashboard/lib/incidents.ts::groupAlertsByOrder`` deliberately, so
+    the assistant describes the same units the agent sees on screen: group on
+    ``journey_id``, label from the representative alert's
+    ``order_id``/``event_id``, and pick the representative as the LAST ERROR
+    (else the last alert) — ``_pickOutcome``'s rule.
+
+    Ordering is by the representative alert's ``emitted_at`` descending. That is
+    PROCESSING time, not log time, so it is only ever used to choose *which*
+    orders survive the cap — never presented to the model as chronology.
+    """
+    outcomes = {j.journey_id: j.outcome for j in journeys}
+
+    grouped: dict[str, list] = {}
+    orphans: list = []
+    for alert in alerts:
+        if alert.journey_id is None:
+            orphans.append(alert)          # clustered before it was linked
+            continue
+        grouped.setdefault(alert.journey_id, []).append(alert)
+
+    def _representative(group: list):
+        ordered = sorted(group, key=lambda a: a.emitted_at)
+        for alert in reversed(ordered):
+            if alert.level == "ERROR":
+                return alert
+        return ordered[-1]
+
+    groups: list[dict] = []
+    for journey_id, group in grouped.items():
+        alert = _representative(group)
+        groups.append({
+            "label": alert.order_id or alert.event_id or alert.alert_id,
+            "outcome": outcomes.get(journey_id),
+            "alert": alert,
+        })
+    for alert in orphans:
+        groups.append({
+            "label": alert.order_id or alert.event_id or alert.alert_id,
+            "outcome": None,
+            "alert": alert,
+        })
+
+    groups.sort(key=lambda g: g["alert"].emitted_at, reverse=True)
+    return groups
+
+
+def _format_span(seconds: float) -> str:
+    """``466`` -> ``"7m 46s"``. Precomputed because date arithmetic is exactly
+    what an LLM gets wrong, and "how long has this been going on?" is one of the
+    most natural questions to ask an incident."""
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def format_incident_context(
+    incident, alerts: list, journeys: list, tz: str | None = None
+) -> str:
+    """The text of an incident scope (pure, testable).
+
+    Three rules are load-bearing and each has a test:
+
+    * Counts are ``len()`` of the rows passed in, NEVER
+      ``incident.alert_count`` / ``journey_count`` — those are maintained
+      incrementally and drift as orders join.
+    * ``incident.first_ts`` / ``last_ts`` are NOT emitted at all. They are
+      clustering wall-clock times (``assign_incident`` / ``process_completion``),
+      not failure times, and the model quotes whatever it is given.
+    * The output is not a timeline. ``Alert`` carries no original-log timestamp,
+      and ``emitted_at`` is processing time under concurrent processing, so no
+      ordering between member alerts is implied.
+    """
+    groups = _incident_order_groups(alerts, journeys)
+
+    facts = [f"status={incident.status}"]
+    for key, value in (
+        ("department", incident.department),
+        ("failing_service", incident.failing_service),
+        ("error_token", incident.error_token),
+    ):
+        if value:
+            facts.append(f"{key}={value}")
+    facts.append(
+        f"orders={len(groups)} alerts={len(alerts)} total "
+        f"(one representative line shown per order)"
+    )
+
+    # The REAL failure window: journeys are built from raw log lines, so their
+    # first_ts/last_ts are true log timestamps (the 90s stall arithmetic relies
+    # on that). Omitted entirely when no journey carries one, rather than
+    # rendered as an empty or zero range.
+    starts = [j.first_ts for j in journeys if j.first_ts is not None]
+    ends = [j.last_ts for j in journeys if j.last_ts is not None]
+    if starts and ends:
+        first, last = min(starts), max(ends)
+        facts.append(
+            f"failures from {human_time(first, tz)} to {human_time(last, tz)} "
+            f"(span {_format_span((last - first).total_seconds())})"
+        )
+
+    shown = groups[:_CONTEXT_ORDER_CAP]
+    if len(groups) > len(shown):
+        heading = f"Affected orders ({len(groups)}, showing {len(shown)}):"
+    else:
+        heading = f"Affected orders ({len(groups)}):"
+
+    lines = [f"{incident.title} [{' '.join(facts)}]", "", heading]
+    for group in shown:
+        alert = group["alert"]
+        label = group["label"]
+        if group["outcome"]:
+            label = f"{label} ({group['outcome']})"
+        lines.append(
+            f"  {label} — {alert.level} {alert.app_name} {alert.logger}: "
+            f"{alert.message}"
+        )
+        if alert.explanation:
+            lines.append(f"    {alert.explanation.strip()}")
+    return "\n".join(lines)
+
+
 async def _context_text(
     session: AsyncSession, kind: str, record_id: str, tz: str | None = None
 ) -> str | None:
@@ -722,6 +874,40 @@ async def _context_text(
                 f"WARN/ERROR plus first and last):\n{format_context_events(selected, tz)}"
             )
         return "\n".join(blocks)
+
+    if kind == "incident":
+        row = (
+            await session.execute(
+                select(Incident).where(Incident.incident_id == record_id)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        # Membership is read live from Postgres rather than from the retrieval
+        # index: the index has no notion of incidents at all (an alert is indexed
+        # at persist time, before its journey completes and long before
+        # clustering runs), and only the DB can give the EXACT, CURRENT member
+        # set instead of a top-k semantic sample.
+        alerts = (
+            (
+                await session.execute(
+                    select(Alert).where(Alert.incident_id == record_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        journeys = (
+            (
+                await session.execute(
+                    select(Journey).where(Journey.incident_id == record_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return format_incident_context(row, list(alerts), list(journeys), tz)
+
     return None
 
 

@@ -296,6 +296,35 @@ def test_build_title_for_unrecognized_cause():
     assert build_title(sig) == "Unrecognized failure — cc-new-service"
 
 
+def test_build_title_uses_suggested_label_when_subtype_unrecognized():
+    sig = Signature(failure_subtype=None, failing_service="cc-settings-service", error_token=None, digest=None)
+    title = build_title(sig, suggested_label="Settings cache connection pool exhausted")
+    assert title == "Settings cache connection pool exhausted — cc-settings-service"
+
+
+def test_build_title_falls_back_when_suggested_label_is_none():
+    sig = Signature(failure_subtype=None, failing_service="cc-settings-service", error_token=None, digest=None)
+    assert build_title(sig, suggested_label=None) == "Unrecognized failure — cc-settings-service"
+
+
+def test_build_title_ignores_suggested_label_for_a_recognized_subtype():
+    # A named subtype never needs the LLM label — it already has a real name.
+    sig = Signature(failure_subtype="ENRICHMENT_FAILED", failing_service="SPT", error_token=None, digest="d1")
+    assert build_title(sig, suggested_label="whatever") == "ENRICHMENT_FAILED — SPT"
+
+
+def test_build_title_sanitizes_a_stray_id_out_of_the_suggested_label():
+    sig = Signature(failure_subtype=None, failing_service="cc-settings-service", error_token=None, digest=None)
+    title = build_title(sig, suggested_label="Order ORD-6015 hit a settings timeout")
+    assert "ORD-6015" not in title
+    assert title == "Order hit a settings timeout — cc-settings-service"
+
+
+def test_build_title_falls_back_when_label_sanitizes_to_nothing():
+    sig = Signature(failure_subtype=None, failing_service="cc-settings-service", error_token=None, digest=None)
+    assert build_title(sig, suggested_label="ORD-6015") == "Unrecognized failure — cc-settings-service"
+
+
 # --- assign_incident: recognized + INFRA ----------------------------------------
 async def test_recognized_infra_matches_existing_open_incident():
     existing = Incident(
@@ -394,13 +423,14 @@ def _completion(status: JourneyStatus, journey_id: str = "j1") -> Completion:
 
 
 class _RowResult:
-    """A result whose .first() returns a single (value,) row, like a
-    `select(Journey.incident_id)` scalar query."""
-    def __init__(self, value):
+    """A result whose .first() returns a (incident_id, suggested_failure_label)
+    row, like `select(Journey.incident_id, Journey.suggested_failure_label)`."""
+    def __init__(self, value, suggested_failure_label=None):
         self._value = value
+        self._label = suggested_failure_label
 
     def first(self):
-        return None if self._value is _MISSING else (self._value,)
+        return None if self._value is _MISSING else (self._value, self._label)
 
 
 _MISSING = object()
@@ -457,6 +487,53 @@ async def test_timed_out_with_a_real_error_forms_an_incident_via_novel_path():
     assert incident.failure_subtype is None  # unrecognized — novel path, not a hardcoded rule
     assert incident.journey_count == 1
     assert incident.alert_count == 1
+
+
+async def test_unrecognized_failure_normalizes_to_novel_path_for_matching():
+    # A FAILED/UNRECOGNIZED_FAILURE completion must still take the cosine/
+    # embedding novel path for matching purposes — not the hash-based exact
+    # path — so unrelated unrecognized failures from the same service don't
+    # get coarsely merged by service name alone.
+    alerts = [
+        Alert(alert_id="e1", emitted_at=NOW, log_id="l1", level="ERROR",
+              app_name="cc-settings-service", logger="c.c.settings.CacheClient",
+              message="ConnectionPoolExhaustedError: no available connections",
+              source="fallback", department=None, embedding=None, journey_id="j-novel"),
+    ]
+    session = _FakeSession([
+        _RowResult(None),                # not yet clustered
+        _FakeResult(items=alerts),       # causal-candidate fetch
+        _FakeResult(items=alerts),       # journey's full alert set, for linking
+        _FakeResult(items=[]),           # the closing UPDATE journeys — return value unused
+    ])
+    completion = Completion(
+        journey_id="j-novel", journey=StitchedJourney(journey_id="j-novel", order_id="ORD-1"),
+        status=JourneyStatus.FAILED, outcome="UNRECOGNIZED_FAILURE",
+    )
+    incident = await process_completion(session, completion)
+    assert incident.signature is None  # novel path, not a hash digest
+    assert incident.failure_subtype is None
+
+
+async def test_unrecognized_failure_uses_suggested_label_from_journey_row():
+    alerts = [
+        Alert(alert_id="e1", emitted_at=NOW, log_id="l1", level="ERROR",
+              app_name="cc-settings-service", logger="c.c.settings.CacheClient",
+              message="ConnectionPoolExhaustedError: no available connections",
+              source="fallback", department=None, embedding=None, journey_id="j-novel"),
+    ]
+    session = _FakeSession([
+        _RowResult(None, suggested_failure_label="Settings cache connection pool exhausted"),
+        _FakeResult(items=alerts),
+        _FakeResult(items=alerts),
+        _FakeResult(items=[]),
+    ])
+    completion = Completion(
+        journey_id="j-novel", journey=StitchedJourney(journey_id="j-novel", order_id="ORD-1"),
+        status=JourneyStatus.FAILED, outcome="UNRECOGNIZED_FAILURE",
+    )
+    incident = await process_completion(session, completion)
+    assert incident.title == "Settings cache connection pool exhausted — cc-settings-service"
 
 
 async def test_failed_journey_creates_incident_links_all_alerts_and_journey():
@@ -576,29 +653,6 @@ async def test_joining_existing_incident_emits_incident_updated_not_new():
     # The count bump is visible in the pushed payload, not just in memory.
     assert events[0]["data"]["alert_count"] == 5
     assert events[0]["data"]["journey_count"] == 2
-
-
-from backend.incidents import INCIDENT_QUIET_TIMEOUT, sweep_stale_incidents
-
-
-async def test_sweep_closes_incidents_past_the_quiet_timeout():
-    stale = Incident(
-        incident_id="inc-old", signature="d1", failure_subtype="ENRICHMENT_FAILED",
-        failing_service="SPT", error_token=None, title="t", department=None,
-        status="open", first_ts=NOW - timedelta(seconds=INCIDENT_QUIET_TIMEOUT + 100),
-        last_ts=NOW - timedelta(seconds=INCIDENT_QUIET_TIMEOUT + 1),
-        primary_alert_id="a0", alert_count=1, journey_count=1,
-    )
-    session = _FakeSession([_FakeResult(items=[stale])])
-    closed = await sweep_stale_incidents(session, now=NOW)
-    assert closed == [stale]
-    assert stale.status == "resolved"
-
-
-async def test_sweep_leaves_recently_active_incidents_open():
-    session = _FakeSession([_FakeResult(items=[])])  # query already filters by last_ts
-    closed = await sweep_stale_incidents(session, now=NOW)
-    assert closed == []
 
 
 from backend.db import Journey

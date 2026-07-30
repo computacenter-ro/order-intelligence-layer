@@ -1386,6 +1386,23 @@ def test_build_incidents_query_filters_by_status():
     assert "status" in sql.lower()
 
 
+def test_build_incidents_query_filters_by_department():
+    stmt = build_incidents_query(None, ["devops", "backend"])
+    sql = _compiled(stmt)
+    assert "department" in sql.lower()
+    assert "IN" in sql.upper()
+
+
+def test_build_incidents_query_empty_department_list_is_no_filter():
+    # [] must mean "no filter", same convention as the alerts department
+    # filter — an IN () would instead match nothing and empty the page.
+    # (The `department` column always appears in the SELECT list regardless;
+    # what matters is that no WHERE clause is added for it.)
+    stmt = build_incidents_query(None, [])
+    sql = _compiled(stmt)
+    assert "WHERE" not in sql.upper()
+
+
 def _incident(**over) -> Incident:
     base = dict(
         incident_id="inc-1", signature="d1", failure_subtype="ENRICHMENT_FAILED",
@@ -1397,6 +1414,14 @@ def _incident(**over) -> Incident:
     )
     base.update(over)
     return Incident(**base)
+
+
+def test_list_incidents_accepts_repeated_department_params():
+    client = TestClient(app)
+    _use([_FakeResult(items=[_incident(department="devops")])])
+    resp = client.get("/incidents", params=[("department", "devops"), ("department", "backend")])
+    assert resp.status_code == 200
+    assert resp.json()["items"][0]["department"] == "devops"
 
 
 def test_list_incidents_returns_page():

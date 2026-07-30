@@ -13,6 +13,7 @@ import {
   GaugeIcon,
   MapTrifoldIcon,
   SignOutIcon,
+  TreeStructureIcon,
   WarningIcon,
 } from "@phosphor-icons/react";
 import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
@@ -20,6 +21,7 @@ import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-m
 import { ChatPanel } from "@/components/chat/ChatPanel";
 import { useAuth } from "@/lib/auth";
 import { ChatProvider, useChat } from "@/lib/chat";
+import { displayName } from "@/lib/format";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
 
@@ -104,6 +106,14 @@ function AppShellInner({ children }: AppShellProps) {
       // underneath it.
       active: false,
     },
+    // A normal route, unlike the Assistant above it — so it takes a real href
+    // and highlights from the pathname like every other item.
+    {
+      label: "Architecture",
+      href: "/architecture",
+      icon: <TreeStructureIcon size={20} />,
+      active: pathname === "/architecture",
+    },
   ];
 
   const handleItemClick = (item: BaseNavItem) => {
@@ -138,10 +148,13 @@ function AppShellInner({ children }: AppShellProps) {
         fontWeight: 500,
         cursor: "pointer",
       }}
+      // The full identity stays here and in the title: the row shows a name, but
+      // "which account am I signed in as" must still be answerable.
       aria-label={`Sign out${user ? ` (${user.username})` : ""}`}
+      title={user?.username}
     >
       <SignOutIcon size={20} />
-      <span>Sign Out{user ? ` · ${user.username}` : ""}</span>
+      <span>Sign Out{user ? ` · ${displayName(user.username)}` : ""}</span>
     </button>
   );
 

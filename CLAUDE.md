@@ -64,7 +64,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
 │   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
 │   │   dump_backend.py           # dev harness: dump backend DB state to JSON
-│   └── data/                     # reference fixtures (mock-order-flows-v2.json / -v3.json)
+│   └── data/                     # reference fixtures (v6 = current; v2..v5 kept for history)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 │   ├── semcache.py               # semantic cache (normalize + embed + LRU) — skips LLM on repeat log types
@@ -92,12 +92,25 @@ A microservice order pipeline. One order's path in the real system:
    order** (persists cart header to BM DB, generates the order number), and
    publishes a **creation response** to `order.response.queue`, which inbound
    reads (→ *bridge event*, see Correlation Model).
-4. cc-order-engine then enriches the order via HTTP/Feign calls:
-   **SPT** (pricing/price lists), **RSM** (rebates/PVC), **SOLR** (product
-   search), **Settings** (margin thresholds, SQL-backed, pushed from
-   Salesforce), **JAM** (user auth/privileges → JWT), **Checker** (margin
-   check — can block the order), **Avalara** (US ship-to address verification,
-   US orders only).
+4. cc-order-engine then enriches the order via HTTP/Feign calls, in **this
+   exact order** (`ENRICH_SATELLITES` in `shared/scenarios.py` — ground truth):
+
+   ```
+   Settings → SPT → RSM → SOLR → JAM → Checker → Avalara (US only, last)
+   ```
+
+   **Settings is FIRST**: the engine reads the account's margin thresholds and
+   settings before it prices anything. Then **SPT** (pricing/price lists),
+   **RSM** (rebates/PVC), **SOLR** (product search / id resolution), **JAM**
+   (user auth/privileges → JWT), **Checker** (margin check — can block the
+   order), and finally **Avalara** (US ship-to address verification, **US orders
+   only**, the last enrichment step before dispatch).
+
+   All seven are **standalone services with their own emitters** and their own
+   `serve` block. SOLR and Avalara used to be folded in elsewhere (SOLR inside
+   the order engine, Avalara inside cc-validator-service); they are now
+   first-class, and the validator no longer emits Avalara lines, so the ship-to
+   verification appears exactly once.
 5. **cc-validator-service** runs validation strategies; then RabbitMQ
    `order.outbound.queue` → **cc-outbound-osw** submits to SAP fulfilment
    (RFC) → **cc-track-trace** registers the order for tracking
@@ -218,8 +231,13 @@ never crosses journeys, because that line already belongs to exactly one).
 
 Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
 NOT stitch — it processes individual logs. The reference fixture reflecting the
-honest bridge is **`pipeline/data/mock-order-flows-v3.json`** (v2 retained for
-history).
+honest bridge is **`pipeline/data/mock-order-flows-v6.json`** — the current
+reference fixture, and the one the tests read. It is **captured from the
+emitters** (never hand-written), so it always reflects what the services
+actually produce: the Settings-first enrichment order, `cc-solr-service` events
+in every flow that reaches SOLR, and `cc-avalara-service` events in the US
+success flow. v2–v5 are retained for history (v5 still shows the older
+SPT-first order and has no SOLR/Avalara events).
 
 ---
 
@@ -236,7 +254,8 @@ tells the next service "your turn to emit", carrying the flow context.
   "flow_id": "internal-uuid",
   "scenario": 6,
   "steps": [["inbound","receive"],["order_engine","create"],["inbound","bridge"],
-            ["order_engine","enrich"],["spt","serve"], "..."],
+            ["order_engine","enrich_settings_call"],["settings","serve"],
+            ["order_engine","enrich_settings_resp"],["order_engine","enrich_spt_call"], "..."],
   "cursor": 3,
   "ctx": {
     "eventId": "evt-...",
@@ -261,6 +280,22 @@ tells the next service "your turn to emit", carrying the flow context.
   defines the exact (service, block) sequence, including satellite
   interleaving during enrichment (OE client log → satellite server log → OE
   response log) and early termination on failures.
+  - Satellite ORDER comes from `ENRICH_SATELLITES` =
+    `[SETTINGS, SPT, RSM, SOLR, JAM, CHECKER]`. Nothing hardcodes it: the order
+    engine derives which satellite owns the one-off orchestration preamble from
+    `ENRICH_SATELLITES[0]`, so reordering the list moves the preamble with it.
+  - **AVALARA is deliberately NOT in that list.** It is US-only, so the chain
+    compiler appends its call→serve→resp trio conditionally on
+    `ctx.country == "US"`, after CHECKER, as the last enrichment step. Its
+    order-engine handlers are still registered unconditionally, or a US chain
+    would dispatch to a missing block.
+  - A scenario that fails **at Settings** (15/16/17) now fails at the *first*
+    enrichment step, so its flow contains **no other satellite**. That is
+    correct, not a truncation bug.
+  - SOLR needs no special-casing per scenario: it is included automatically in
+    every flow that reaches it (successes and failures that fail later — JAM,
+    margin, validation, SAP) and absent from those that die earlier (transform,
+    create, Settings failure, SPT-down, RSM).
 - **Timing:** a service sleeps 10–110 ms (random) between its log lines, and
   the baton hop adds natural delay — so timestamps (always real `utcnow`)
   interleave realistically across concurrently running flows.
@@ -287,29 +322,39 @@ tells the next service "your turn to emit", carrying the flow context.
 | order_engine | cc-order-engine | CCECMEWEBT001 | `create` (fills ids; creation-response publish log), `enrich` (client `--->`/`<---` Feign-style logs around each satellite), `dispatch` (publish to order.outbound.queue log). Fail `create`: BM-DB timeout ×3 → failure response (still eventId-only). |
 | spt | cc-spt-service | CCECMSRVT001 | price list lookup logs. Fail `spt`: OE logs timeouts ×3 → `"Order processing aborted"`. |
 | rsm | cc-rsm-service | CCECMSRVT001 | rebates / PVC rates logs. |
-| solr | cc-solr-service | CCECMSRVT001 | product search / id resolution logs. |
+| solr | cc-solr-service | CCECMSRVT001 | `serve`: product search / id resolution logs. Standalone satellite (after RSM, before JAM). Success-path only — no failure variant. |
 | jam | cc-jam-service | CCECMSRVT001 | auth + privileges + JWT logs. Fail `jam`: 403 account disabled → abort. |
 | settings | cc-settings-service | CCECMSRVT002 | margin threshold settings; Hibernate-style SQL log. |
 | checker | cc-checker-service | CCECMSRVT002 | per-line margin logs. Fail `margin`: below threshold → `"blocked by margin check"`. |
-| avalara | cc-avalara-service | CCECMSRVT002 | US address verification (US flows only). |
-| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs. Fail `udf`: missing `costCenter` UDF → 422 → abort. |
+| avalara | cc-avalara-service | CCECMSRVT002 | `serve`: US ship-to address verification (**US flows only**), the last enrichment step, after Checker. Standalone satellite — the validator no longer emits these lines. Success-path only — no failure variant. |
+| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs (the ship-to strategy is one, for every country — the real Avalara call moved to `cc-avalara-service`). Fail `udf`: missing `costCenter` UDF → 422 → abort. |
 | outbound_osw | cc-outbound-osw | CCECMEWEBT002 | SAP submission logs. Fail `sap`: RFC failure ×3 → `"moved to order.outbound.queue_error"`. |
 | track_trace | cc-track-trace | CCECMEWEBT002 | `"Registered order ... for tracking"` (**success terminal**). |
 
 ### The 10 canonical scenarios (`shared/scenarios.py` — ground truth for tests)
 
-| # | Outcome | fail_at | bridge_ids |
-|---|---|---|---|
-| 1 | `SUCCESS` (UK, 3 lines) | — | both |
-| 2 | `SUCCESS` (DE via Salesforce) | — | order |
-| 3 | `SUCCESS` (US, Avalara runs) | — | cart |
-| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) |
-| 5 | `ORDER_CREATION_FAILED` | create | — (never created) |
-| 6 | `MARGIN_CHECK_FAILED` | margin | order |
-| 7 | `VALIDATION_FAILED` | udf | both |
-| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart |
-| 9 | `AUTH_FAILED` (JAM 403) | jam | order |
-| 10 | `SAP_SUBMISSION_FAILED` | sap | both |
+The **Satellites** column is derived, not configured — it is what the chain
+compiler produces. `SOLR` appears in every flow that reaches it; `Avalara` only
+in the US flow that gets all the way to the end of enrichment.
+
+| # | Outcome | fail_at | bridge_ids | Satellites reached |
+|---|---|---|---|---|
+| 1 | `SUCCESS` (UK, 3 lines) | — | both | settings → spt → rsm → **solr** → jam → checker |
+| 2 | `SUCCESS` (DE via Salesforce) | — | order | settings → spt → rsm → **solr** → jam → checker |
+| 3 | `SUCCESS` (US, Avalara runs) | — | cart | settings → spt → rsm → **solr** → jam → checker → **avalara** |
+| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) | — (dies in phase 1) |
+| 5 | `ORDER_CREATION_FAILED` | create | — (never created) | — (dies in phase 1) |
+| 6 | `MARGIN_CHECK_FAILED` | margin | order | settings → spt → rsm → **solr** → jam → checker |
+| 7 | `VALIDATION_FAILED` | udf | both | settings → spt → rsm → **solr** → jam → checker |
+| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart | settings → spt (no solr — dies here) |
+| 9 | `AUTH_FAILED` (JAM 403) | jam | order | settings → spt → rsm → **solr** → jam |
+| 10 | `SAP_SUBMISSION_FAILED` | sap | both | settings → spt → rsm → **solr** → jam → checker |
+
+Scenarios 11–17 (clustering / novel-failure cases, also in `shared/scenarios.py`)
+follow the same rules: 11/12 are SPT-down (settings → spt only, and 12 is US but
+never reaches Avalara — country alone is not sufficient), 13 is a margin failure
+(reaches solr), 14 is SAP-down (reaches solr), and 15/16/17 fail **at Settings**,
+so they reach `settings` and nothing else.
 
 ### Injector (`pipeline/injector/inject.py`)
 Mints **only** `eventId` (= `evt-<uuid>`) — per the correlation model the order
@@ -332,12 +377,40 @@ random orderId collided within a few dozen flows). The 19-digit width is fixed b
 
 FastAPI, in-memory storage. Intentionally dumb — **no journey logic here, ever**.
 
+Storage is a **capped ring buffer** (`deque(maxlen=MOCK_ES_MAX_LOGS)`, default
+200k lines): the store is unbounded by nature and the deployed simulation runs
+continuously (~170k lines/day at 2 flows/30s), so an uncapped list would OOM the
+container on a multi-day run. Evicting the oldest is safe because **nothing at
+runtime reads old logs** — the poller only ever asks for a ~20s window and
+`?id=` is debug-only. Eviction is by **insertion order, not timestamp**:
+concurrent flows interleave, so the newest arrival is not necessarily the latest
+timestamp, and evicting by timestamp could drop a just-arrived log that still
+sits inside the poller's window.
+
 | Endpoint | Behavior |
 |---|---|
 | `POST /logs` | Single log object or array. Validates `log_id` + `timestamp` (422 otherwise). Returns `{"ingested": N}`. |
 | `GET /logs?from=<iso>&to=<iso>` | `from <= timestamp < to`, sorted ascending. |
 | `GET /logs?id=<X>` | Logs where `eventId==X` OR `orderId==X` OR `cartHeaderId==X`, ascending. **Debug/ops tool only** — no runtime component depends on it. |
-| `GET /health` | `{"status":"ok","stored":N}` |
+| `GET /health` | `{"status":"ok","stored":N,"capacity":MOCK_ES_MAX_LOGS,"oldest_timestamp":ISO\|null}` — `stored == capacity` means the buffer is evicting; `oldest_timestamp` is the **retention floor** (the MINIMUM timestamp held, not the left-most entry) |
+
+`GET /logs` with **no params** is capped at `MOCK_ES_QUERY_LIMIT` (default 5000,
+newest first) — an uncapped read serializes the whole store (~90 MB at the 200k
+cap) on an endpoint no runtime component uses. **Windowed (`from`/`to`) and `id`
+queries are never capped**: the poller's correctness depends on receiving its
+entire window, so truncating one would silently drop logs.
+
+**Retention floor and the poller watermark.** This store is in-memory while the
+poller's watermark (`ai:last_to`) persists in Redis, so a collector restart — or
+eviction outrunning the poller — leaves the poller asking for a window whose logs
+are gone. It used to read `[]`, advance the watermark, and lose that data
+silently; the journeys involved were then swept as `TIMED_OUT`, which reads like a
+correlation bug rather than lost input. The poller now compares its watermark
+against `oldest_timestamp` **only when a window came back empty** (so the healthy
+path costs no extra request), logs a WARNING naming the gap, and skips the
+watermark forward to the floor so the cycle resumes on real data. The logs in the
+gap are genuinely unrecoverable — this makes the loss loud, it does not prevent
+it. Expect a burst of `TIMED_OUT` journeys after any collector restart.
 
 Only the AI service's poller reads from it at runtime.
 
@@ -664,8 +737,12 @@ hand-editing tables — see "Gotchas" below.
 ### API
 ```
 POST /auth/login                        # {username,password} -> sets httpOnly session cookie
+                                        # (404 when PASSWORD_LOGIN_ENABLED is off)
 POST /auth/logout                       # clears the cookie
 GET  /auth/me                           # current user (401 if no valid session) — the frontend guard
+GET  /auth/config                       # {entra_enabled, password_login} — what the login screen renders
+GET  /auth/entra/login                  # 307 -> Microsoft (503 when Entra is unconfigured)
+GET  /auth/entra/callback               # code -> session cookie -> 302 to DASHBOARD_URL
 GET  /alerts?since=&department=&source=&cached=  # 🔒 requires session
                                         # cached=true|false is ORTHOGONAL to source:
                                         # every cached alert is source="ai", so it
@@ -716,30 +793,65 @@ executed rows into the response. Nullable group-by columns get an explicit bucke
 (`department` → `"unassigned"`, `severity` → `"unrated"`, `outcome` → `"none"`) so
 every breakdown sums back to its total instead of silently dropping nulls.
 
-### Auth (`auth.py`) — Phase 1: single hardcoded admin
-Two deliberately separated layers so later auth methods are cheap:
-- **Verification** (swappable): `authenticate()` matches ONE env-configured admin
-  (`ADMIN_USERNAME` + bcrypt `ADMIN_PASSWORD_HASH`; dev default `admin`/`admin`).
+### Auth (`auth.py`, `auth_entra.py`)
+Two deliberately separated layers, which is why adding Entra ID cost nothing
+downstream:
+- **Verification** (swappable): **Entra ID** (`auth_entra.py`) is the primary
+  path — a backend-driven OAuth authorization-code flow. `authenticate()` in
+  `auth.py` still matches ONE env-configured admin (`ADMIN_USERNAME` + bcrypt
+  `ADMIN_PASSWORD_HASH`; dev default `admin`/`admin`), kept as the escape hatch
+  for local dev and for the day the Entra client secret expires. It is gated by
+  `PASSWORD_LOGIN_ENABLED` (404 when off) and MUST be `false` in a deployment —
+  the default hash would otherwise be a way around SSO.
 - **Session** (stable seam): `issue_token()` mints a signed JWT carried in an
   **httpOnly `oil_session` cookie**; `get_current_user` (a FastAPI dependency)
   verifies it and guards every read route (declared once at the `api.py` router
-  level). The `/ws` handshake authenticates with the same cookie (browsers can't
-  set WS headers) — `?token=` fallback for non-browser clients; a bad/absent
-  token closes with code 1008 before the client is registered.
+  level). BOTH login paths funnel through `issue_token` + `set_auth_cookie`, so
+  they produce the same session. The `/ws` handshake authenticates with the same
+  cookie (browsers can't set WS headers) — `?token=` fallback for non-browser
+  clients; a bad/absent token closes with code 1008 before the client is
+  registered.
 
-Magic-link / SSO later = new login endpoints that mint the *same* JWT via
-`issue_token` and set the *same* cookie via `set_auth_cookie` — `get_current_user`,
+**Entra flow** (`GET /auth/entra/login` → Microsoft → `GET /auth/entra/callback`):
+`state`+`nonce` are stored in a signed 5-minute `oil_oauth_state` cookie
+(`SameSite=lax` — the callback hop is a cross-site top-level GET, `strict` would
+drop it); the callback exchanges the code via **MSAL** (synchronous, so wrapped
+in `asyncio.to_thread` — the loop also runs the consumers), verifies the nonce,
+mints the session, and redirects to `DASHBOARD_URL`. Every failure redirects to
+`{DASHBOARD_URL}/?auth_error=<bad_state|access_denied|exchange_failed|not_configured>`
+— never a raw error body, since the browser is mid-navigation on :8000. A token
+response with no claims is `exchange_failed`, not `bad_state`: missing claims mean
+a broken exchange, a wrong nonce means a replay. MSAL reserves
+`openid`/`profile`/`offline_access`, so the code requests NO scopes and takes
+identity from `preferred_username` (then `email`, then `oid`). No Graph call.
+Missing `ENTRA_*` config disables Entra (503 on the login route) rather than
+crashing. **Authorization is not enforced in code**: any account in the tenant
+that signs in gets access — restrict it in the Azure portal (Enterprise
+Application → "Assignment required" + user/group assignment), which needs no code
+change. `GET /auth/config` reports `{entra_enabled, password_login}` so the login
+screen knows what to render. Note logout clears only our cookie, not the Microsoft
+browser session, so signing back in may not re-prompt.
+
+Another auth method later = a new login endpoint that mints the *same* JWT via
+`issue_token` and sets the *same* cookie via `set_auth_cookie` — `get_current_user`,
 every guarded route, the WS check, and the frontend guard stay untouched. Don't
 put auth-method specifics in the JWT payload; keep it identity + expiry.
 
-Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `JWT_SECRET` (≥32 bytes in
+Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `PASSWORD_LOGIN_ENABLED`,
+`ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_REDIRECT_URI`,
+`JWT_SECRET` (≥32 bytes in
 deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS).
 The dev-run scripts (injector, replay) POST to the collector/RabbitMQ — NOT this
 API — so they are unaffected by auth. `passlib` needs `bcrypt<4.1` (pinned).
 
 Dashboard: `lib/auth.tsx` (`AuthProvider` calls `/auth/me` on load) +
 `components/auth/AuthGate.tsx` (renders `LoginScreen` when anonymous, the app
-when authenticated) + a logout control in the side-nav footer. All API/WS calls
+when authenticated) + a logout control in the side-nav footer. `LoginScreen`
+reads `/auth/config` to decide what to offer: "Sign In With Microsoft" (a
+full-page navigation to the backend, never `fetch` — OAuth needs a top-level
+navigation) plus the password form only when it is enabled. Neither
+`AuthProvider` nor `AuthGate` knows Entra exists — after the callback redirect
+the existing `/auth/me` call just succeeds. All API/WS calls
 use `credentials:"include"` so the cookie flows cross-origin (:3000 → :8000);
 backend CORS sets `allow_credentials=True` and allows `POST`/`OPTIONS`.
 
@@ -839,7 +951,8 @@ Env defaults: `ES_URL=http://localhost:9200`,
 `DATABASE_URL=postgresql://...`, `POLL_INTERVAL=10`, `WINDOW_START_OFFSET=25`,
 `WINDOW_END_OFFSET=5`, `MAX_WINDOW_SPAN=120` (poller catch-up cap),
 `ALERT_CONCURRENCY=4` (concurrent alert LLM calls), `STALLED_TIMEOUT=90`,
-`STALLED_SWEEP_INTERVAL=15`, `DASHBOARD_URL` (dashboard base for journey links),
+`STALLED_SWEEP_INTERVAL=15`, `MOCK_ES_MAX_LOGS=200000` (collector ring-buffer
+capacity), `DASHBOARD_URL` (dashboard base for journey links),
 `SEMCACHE_ENABLED=1`, `SEMCACHE_THRESHOLD=0.95` (cosine floor),
 `SEMCACHE_MAX_ENTRIES=500`, `SEMCACHE_MODEL=all-MiniLM-L6-v2`, `SEMCACHE_GUARD=1`,
 `SEMCACHE_SALIENT_EXTRA` (comma-sep extra guard words),
@@ -850,6 +963,12 @@ sets the average rate), `LLM_STATS_STAGGER_SECONDS=1.5` (pause between EVERY
 request in a cycle; sized for 12 requests, not 4 — see `settings.py` for the
 arithmetic), `LLM_STATS_SNAPSHOT_KEY=ai:llmstats:snapshot`,
 plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
+`ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET` (all three required
+to enable Entra sign-in; absent = disabled, never a crash),
+`ENTRA_REDIRECT_URI=http://localhost:8000/auth/entra/callback` (must match the
+Azure app registration byte-for-byte), `PASSWORD_LOGIN_ENABLED=true` (set false in
+any deployment), plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
+above.
 
 `LLM_STATS_CACHE_TTL_SECONDS` was **removed** with the TTL cache it belonged to —
 reads no longer fetch, so there is nothing to expire.
@@ -932,6 +1051,11 @@ reads no longer fetch, so there is nothing to expire.
 - All LLM/provider wiring stays in one module (Azure AI Foundry today). The
   semantic-cache embedding model (sentence-transformers) is local, not a provider
   — it lives in `ai_service/semcache.py`, not `llm.py`.
+- Auth methods are added, never rewired: a new one mints the same JWT via
+  `issue_token` and sets the same cookie via `set_auth_cookie`. Never make a
+  route, the WS handshake, or the dashboard aware of *how* someone signed in.
+  The Entra `state`/`nonce` cookie must stay `SameSite=lax`, and MSAL calls must
+  stay off the event loop (`asyncio.to_thread`).
 - All datetimes ae UTC and timezone aware (timestamptz in Postgres,
   datetime.now(timezone.utc) in Python - never utcnow(), never naive
   datetimes). The 90s stalled journey arithmetic depends on this.

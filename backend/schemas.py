@@ -96,9 +96,13 @@ class ChatContext(BaseModel):
     The backend resolves ``(kind, id)`` against its own DB and prepends that
     record's text to the question, so the answer is anchored to what the agent is
     looking at instead of whatever the query happens to retrieve.
+
+    ``kind`` is a plain ``str``, not an enum, deliberately: an unrecognized value
+    falls through ``_context_text`` to ``None`` and the question is simply
+    answered unscoped, which is a better failure than a 422 on a chat request.
     """
 
-    kind: str                          # "alert" | "journey"
+    kind: str                          # "alert" | "journey" | "incident"
     id: str
 
 

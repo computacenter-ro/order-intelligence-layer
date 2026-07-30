@@ -10,11 +10,15 @@ This is the busiest emitter. Its blocks:
 
   * ``enrich_<sat>_call`` / ``enrich_<sat>_resp`` — the Feign-style client
     ``--->`` / ``<---`` logs that bracket each satellite call, plus the
-    order-engine-side processing filler that the reference dataset shows around
-    each satellite (org hierarchy + object attrs before SPT; pricing after SPT;
-    PVC/rebate around RSM; internal-contract/fee/cart filler after SETTINGS;
-    JWT after JAM). The satellite's own server-side ``serve`` block runs in
-    between (its own module).
+    order-engine-side processing filler shown around each satellite (org
+    hierarchy + object attrs before the FIRST satellite; internal-contract/
+    fee/cart filler after SETTINGS; pricing after SPT; PVC/rebate around RSM;
+    resolved-product filler after SOLR; JWT after JAM). The satellite's own
+    server-side ``serve`` block runs in between (its own module).
+
+    Satellite ORDER comes from ``ENRICH_SATELLITES`` (Settings first) and is
+    never hardcoded here — see ``_FIRST_SATELLITE``. AVALARA's handlers are
+    registered too even though it is US-only and therefore not in that list.
 
   * ``dispatch`` — publish the validated order to order.outbound.queue.
 
@@ -32,6 +36,7 @@ from pipeline.services.blocklib import emit_line, phase1_ids, phase2_ids
 from pipeline.services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
 from pipeline.services.registry import EmitFn, register
 from shared.models import Baton, BatonContext
+from shared.scenarios import AVALARA, ENRICH_SATELLITES
 
 _PROF = profile("order_engine")
 
@@ -75,9 +80,18 @@ _CART_SEQ = itertools.count(random.randint(0, 999_999))
 _CLIENT_LOGGER = {
     "spt": "c.c.orderengine.client.SptClient",
     "rsm": "c.c.orderengine.client.RsmClient",
+    "solr": "c.c.orderengine.client.SolrClient",
     "settings": "c.c.orderengine.client.SettingsClient",
     "jam": "c.c.orderengine.client.JamClient",
+    "avalara": "c.c.orderengine.client.AvalaraClient",
 }
+
+# The FIRST satellite in the enrichment order owns the one-off orchestration
+# preamble (see _orchestration_preamble). Derived from ENRICH_SATELLITES rather
+# than hardcoded, so reordering the satellites moves the preamble with it — it
+# used to be pinned to "spt", which silently emitted it mid-enrichment once
+# Settings became first.
+_FIRST_SATELLITE = ENRICH_SATELLITES[0]
 
 _CREATE_THREAD = "order-create-listener-1"
 
@@ -240,7 +254,8 @@ async def _orchestration_preamble(baton: Baton, emit: EmitFn) -> None:
     """The order-engine lines that precede the first satellite call (phase 2).
 
     OrderService / CartHeaderService / OrganizationService (hierarchy) /
-    ObjectAttributeService — emitted once, right before the SPT call.
+    ObjectAttributeService — emitted once, right before the FIRST satellite's
+    call line (Settings, per ENRICH_SATELLITES).
     """
     ctx = baton.ctx
     ids = phase2_ids(ctx)
@@ -291,6 +306,19 @@ def _endpoint(sat: str, ctx: BatonContext) -> str:
             f"[JamClient#getUserProfileWithPrivilegesBySamAccountName] ---> GET "
             f"http://jamws-uat.computacenter.com/api/user/oe/{ctx.user} HTTP/1.1"
         )
+    if sat == "solr":
+        product_ids = ",".join(line.productId for line in ctx.lines)
+        return (
+            f"[SolrClient#searchProductsByIds] ---> GET "
+            f"http://solrws-uat.computacenter.com/solr/products_{country.lower()}/select"
+            f"?q=productId:({product_ids})&rows={len(ctx.lines)} HTTP/1.1"
+        )
+    if sat == "avalara":
+        return (
+            f"[AvalaraClient#resolveShipToAddress] ---> POST "
+            f"http://avalarews-uat.computacenter.com/api/v1/addresses/resolve/"
+            f"{acct}?countryIdentifier={country} HTTP/1.1"
+        )
     return f"[{sat}] ---> call"
 
 
@@ -302,8 +330,9 @@ def _make_enrich_call(sat: str):
         thread = _worker_thread(baton)
         ids = phase2_ids(ctx)
 
-        # SPT is the first satellite → emit the orchestration preamble first.
-        if sat == "spt":
+        # The first satellite in the enrichment order → emit the one-off
+        # orchestration preamble before its call line.
+        if sat == _FIRST_SATELLITE:
             await _orchestration_preamble(baton, emit)
 
         # Checker has no order-engine client call line — the checker service
@@ -392,6 +421,25 @@ def _make_enrich_resp(sat: str):
             await emit_line(emit, _PROF, logger=_LOG_CART_SOURCING, level="DEBUG", thread=thread,
                             message=f"Get cart sourcing items for cart header id {ctx.cartHeaderId}", ids=ids)
 
+        elif sat == "solr":
+            await emit_line(emit, _PROF, logger=logger, level="DEBUG", thread=thread,
+                            message=(
+                                f"[SolrClient#searchProductsByIds] "
+                                f"<--- HTTP/1.1 200 ({random.randint(20, 70)}ms)"
+                            ), ids=ids)
+            await emit_line(emit, _PROF, logger=_LOG_PRODUCT, level="DEBUG", thread=thread,
+                            message=(
+                                f"Resolved {len(ctx.lines)} product entities from search "
+                                f"for cart header {ctx.cartHeaderId}"
+                            ), ids=ids)
+
+        elif sat == "avalara":
+            await emit_line(emit, _PROF, logger=logger, level="DEBUG", thread=thread,
+                            message=(
+                                f"[AvalaraClient#resolveShipToAddress] "
+                                f"<--- HTTP/1.1 200 ({random.randint(120, 260)}ms)"
+                            ), ids=ids)
+
         elif sat == "jam":
             await emit_line(emit, _PROF, logger=logger, level="DEBUG", thread=thread,
                             message=(
@@ -415,9 +463,12 @@ def _make_enrich_resp(sat: str):
 
 
 # Register the call/resp handlers for every enrich satellite.
-from shared.scenarios import ENRICH_SATELLITES  # noqa: E402
-
-for _sat in ENRICH_SATELLITES:
+#
+# AVALARA is included explicitly: it is US-only, so ``shared/scenarios.py``
+# appends its trio conditionally rather than listing it in ENRICH_SATELLITES —
+# but the handlers must still be registered, or a US chain would dispatch to a
+# missing block.
+for _sat in [*ENRICH_SATELLITES, AVALARA]:
     register("order_engine", f"enrich_{_sat}_call")(_make_enrich_call(_sat))
     register("order_engine", f"enrich_{_sat}_resp")(_make_enrich_resp(_sat))
 

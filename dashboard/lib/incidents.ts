@@ -8,11 +8,27 @@ export interface OrderGroup {
    * an alert with no journey_id at all (shouldn't happen for an already-
    * clustered incident, but grouping must not silently drop such an alert). */
   journeyId: string | null;
-  /** The last alert in the group by emitted_at — the representative "what
-   * happened to this order" line shown next to its label. */
+  /** The representative "what happened to this order" line: the LAST
+   * ERROR-level alert in the group, or the last alert overall if the group
+   * has no ERROR. NOT simply "last by emitted_at" — that field is when the AI
+   * service finished PROCESSING the alert (LLM call / cache lookup), not the
+   * original log's own timestamp, and alerts are processed concurrently
+   * (ALERT_CONCURRENCY), so a WARN can finish processing after a
+   * chronologically-later terminal ERROR. Preferring the last ERROR mirrors
+   * the same "ERROR outranks WARN" rule the backend's causal-line picker
+   * already uses (first ERROR, else first WARN) — just applied to the last
+   * alert instead of the first. */
   outcome: ProcessedAlert;
   /** All of this group's alerts, chronological (emitted_at ascending). */
   alerts: ProcessedAlert[];
+}
+
+/** The last ERROR-level alert in `sorted`, or its last alert if none is ERROR. */
+function _pickOutcome(sorted: ProcessedAlert[]): ProcessedAlert {
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    if (sorted[i].level === "ERROR") return sorted[i];
+  }
+  return sorted[sorted.length - 1];
 }
 
 /**
@@ -49,7 +65,7 @@ export function groupAlertsByOrder(alerts: ProcessedAlert[]): OrderGroup[] {
     const sorted = [...groupAlerts].sort(
       (a, b) => Date.parse(a.emitted_at) - Date.parse(b.emitted_at)
     );
-    const outcome = sorted[sorted.length - 1];
+    const outcome = _pickOutcome(sorted);
     groups.push({
       label: outcome.order_id ?? outcome.event_id ?? outcome.alert_id,
       journeyId,

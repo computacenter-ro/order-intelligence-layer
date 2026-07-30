@@ -17,11 +17,16 @@ from dataclasses import replace
 from shared.models import Baton, BatonContext
 from shared.scenarios import (
     AVALARA,
+    CHECKER,
     ENRICH_SATELLITES,
     INBOUND,
+    JAM,
     ORDER_ENGINE,
+    RSM,
     SCENARIOS,
+    SETTINGS,
     SOLR,
+    SPT,
     TRACK_TRACE,
     VALIDATOR,
     BLOCKS,
@@ -29,7 +34,7 @@ from shared.scenarios import (
     compile_steps,
 )
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v4.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v6.json"
 
 # CLAUDE.md canonical table: {id: (outcome, fail_at, bridge_ids)}
 CANONICAL = {
@@ -46,8 +51,13 @@ CANONICAL = {
 }
 
 
-def test_exactly_fifteen_scenarios():
-    assert sorted(SCENARIOS) == list(range(1, 16))
+def test_scenario_ids_are_a_contiguous_range_from_one():
+    # Derived from SCENARIOS rather than a hardcoded count: scenarios are added
+    # over time (10 canonical + the clustering/novel cases 11-17), and a literal
+    # made this fail every time one was appended without telling us anything.
+    # What actually matters is that the ids stay gapless and 1-based, since
+    # tests and the injector address scenarios by number.
+    assert sorted(SCENARIOS) == list(range(1, len(SCENARIOS) + 1))
 
 
 @pytest.mark.parametrize("sid", range(1, 11))
@@ -111,30 +121,86 @@ def test_bridge_ids_knob_is_inert_but_preserved():
     assert {"both", "order", "cart"} <= variants  # values preserved, just unused
 
 
-def test_avalara_is_not_a_standalone_enrich_satellite():
-    # Per the reference dataset, Avalara ship-to verification is emitted by the
-    # validator (US flows only), not by a standalone cc-avalara-service `serve`
-    # step. So no chain contains an (avalara, serve) step, and avalara is not in
-    # the satellite list.
+def test_settings_is_the_first_enrichment_call():
+    """SETTINGS IS FIRST: the order engine reads the account's settings before it
+    prices anything. This is the current canonical order — it supersedes the
+    SPT-first order captured in v5."""
+    assert ENRICH_SATELLITES[0] == SETTINGS
+    for s in all_scenarios():
+        steps = compile_steps(s)
+        enrich = [(svc, b) for svc, b in steps if b.startswith("enrich_")]
+        if not enrich:
+            continue  # pre-creation failures never enrich
+        assert enrich[0] == (ORDER_ENGINE, "enrich_settings_call"), (
+            f"S{s.id}: first enrichment call is {enrich[0]}, not settings"
+        )
+
+
+def test_canonical_enrichment_order():
+    """The full satellite order for a success chain, exactly as documented."""
+    sats = [svc for svc, b in compile_steps(SCENARIOS[1]) if b == BLOCKS.SERVE]
+    assert sats == ["settings", "spt", "rsm", "solr", "jam", "checker"]
+    # The US success chain adds Avalara last.
+    us = [svc for svc, b in compile_steps(SCENARIOS[3]) if b == BLOCKS.SERVE]
+    assert us == ["settings", "spt", "rsm", "solr", "jam", "checker", "avalara"]
+
+
+def test_solr_is_a_standalone_enrich_satellite_after_rsm_before_jam():
+    """SOLR is now a first-class satellite with its own cc-solr-service `serve`
+    step, inserted AFTER RSM and BEFORE JAM (superseding the old note that it was
+    folded into the order engine)."""
+    assert SOLR in ENRICH_SATELLITES
+    i = ENRICH_SATELLITES.index(SOLR)
+    assert ENRICH_SATELLITES[i - 1] == RSM
+    assert ENRICH_SATELLITES[i + 1] == JAM
+    # It appears in every chain that reaches it...
+    for sid in (1, 2, 3, 6, 7, 9, 10, 13, 14):
+        assert (SOLR, BLOCKS.SERVE) in compile_steps(SCENARIOS[sid]), (
+            f"S{sid} reaches SOLR but has no (solr, serve) step"
+        )
+
+
+@pytest.mark.parametrize("sid", [4, 5, 8, 11, 12, 15, 16, 17])
+def test_solr_absent_from_flows_that_die_before_it(sid):
+    """...and is absent from flows that die earlier: transform (4), create (5),
+    SPT-down (8/11/12) and the Settings failures (15/16/17). Settings now fails
+    at the FIRST enrichment step, so those chains contain no other satellite."""
+    assert (SOLR, BLOCKS.SERVE) not in compile_steps(SCENARIOS[sid])
+
+
+def test_avalara_is_us_only_and_the_last_enrichment_step():
+    """Avalara runs ONLY for US orders, after Checker, as the last enrichment
+    step — hence it is appended conditionally rather than listed in
+    ENRICH_SATELLITES."""
     assert AVALARA not in ENRICH_SATELLITES
     for s in all_scenarios():
-        assert (AVALARA, BLOCKS.SERVE) not in compile_steps(s)
+        steps = compile_steps(s)
+        has_avalara = (AVALARA, BLOCKS.SERVE) in steps
+        # Only the US flow that actually REACHES enrichment's end gets it: S12 is
+        # US but dies at SPT, so country alone is not sufficient.
+        if not has_avalara:
+            continue
+        assert s.country == "US", f"S{s.id}: non-US flow has an Avalara step"
+        sats = [svc for svc, b in steps if b == BLOCKS.SERVE]
+        assert sats.index(AVALARA) == len(sats) - 1, (
+            f"S{s.id}: Avalara is not the last satellite: {sats}"
+        )
+        assert sats[sats.index(AVALARA) - 1] == CHECKER
+
+    # Concretely: S3 (US success) has it; S1/S2 (UK/DE success) do not; S12
+    # (US, dies at SPT) does not.
+    assert (AVALARA, BLOCKS.SERVE) in compile_steps(SCENARIOS[3])
+    assert (AVALARA, BLOCKS.SERVE) not in compile_steps(SCENARIOS[1])
+    assert (AVALARA, BLOCKS.SERVE) not in compile_steps(SCENARIOS[2])
+    assert (AVALARA, BLOCKS.SERVE) not in compile_steps(SCENARIOS[12])
 
 
-def test_solr_is_not_a_standalone_enrich_satellite():
-    # SOLR product-id resolution is internal to the order engine in the
-    # reference dataset — there is no cc-solr-service `serve` step.
-    assert SOLR not in ENRICH_SATELLITES
-    for s in all_scenarios():
-        assert (SOLR, BLOCKS.SERVE) not in compile_steps(s)
-
-
-def test_us_flow_reaches_the_validator_where_avalara_is_emitted():
-    # The US success flow (S3) must reach the validator's validate block — that
-    # is where the validator emits the Avalara ship-to verification lines.
-    s3 = SCENARIOS[3]
-    assert s3.country == "US"
-    assert (VALIDATOR, BLOCKS.VALIDATE) in compile_steps(s3)
+def test_settings_failure_contains_no_other_satellite():
+    """A Settings failure now fails at the FIRST enrichment step, so its chain
+    holds exactly one satellite serve (Settings). Correct, not a gap."""
+    for sid in (15, 16, 17):
+        sats = [svc for svc, b in compile_steps(SCENARIOS[sid]) if b == BLOCKS.SERVE]
+        assert sats == [SETTINGS], f"S{sid}: expected only settings, got {sats}"
 
 
 def test_enrichment_uses_fine_grained_call_serve_resp_trio():
@@ -149,8 +215,13 @@ def test_enrichment_uses_fine_grained_call_serve_resp_trio():
 
 
 def test_outcomes_match_reference_fixture_order():
+    # v6 covers every scenario, so compare against the full set (length-derived,
+    # not a hardcoded 15 — see test_scenario_ids_are_a_contiguous_range_from_one).
     ref = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    assert [f["outcome"] for f in ref] == [SCENARIOS[i].outcome for i in range(1, 16)]
+    assert [f["_flow"] for f in ref] == sorted(SCENARIOS)
+    assert [f["outcome"] for f in ref] == [
+        SCENARIOS[i].outcome for i in sorted(SCENARIOS)
+    ]
 
 
 # --- added: deeper invariants + edge cases -----------------------------------

@@ -56,6 +56,23 @@ JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", str(8 * 60 * 60)))
 COOKIE_NAME = "oil_session"
 COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true"
 
+
+# Read at CALL time, not import time, so a deployment (and the tests) can flip it
+# without re-importing the module. Any of false/0/no disables password login.
+def password_login_enabled() -> bool:
+    """Whether ``POST /auth/login`` is served at all.
+
+    Entra ID is the intended sign-in path; password login remains as the escape
+    hatch for local dev and for the day the Entra client secret expires. It MUST
+    be off in a real deployment — the default hash is bcrypt("admin"), which
+    would otherwise be a documented way around SSO.
+    """
+    return os.getenv("PASSWORD_LOGIN_ENABLED", "true").strip().lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+
 _pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -123,8 +140,23 @@ def set_auth_cookie(response: Response, token: str) -> None:
 
 
 def clear_auth_cookie(response: Response) -> None:
-    """Delete the session cookie (logout)."""
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+    """Delete the session cookie (logout).
+
+    ``secure``/``samesite`` MUST mirror :func:`set_auth_cookie` exactly. A browser
+    treats a cookie's identity as name + Path + Domain, but it will reject an
+    incoming ``Set-Cookie`` that drops ``Secure`` on a secure page — so a deletion
+    sent without it can be ignored, leaving the session cookie in place and logout
+    silently not logging the user out. This only shows up once
+    ``AUTH_COOKIE_SECURE=true`` (i.e. in the real HTTPS deployment), never on
+    local http, which is exactly why it is stated here rather than left implicit.
+    """
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite="lax",
+    )
 
 
 # --- dependency: the trust boundary every protected route reuses -------------
@@ -179,6 +211,9 @@ def authenticate(username: str, password: str) -> bool:
 
 @router.post("/login", response_model=UserOut)
 async def login(body: LoginRequest, response: Response) -> UserOut:
+    if not password_login_enabled():
+        # 404 rather than 403: the endpoint simply isn't there when disabled.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if not authenticate(body.username, body.password):
         # One message for both wrong-user and wrong-password — no user enumeration.
         raise HTTPException(

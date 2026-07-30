@@ -80,20 +80,31 @@ def _enrich_resp(sat: str) -> str:
 
 
 # --- Enrichment satellite order ----------------------------------------------
-# The order the order engine calls each satellite during enrich, taken from the
-# reference dataset (data/mock-order-flows-v2.json): SPT -> RSM -> SETTINGS ->
-# JAM -> CHECKER.
+# The order the order engine calls each satellite during enrich:
 #
-# Two services from the CLAUDE.md table are deliberately NOT standalone enrich
-# satellites, because the reference dataset does not emit them as separate
-# server-side steps during enrichment:
-#   * SOLR  — product-id resolution happens inside the order engine; there is no
-#             cc-solr-service `serve` block in any reference flow.
-#   * AVALARA — US ship-to verification is emitted by cc-validator-service (its
-#             AvalaraClient + ValidateShipToWithAvalara strategy), NOT by a
-#             standalone service. So Avalara is handled inside the validator's
-#             `validate` block for US flows, not as an enrich satellite.
-ENRICH_SATELLITES: list[str] = [SPT, RSM, SETTINGS, JAM, CHECKER]
+#   SETTINGS -> SPT -> RSM -> SOLR -> JAM -> CHECKER   (+ AVALARA, US only)
+#
+# **SETTINGS IS FIRST.** The order engine reads the account's margin thresholds
+# and settings before it prices anything, so Settings is the first call it makes
+# when the order comes back from inbound. This supersedes the older
+# SPT -> RSM -> SETTINGS order captured in data/mock-order-flows-v5.json; the
+# current reference capture is data/mock-order-flows-v6.json.
+#
+# A consequence worth stating, because it looks like a gap: a scenario that
+# fails AT Settings (15/16/17) now fails at the FIRST enrichment step, so its
+# flow contains NO other satellite. That is correct, not a truncation bug.
+#
+# SOLR and AVALARA are now first-class standalone satellites with their own
+# emitters (pipeline/services/solr.py, pipeline/services/avalara.py) and their
+# own `serve` blocks — superseding the previous note here that they were
+# deliberately NOT standalone (SOLR folded into the order engine, Avalara into
+# cc-validator-service). Avalara's lines were removed from validator.py when it
+# became a real service, so they are emitted exactly once.
+#
+# AVALARA is deliberately NOT in this list: it runs for US orders only, so
+# ``_full_chain`` appends its trio conditionally on ``ctx.country == "US"``
+# rather than unconditionally here.
+ENRICH_SATELLITES: list[str] = [SETTINGS, SPT, RSM, SOLR, JAM, CHECKER]
 
 
 # --- Scenario definition ------------------------------------------------------
@@ -148,13 +159,22 @@ def _full_chain(scenario: Scenario) -> list[tuple[str, str]]:
     # bridge
     steps.append((INBOUND, BLOCKS.BRIDGE))
 
-    # phase 2 — enrichment (fine-grained satellite trio each). US Avalara
-    # verification is NOT a satellite here — the validator emits it (see the
-    # ENRICH_SATELLITES note and services/validator.py).
+    # phase 2 — enrichment (fine-grained satellite trio each), in the
+    # ENRICH_SATELLITES order: SETTINGS first, then SPT -> RSM -> SOLR -> JAM ->
+    # CHECKER.
     for sat in ENRICH_SATELLITES:
         steps.append((ORDER_ENGINE, _enrich_call(sat)))
         steps.append((sat, BLOCKS.SERVE))
         steps.append((ORDER_ENGINE, _enrich_resp(sat)))
+
+    # Avalara — US ship-to address verification, the LAST enrichment step and
+    # US-only, which is why it is appended here rather than sitting in
+    # ENRICH_SATELLITES (that list is unconditional). Emitted by the standalone
+    # cc-avalara-service; the validator no longer emits these lines.
+    if scenario.country == "US":
+        steps.append((ORDER_ENGINE, _enrich_call(AVALARA)))
+        steps.append((AVALARA, BLOCKS.SERVE))
+        steps.append((ORDER_ENGINE, _enrich_resp(AVALARA)))
 
     # validation → dispatch → SAP submit → tracking (success terminal)
     steps.append((VALIDATOR, BLOCKS.VALIDATE))

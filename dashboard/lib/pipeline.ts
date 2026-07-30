@@ -1,5 +1,20 @@
 import type { Journey, JourneyStatus } from "@/lib/types";
 
+// The trail's stage order. Note this is the DISPLAY order, not the full
+// enrichment order: cc-settings-service is deliberately not a stage (it is the
+// first service the order engine calls, but showing it would add a row that is
+// always either done or the failure point of a novel/unrecognized failure), so
+// Settings becoming the first enrichment call needs no change here.
+//
+// cc-avalara-service sits AFTER checker and BEFORE validator: it is the last
+// enrichment step, and it is US-only. A non-US journey therefore has no avalara
+// event, so the stage renders as "skipped" — which is honest (nothing to hide:
+// the order genuinely did not need US address verification) and is exactly how
+// the trail already treats any stage a flow legitimately bypasses. We do NOT
+// try to detect US-ness to omit the row: journey data carries no country field
+// (it would mean parsing it out of log text), and a stage list whose LENGTH
+// varied per journey would make the trail's rows stop lining up between
+// journeys, which is worse than one honest "skipped".
 export const CANONICAL_STAGES: { appName: string; label: string }[] = [
   { appName: "cc-inbound-service", label: "inbound" },
   { appName: "cc-order-engine", label: "order-engine" },
@@ -8,6 +23,7 @@ export const CANONICAL_STAGES: { appName: string; label: string }[] = [
   { appName: "cc-solr-service", label: "solr" },
   { appName: "cc-jam-service", label: "jam" },
   { appName: "cc-checker-service", label: "checker" },
+  { appName: "cc-avalara-service", label: "avalara" },
   { appName: "cc-validator-service", label: "validator" },
   { appName: "cc-outbound-osw", label: "outbound-osw" },
   { appName: "cc-track-trace", label: "track-trace" },
@@ -78,11 +94,24 @@ function stageIndexByLabel(label: string): number {
   return CANONICAL_STAGES.findIndex((stage) => stage.label === label);
 }
 
+// Stages that a journey can legitimately BYPASS rather than fail at, so being
+// before the stop index is not enough to call them "done" — they must actually
+// have an event. Today that is only avalara (US-only). Every other stage is
+// either reached by all flows or is the failure point itself.
+//
+// This is deliberately a narrow allow-list rather than a blanket "no event =>
+// skipped" rule: several failure paths report through order-engine's OWN client
+// logging instead of the satellite's (see the OUTCOME_FAIL_STAGE comment above),
+// so a satellite with no events of its own is NOT reliable evidence that the
+// order never got there.
+const OPTIONAL_STAGES = new Set(["avalara"]);
+
 export function pipelineStages(journey: Journey): PipelineStage[] {
   const events = journey.events ?? [];
   const lastEvent = events[events.length - 1];
   const lastAppName = lastEvent ? lastEvent.raw.app_name : CANONICAL_STAGES[0].appName;
   const rawIndex = CANONICAL_STAGES.findIndex((stage) => stage.appName === lastAppName);
+  const seenAppNames = new Set(events.map((event) => event.raw.app_name));
 
   // The curated outcome table is authoritative for FAILED journeys; fall back
   // to the previous last-event-based guess for outcomes it doesn't cover
@@ -99,6 +128,12 @@ export function pipelineStages(journey: Journey): PipelineStage[] {
   return CANONICAL_STAGES.map((stage, index) => {
     if (index === orderEngineIndex && orderEngineWarned && index < stopIndex) {
       return { label: stage.label, state: "warned" as const };
+    }
+    // An optional stage the order never actually visited (a non-US journey's
+    // avalara) reads as skipped, not done: position alone would paint it green
+    // and claim the order was address-verified when it never was.
+    if (OPTIONAL_STAGES.has(stage.label) && !seenAppNames.has(stage.appName)) {
+      return { label: stage.label, state: "skipped" as const };
     }
     if (index < stopIndex) return { label: stage.label, state: "done" as const };
     if (index === stopIndex) return { label: stage.label, state: STOP_STATE[journey.status] };

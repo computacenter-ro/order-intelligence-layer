@@ -479,6 +479,31 @@ async def get_alert_facets(
     return AlertFacets(**counts)
 
 
+# DECLARED AFTER /alerts/facets ON PURPOSE. Starlette matches routes in
+# registration order, so a `/alerts/{alert_id}` registered above would swallow
+# "facets" as an alert id and this API would lose its facet counts with no error
+# anywhere. `test_facets_is_not_shadowed_by_the_resolve_route` anticipated
+# exactly this route arriving one day; keep the two in this order.
+@router.get("/alerts/{alert_id}", response_model=AlertOut)
+async def get_alert(
+    alert_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Alert:
+    """One alert by id. Read-only.
+
+    Exists so a caller holding only an id can render the alert — the chat
+    panel's citation chips, which carry `{id, kind}` and nothing else. The list
+    endpoint cannot serve that: it has no alert_id filter, and adding one would
+    make a single-record read look like a search.
+    """
+    alert = (
+        await session.execute(select(Alert).where(Alert.alert_id == alert_id))
+    ).scalar_one_or_none()
+    if alert is None:
+        raise HTTPException(status_code=404, detail=f"alert {alert_id!r} not found")
+    return alert
+
+
 @router.patch("/alerts/{alert_id}/resolve", response_model=AlertOut)
 async def resolve_alert(
     alert_id: str,
@@ -654,16 +679,23 @@ def _dashboard_link(metadata: dict, *, kind: str = "", record_id: str = "") -> s
     """Dashboard journey link for a cited record, or None.
 
     Same rule as ``backend/teams.py::_dashboard_link``: DASHBOARD_URL + the
-    journey_id (or order_id) the record carries. For a ``journey`` record the
-    record id IS the journey id, so it is used as a last resort — otherwise a
-    journey citation, the most link-worthy kind, would render without a link.
-    None when DASHBOARD_URL is unset or nothing identifies a journey; the UI then
-    shows the citation as plain text.
+    **journey_id**. For a ``journey`` record the record id IS the journey id, so it
+    is used as a last resort — otherwise a journey citation, the most link-worthy
+    kind, would render without a link. None when DASHBOARD_URL is unset or nothing
+    identifies a journey; the UI then shows the citation as plain text.
+
+    ``order_id`` is deliberately NOT a fallback. It used to be, and it produced a
+    link that always 404s: ``/journeys/{journey_id}`` resolves a journey id, so
+    ``/journeys/ORD-8944`` renders "Journey not found". An alert's ``journey_id``
+    is nullable (one not yet stitched to a journey has none), so that fallback
+    fired routinely rather than rarely. No link is the honest answer for a record
+    that cannot name a journey — and the UI already renders an unlinked citation
+    as plain grey text.
     """
     import os
 
     base = os.getenv("DASHBOARD_URL", "").rstrip("/")
-    ref = metadata.get("journey_id") or metadata.get("order_id")
+    ref = metadata.get("journey_id")
     if not ref and kind == "journey":
         ref = record_id
     if not base or not ref:

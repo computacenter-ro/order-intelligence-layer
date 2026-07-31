@@ -19,11 +19,24 @@ import {
  * than a `setInterval` per hop — the token position has to be a smooth function
  * of elapsed time, and an interval would quantise it to the timer's resolution
  * and drift over a ~25-hop sequence.
+ *
+ * Three transport controls, which is why elapsed time is accumulated rather
+ * than measured from a start timestamp:
+ *   - `play()`    starts from the beginning, or RESUMES from a pause.
+ *   - `pause()`   freezes the token in place, keeping the visited trail.
+ *   - `reset()`   clears everything back to idle.
+ * Speed is a live multiplier — see `setSpeed`.
  */
 
 export interface PlaybackState {
-  /** True while a journey is running (including its final dwell). */
+  /** True while the token is actually moving. */
   playing: boolean;
+  /**
+   * True when a journey is part-way through but frozen. Distinct from
+   * `!playing`: an idle map and a paused one look different and offer different
+   * controls (Play means "start" vs "resume").
+   */
+  paused: boolean;
   /** Index into JOURNEY_STEPS, or -1 when idle. */
   stepIndex: number;
   /** 0..1 along the current hop's path. */
@@ -38,6 +51,7 @@ export interface PlaybackState {
 
 const IDLE: PlaybackState = {
   playing: false,
+  paused: false,
   stepIndex: -1,
   progress: 0,
   visited: new Set(),
@@ -45,10 +59,18 @@ const IDLE: PlaybackState = {
   finished: false,
 };
 
+/** Speed multipliers the UI slider can select, slowest to fastest. */
+export const MIN_SPEED = 0.25;
+export const MAX_SPEED = 4;
+export const DEFAULT_SPEED = 1;
+
 /**
  * Total time a step occupies: the hop itself plus any extra dwell once it
  * arrives (used to hold on the creation and the bridge ack, which are the two
  * moments the animation exists to explain).
+ *
+ * Speed is applied to the accumulated clock, not here — so a step's dwell
+ * scales with speed exactly like its hop does.
  */
 function stepDuration(step: JourneyStep): number {
   return HOP_DURATION + (step.dwell ?? 0);
@@ -66,84 +88,95 @@ function prefersReducedMotion(): boolean {
   );
 }
 
+/** Reduced-motion step cadence at 1x, in ms. */
+const REDUCED_STEP_MS = 700;
+
 export function useJourneyPlayback() {
   const [state, setState] = useState<PlaybackState>(IDLE);
+  const [speed, setSpeedState] = useState<number>(DEFAULT_SPEED);
   const frameRef = useRef<number | null>(null);
-  const startRef = useRef<number>(0);
   const stepRef = useRef<number>(0);
   const visitedRef = useRef<Set<string>>(new Set());
   /**
    * Reduced-motion playback steps on timeouts rather than rAF, so the two modes
-   * need separate handles and `stop` clears whichever is live.
+   * need separate handles and the stop paths clear whichever is live.
    */
   const timerRef = useRef<number | null>(null);
+
+  /**
+   * Time already spent inside the CURRENT step, in "journey ms" (i.e. speed
+   * already applied). Accumulating this instead of diffing against a fixed
+   * start timestamp is what makes both pause/resume and a live speed change
+   * work: the token's position depends only on this number, so changing speed
+   * alters how fast it grows and never where the token currently is.
+   */
+  const stepElapsedRef = useRef<number>(0);
+  /** Timestamp of the previous frame, to derive each frame's delta. */
+  const lastFrameRef = useRef<number>(0);
+  /**
+   * Live mirror of `speed` for the rAF loop. The loop is created once per
+   * play/resume and closes over its variables, so it cannot read the state
+   * value — without this a speed change would not take effect until the next
+   * play. Not derivable from state inside the loop, hence a ref.
+   */
+  const speedRef = useRef<number>(DEFAULT_SPEED);
 
   const cancel = useCallback(() => {
     if (frameRef.current !== null) {
       cancelAnimationFrame(frameRef.current);
       frameRef.current = null;
     }
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
   }, []);
 
-  const stop = useCallback(() => {
+  // Stop the loop if the component goes away mid-journey, so a stray frame or
+  // timeout can't call setState on an unmounted tree.
+  useEffect(() => cancel, [cancel]);
+
+  const setSpeed = useCallback((next: number) => {
+    const clamped = Math.min(MAX_SPEED, Math.max(MIN_SPEED, next));
+    speedRef.current = clamped;
+    setSpeedState(clamped);
+  }, []);
+
+  const reset = useCallback(() => {
     cancel();
     stepRef.current = 0;
     visitedRef.current = new Set();
+    stepElapsedRef.current = 0;
     setState(IDLE);
   }, [cancel]);
 
-  // Stop the loop if the component goes away mid-journey, so a stray frame
-  // can't call setState on an unmounted tree.
-  useEffect(() => cancel, [cancel]);
-
-  const play = useCallback(() => {
+  const pause = useCallback(() => {
     cancel();
-    stepRef.current = 0;
-    visitedRef.current = new Set([JOURNEY_STEPS[0].from]);
-    const reducedMotion = prefersReducedMotion();
+    // Keep stepIndex/progress/visited exactly as they are — that is the freeze.
+    setState((prev) =>
+      prev.playing ? { ...prev, playing: false, paused: true } : prev
+    );
+  }, [cancel]);
 
-    /**
-     * Reduced motion: no travelling token. The journey still plays so the
-     * captions and the id handover are readable, but each step snaps to its
-     * destination and holds — movement is the thing being suppressed, not the
-     * explanation (WCAG 2.3.3 / prefers-reduced-motion).
-     */
-    if (reducedMotion) {
-      let i = 0;
-      const advance = () => {
-        const step = JOURNEY_STEPS[i];
-        const arrival = step.highlight ?? (step.reverse ? step.from : step.to);
-        visitedRef.current = new Set(visitedRef.current).add(arrival);
-        setState({
-          playing: true,
-          stepIndex: i,
-          progress: 1,
-          visited: visitedRef.current,
-          activeNode: arrival,
-          finished: false,
-        });
-        i += 1;
-        if (i >= JOURNEY_STEPS.length) {
-          window.setTimeout(
-            () =>
-              setState((prev) => ({ ...prev, playing: false, finished: true })),
-            700
-          );
-          return;
-        }
-        timerRef.current = window.setTimeout(advance, 700);
-      };
-      advance();
-      return;
-    }
-
-    startRef.current = performance.now();
+  /**
+   * Starts the rAF loop from whatever `stepRef`/`stepElapsedRef` currently hold,
+   * so it serves both a fresh play and a resume.
+   */
+  const runFrom = useCallback(() => {
+    cancel();
+    lastFrameRef.current = performance.now();
 
     const tick = (now: number) => {
       const step = JOURNEY_STEPS[stepRef.current];
       if (!step) return;
 
-      const elapsed = now - startRef.current;
+      // Advance the journey clock by real time scaled by the CURRENT speed,
+      // read fresh each frame so the slider takes effect immediately.
+      const delta = now - lastFrameRef.current;
+      lastFrameRef.current = now;
+      stepElapsedRef.current += delta * speedRef.current;
+
+      const elapsed = stepElapsedRef.current;
       const total = stepDuration(step);
       // The token reaches the destination at HOP_DURATION; any remaining time
       // is dwell, during which progress stays pinned at 1.
@@ -159,6 +192,7 @@ export function useJourneyPlayback() {
 
       setState({
         playing: true,
+        paused: false,
         stepIndex: stepRef.current,
         progress,
         visited: visitedRef.current,
@@ -168,11 +202,18 @@ export function useJourneyPlayback() {
 
       if (elapsed >= total) {
         stepRef.current += 1;
-        startRef.current = now;
+        // Carry the overshoot into the next step instead of dropping it, so a
+        // high speed (where one frame can exceed a whole step) stays accurate.
+        stepElapsedRef.current = elapsed - total;
         if (stepRef.current >= JOURNEY_STEPS.length) {
           // Hold the completed state on screen: the last caption is the
           // SUCCESS terminal, which is the punchline.
-          setState((prev) => ({ ...prev, playing: false, finished: true }));
+          setState((prev) => ({
+            ...prev,
+            playing: false,
+            paused: false,
+            finished: true,
+          }));
           frameRef.current = null;
           return;
         }
@@ -183,19 +224,64 @@ export function useJourneyPlayback() {
     frameRef.current = requestAnimationFrame(tick);
   }, [cancel]);
 
-  useEffect(() => {
-    return () => {
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+  /**
+   * Reduced motion: no travelling token. The journey still plays so the
+   * captions and the id handover are readable, but each step snaps to its
+   * destination and holds — movement is the thing being suppressed, not the
+   * explanation (WCAG 2.3.3 / prefers-reduced-motion). Pause/resume and speed
+   * apply here too: the cadence is a timeout scaled by the same multiplier.
+   */
+  const runReducedFrom = useCallback(() => {
+    cancel();
+    const advance = () => {
+      const i = stepRef.current;
+      const step = JOURNEY_STEPS[i];
+      if (!step) return;
+      const arrival = step.highlight ?? (step.reverse ? step.from : step.to);
+      visitedRef.current = new Set(visitedRef.current).add(arrival);
+      setState({
+        playing: true,
+        paused: false,
+        stepIndex: i,
+        progress: 1,
+        visited: visitedRef.current,
+        activeNode: arrival,
+        finished: false,
+      });
+      stepRef.current = i + 1;
+      const wait = REDUCED_STEP_MS / speedRef.current;
+      if (stepRef.current >= JOURNEY_STEPS.length) {
+        timerRef.current = window.setTimeout(
+          () =>
+            setState((prev) => ({
+              ...prev,
+              playing: false,
+              paused: false,
+              finished: true,
+            })),
+          wait
+        );
+        return;
+      }
+      timerRef.current = window.setTimeout(advance, wait);
     };
-  }, []);
+    advance();
+  }, [cancel]);
 
-  const stopAll = useCallback(() => {
-    if (timerRef.current !== null) {
-      window.clearTimeout(timerRef.current);
-      timerRef.current = null;
+  const play = useCallback(() => {
+    // Resume: keep the accumulated position and carry on.
+    if (state.paused) {
+      if (prefersReducedMotion()) runReducedFrom();
+      else runFrom();
+      return;
     }
-    stop();
-  }, [stop]);
+    // Fresh start (from idle, or replaying after finishing).
+    stepRef.current = 0;
+    stepElapsedRef.current = 0;
+    visitedRef.current = new Set([JOURNEY_STEPS[0].from]);
+    if (prefersReducedMotion()) runReducedFrom();
+    else runFrom();
+  }, [state.paused, runFrom, runReducedFrom]);
 
-  return { state, play, stop: stopAll };
+  return { state, speed, play, pause, reset, setSpeed };
 }

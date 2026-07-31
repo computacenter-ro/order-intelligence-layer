@@ -16,8 +16,9 @@ import {
   TreeStructureIcon,
   WarningIcon,
 } from "@phosphor-icons/react";
-import ccLogoWhite from "@computacenter-ro/style-guide/logos/cc-logo-white.png";
-import ccLogoWhiteMark from "@computacenter-ro/style-guide/logos/cc-logo-white-mark.png";
+// One mark for both nav states — the expanded header pairs it with the app
+// name, so the wordmark logo it replaced was redundant (and set the brand twice).
+import ccLogoWhiteMark from "@/assets/cc-logo-white-mark.png";
 import { ChatPanel } from "@/components/chat/ChatPanel";
 import { useAuth } from "@/lib/auth";
 import { ChatProvider, useChat } from "@/lib/chat";
@@ -186,13 +187,45 @@ function AppShellInner({ children }: AppShellProps) {
       <SideNav
         logo={
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <Image src={ccLogoWhite} alt="Computacenter" height={22} width={43} />
+            {/* Same mark AND same 40x30 as the collapsed rail, so the logo does
+                not change size when the panel toggles. 40px is the ceiling: the
+                collapsed rail is 64px wide with 12px padding either side. */}
+            <Image src={ccLogoWhiteMark} alt="Computacenter" height={30} width={40} />
             <span style={{ color: "var(--cc-cloud-white)", fontSize: "14px", fontWeight: 600 }}>
               IT Support Dashboard
             </span>
           </div>
         }
-        logoMark={<Image src={ccLogoWhiteMark} alt="Computacenter" height={24} width={32} />}
+        // A fixed 40px track, not `flex: 1`. The collapsed header is 64px with
+        // 12px padding either side, so 40px of content width — but while the
+        // caret shared this row it took 24px, leaving a flex child just 16px,
+        // and the global `img { max-width: 100% }` reset then shrank the image
+        // to fit. That is why asking for 40x30 once silently rendered 16x11.8.
+        // An explicit width is immune to that, and centres on the rail's axis
+        // (x=32) alongside the 20px item icons.
+        //
+        // The caret now sits on its own row BELOW this one — see the side-nav
+        // header rules in app/globals.css, which also zero the negative margin
+        // this wrapper used to need to overlap it.
+        //
+        // Done here rather than in the shared SideNav, which is vendored from
+        // the style guide and used by other apps.
+        logoMark={
+          <span
+            style={{
+              flex: "0 0 auto",
+              width: "40px",
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+            }}
+          >
+            {/* 40x30 keeps the asset's 1033x765 ratio (1.3503) — the brand
+                rules forbid stretching the logo, so width and height move
+                together. Same size as the expanded header's mark. */}
+            <Image src={ccLogoWhiteMark} alt="Computacenter" height={30} width={40} />
+          </span>
+        }
         items={items}
         collapsed={collapsed}
         onCollapse={handleCollapse}

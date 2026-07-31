@@ -175,13 +175,67 @@ body {
   transition: background-color 200ms ease, box-shadow 200ms ease;
 }
 
-.oil-journey-button:hover {
+/* :not(:disabled) — the Reset button is disabled while the replay is idle, and a
+   hover lift on an inert control reads as interactive. */
+.oil-journey-button:hover:not(:disabled) {
   box-shadow: var(--cc-shadow-md);
 }
 
 .oil-journey-button:focus-visible {
   outline: 2px solid var(--cc-foundation-blue);
   outline-offset: 2px;
+}
+
+/* Journey-replay speed slider. A native <input type="range"> so it stays
+   keyboard-operable (arrows / Home / End) and announces as a slider for free;
+   only the paint is replaced, since the UA default is grey and does not read as
+   part of the diagram's control set. Track and thumb need vendor-prefixed
+   selectors — they cannot be combined into one rule, because an unknown
+   pseudo-element invalidates the whole selector list in both engines. */
+.oil-speed-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.oil-speed-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--cc-grey-five);
+}
+
+.oil-speed-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--cc-grey-five);
+}
+
+.oil-speed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  /* Centres the 14px thumb on the 4px track. */
+  margin-top: -5px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--cc-heritage-blue);
+}
+
+.oil-speed-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--cc-heritage-blue);
+}
+
+.oil-speed-slider:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 /* Diagram nodes are focusable <g> elements. The default UA focus ring hugs the
@@ -195,6 +249,44 @@ body {
   outline: 2px solid var(--cc-foundation-blue);
   outline-offset: 4px;
   border-radius: 8px;
+}
+
+/* Side-nav header: stack the collapse caret UNDER the logo.
+
+   The style-guide SideNav renders its header as one flex ROW containing the
+   logo and the caret button, and exposes no className/style hook for it — so
+   this is done here, structurally (nav's first child), rather than by forking
+   the vendored component or hacking it from inside `logoMark` (a child cannot
+   restyle its parent). Two rows instead of one, hence the taller min-height:
+   the component hardcodes 64px for a single row.
+
+   Kept as one rule for both nav states so the header cannot drift between
+   them; the caret centres itself in the expanded nav too, directly below the
+   logo + app name. */
+nav[aria-label="Sidebar navigation"] > div:first-child {
+  flex-direction: column;
+  /* Overrides the component's `space-between` (expanded), which would push the
+     logo and caret to opposite ends of the column. */
+  justify-content: center;
+  gap: 4px;
+  /* Two stacked rows no longer fit the component's 64px single-row header. */
+  min-height: auto;
+  padding: 12px;
+}
+
+/* The caret is the header's last child; the logo wrapper precedes it. Centre it
+   under the logo in both states. */
+nav[aria-label="Sidebar navigation"] > div:first-child > button:last-child {
+  align-self: center;
+}
+
+/* The collapsed logoMark overlaps the caret with a negative right margin to win
+   back the width the caret used to steal from the same row (see AppShell). Once
+   the caret moves to its own row there is nothing to overlap, so that offset
+   would push the mark off-centre — neutralise it here, where the row/column
+   change is made. */
+nav[aria-label="Sidebar navigation"] > div:first-child > div > span {
+  margin-right: 0 !important;
 }
 
 /* The pan/zoom transform is applied directly, never animated, so there is no

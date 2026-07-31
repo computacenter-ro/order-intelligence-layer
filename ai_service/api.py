@@ -210,29 +210,76 @@ def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
 # documentation" chip for the same reason.
 DOC_CITATION_TEXT = "the official documentation"
 
+# A trailing "Evidence:"/"Sources:" lead-in left with nothing after it once the
+# ids are gone. Swallows the orphaned punctuation with it, so "Evidence: [a], [b]."
+# disappears entirely rather than decaying to "Evidence: , ." and then "Evidence.".
+#
+# Anchored at end-of-string and requires the colon to be followed by punctuation
+# ONLY: "Evidence: the margin was below threshold." keeps its real content.
+_DANGLING_LEADIN = re.compile(
+    r"\s*\b(?:evidence|sources?|citations?|references?|refs?)\b\s*:[\s.,;]*$",
+    re.IGNORECASE,
+)
 
-def replace_doc_citations(answer: str, doc_ids: list[str]) -> str:
-    """Swap ``[<doc chunk id>]`` in the prose for a plain phrase.
 
-    The prompt already asks the model not to cite doc ids, but "do not do X" is a
-    conditional instruction and a small/fast deployment follows those unreliably —
-    the same reason the coverage caveat became a computed field instead of a
-    prompt rule. This is the deterministic backstop: the ids are known exactly, so
-    a hidden citation can never leak into an answer as an unresolvable
-    ``[jam-ws#blind-spots-and-traps--role-matching-is-exact]``.
+def clean_answer_citations(
+    answer: str, doc_ids: list[str], record_ids: list[str] | None = None
+) -> str:
+    """Remove source-record ids from the prose; the UI lists sources separately.
 
-    Substituting a phrase rather than deleting keeps the sentence intact: "as
-    described in [jam-ws#escalation]." would otherwise become "as described in ."
+    Record ids are internal identifiers — ``[4d6e9f08-d1e2-4d40-b1f5-8e9d3668dd1d]``
+    — of rows the reader cannot look up by id, shown beside the answer as chips
+    anyway. In the prose they are pure noise.
+
+    Two different treatments, because the two cases read differently:
+
+    * **documentation ids** are SUBSTITUTED with a phrase, so "as described in
+      [jam-ws#escalation]." stays a sentence instead of becoming "as described in ."
+      The phrase also carries real meaning: this claim came from documentation
+      rather than from log evidence.
+    * **alert/journey ids** are DELETED, since no phrase would add anything — the
+      answer is already about those records.
+
+    BUSINESS identifiers (``ORD-6426``, ``evt-…``, cart header ids) are untouched:
+    an agent works with those daily and they are the whole point of the answer.
+    Only ids of retrieved records are removed, and only inside square brackets, so
+    an order number can never be caught by this.
+
+    The prompt already asks for no citations, but "do not do X" is a conditional
+    instruction that a small/fast deployment follows unreliably — the same reason
+    the coverage caveat became a computed field rather than a prompt rule. This is
+    the deterministic backstop.
     """
-    if not doc_ids:
-        return answer
-    for doc_id in doc_ids:
+    for doc_id in doc_ids or []:
         answer = answer.replace(f"[{doc_id}]", DOC_CITATION_TEXT)
     # Several doc chunks in one citation list collapse to one mention, so
     # "..., the official documentation, the official documentation" reads right.
     phrase = re.escape(DOC_CITATION_TEXT)
     answer = re.sub(rf"{phrase}(?:\s*(?:,|;|and)\s*{phrase})+", DOC_CITATION_TEXT, answer)
-    return answer
+
+    for record_id in record_ids or []:
+        answer = answer.replace(f"[{record_id}]", "")
+
+    return _tidy_after_removal(answer)
+
+
+def _tidy_after_removal(text: str) -> str:
+    """Repair the punctuation a deleted citation leaves behind.
+
+    "Evidence: [a], [b]." would otherwise end up as "Evidence: , ." — visibly
+    broken in a way the original id never was.
+    """
+    text = re.sub(r"\[\s*\]", "", text)                  # emptied brackets
+    text = re.sub(r"\(\s*[,;]*\s*\)", "", text)          # emptied parentheses
+    # BEFORE the punctuation tidy: that step would eat the colon this depends on,
+    # leaving a stranded "Evidence." nothing later can recognise.
+    text = _DANGLING_LEADIN.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)               # doubled spaces
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)         # space before punctuation
+    text = re.sub(r"([,;:])\s*(?=[.,;:])", "", text)     # stacked separators
+    text = re.sub(r"([.!?])[\s.]*\1", r"\1", text)       # ".." from a removed clause
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text.strip(" \t\n,;:")
 
 
 def build_retrieval_answer(
@@ -413,7 +460,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
             fallback=None,
         )
         if composed:
-            answer, mode = replace_doc_citations(composed, [d["id"] for d in docs]), AI_COMPOSED
+            answer = clean_answer_citations(
+                composed, [d["id"] for d in docs], [r["id"] for r in results]
+            )
+            mode = AI_COMPOSED
 
     return ChatResponse(
         answer=answer,

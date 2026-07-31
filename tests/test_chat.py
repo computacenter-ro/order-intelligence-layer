@@ -159,10 +159,11 @@ async def test_compose_system_prompt_states_the_grounding_rules():
     system = model.prompts[0]
     assert "ONLY the context provided" in system
     assert "Never invent" in system
-    # INCIDENT ids specifically: doc chunk ids name sections of a repository the
-    # agent cannot open, and the UI hides those sources behind one badge, so a
-    # cited doc id would be an unresolvable reference.
-    assert "Cite the INCIDENT record ids" in system
+    # No citations at all: record ids identify rows the agent cannot look up by
+    # id, and the interface lists the sources beside the answer. Business ids
+    # (ORD-…) are explicitly still allowed — removing those would gut the answer.
+    assert "no square-bracket citations of any kind" in system
+    assert "ORD-6426" in system
 
 
 async def test_compose_raises_without_a_model():
@@ -198,7 +199,10 @@ def test_healthy_model_yields_mode_ai(wired):
         "/chat", json={"query": "why was the order blocked by margin", "k": 3}
     ).json()
     assert body["mode"] == "ai"
-    assert body["answer"] == "The margin check blocked order ORD-1. [a1]"
+    # The record id is stripped from the prose — it is an internal identifier of a
+    # row the reader cannot look up, and the UI lists the sources beside the
+    # answer anyway. The ORDER number stays: that is what the agent works with.
+    assert body["answer"] == "The margin check blocked order ORD-1."
     assert body["sources"], "sources are returned in AI mode too"
     assert model.calls == 1
 

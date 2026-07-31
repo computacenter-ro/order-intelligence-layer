@@ -190,11 +190,11 @@ def test_retrieval_only_answer_with_nothing_is_unchanged():
     assert api.build_retrieval_answer("q", []) == api.NO_RESULTS_ANSWER
 
 
-# --- doc citations never reach the reader as ids ------------------------------
+# --- no record id ever reaches the reader -------------------------------------
 def test_doc_citation_becomes_a_plain_phrase():
-    """A doc id names a chunk of a repo the agent cannot open. The UI hides those
-    sources, so a bracketed id left in the prose would dangle."""
-    answer = api.replace_doc_citations(
+    """Substituted, not deleted: the phrase carries meaning (this came from
+    documentation, not from log evidence) and keeps the sentence intact."""
+    answer = api.clean_answer_citations(
         "JAM returns privileges [jam-ws#what-this-service-does].",
         ["jam-ws#what-this-service-does"],
     )
@@ -203,43 +203,96 @@ def test_doc_citation_becomes_a_plain_phrase():
 
 def test_doc_citation_is_substituted_not_deleted():
     """Deleting would leave "as described in ." — the sentence must survive."""
-    answer = api.replace_doc_citations("as described in [jam-ws#escalation]", ["jam-ws#escalation"])
+    answer = api.clean_answer_citations(
+        "as described in [jam-ws#escalation]", ["jam-ws#escalation"]
+    )
     assert answer == "as described in the official documentation"
 
 
 def test_repeated_doc_citations_collapse_to_one_mention():
-    answer = api.replace_doc_citations(
+    answer = api.clean_answer_citations(
         "See [a#one], [a#two] and [a#three].", ["a#one", "a#two", "a#three"]
     )
     assert answer == "See the official documentation."
 
 
-def test_incident_citations_are_left_alone():
-    """Those DO resolve — the UI renders them as linked chips."""
-    answer = api.replace_doc_citations(
-        "Evidence: [alert-123], [jam-ws#escalation].", ["jam-ws#escalation"]
+def test_alert_and_journey_ids_are_deleted():
+    """Internal uuids of rows the reader cannot look up by id — pure noise."""
+    answer = api.clean_answer_citations(
+        "The margin check blocked the order. [4d6e9f08-d1e2-4d40-b1f5-8e9d3668dd1d]",
+        [],
+        ["4d6e9f08-d1e2-4d40-b1f5-8e9d3668dd1d"],
     )
-    assert "[alert-123]" in answer
+    assert answer == "The margin check blocked the order."
+
+
+def test_a_dangling_evidence_list_is_removed_whole():
+    """"Evidence: [a], [b]." must not become "Evidence: , .""" ""
+    answer = api.clean_answer_citations(
+        "Submission failed at SAP. Evidence: [alert-1], [journey-2].",
+        [],
+        ["alert-1", "journey-2"],
+    )
+    assert answer == "Submission failed at SAP."
+
+
+def test_mixed_doc_and_record_citations():
+    answer = api.clean_answer_citations(
+        "It is a business rejection. Evidence: [alert-1], [jam-ws#escalation].",
+        ["jam-ws#escalation"],
+        ["alert-1"],
+    )
+    assert "alert-1" not in answer
     assert "jam-ws#escalation" not in answer
+    assert api.DOC_CITATION_TEXT in answer
+    assert "Evidence: ," not in answer
 
 
-def test_no_docs_leaves_the_answer_untouched():
-    assert api.replace_doc_citations("Evidence: [alert-1].", []) == "Evidence: [alert-1]."
+def test_business_identifiers_are_never_touched():
+    """ORD-6426 is what the agent actually works with — the point of the answer.
+
+    Only ids of RETRIEVED RECORDS are removed, and only inside brackets, so an
+    order number cannot be caught by this even when it appears in brackets.
+    """
+    text = (
+        "Order ORD-6426 was blocked: margin 4.97% below the 15% threshold "
+        "(event evt-372656a7, cart header 1840927365018240001). [alert-1]"
+    )
+    answer = api.clean_answer_citations(text, [], ["alert-1"])
+    assert "ORD-6426" in answer
+    assert "evt-372656a7" in answer
+    assert "1840927365018240001" in answer
+    assert "alert-1" not in answer
 
 
-def test_endpoint_strips_doc_ids_from_the_composed_answer(wired, monkeypatch):
+def test_an_unretrieved_bracketed_token_is_left_alone():
+    """Only known source ids are removed — this never guesses at brackets."""
+    answer = api.clean_answer_citations("See note [3] in the runbook.", [], ["alert-1"])
+    assert answer == "See note [3] in the runbook."
+
+
+def test_nothing_to_remove_leaves_the_answer_untouched():
+    assert api.clean_answer_citations("Plain answer.", [], []) == "Plain answer."
+
+
+def test_endpoint_strips_ids_from_the_composed_answer(wired, monkeypatch):
     _serve(monkeypatch, alerts=[], docs=[DOC_HIT])
     body = wired.post("/chat", json={"query": "what does JAM do?"}).json()
     # The fake model replies with exactly the citation the prompt asks it to avoid.
     assert "[jam-ws#what-this-service-does]" not in body["answer"]
     assert api.DOC_CITATION_TEXT in body["answer"]
-    # ...but the source is still RETURNED, so the UI can show its one chip and the
-    # id stays available for the evaluation set and network-tab debugging.
+    # ...but the source is still RETURNED, so the UI can show its chip and the id
+    # stays available for the evaluation set and network-tab debugging.
     assert [s["id"] for s in body["sources"]] == ["jam-ws#what-this-service-does"]
 
 
-def test_prompt_tells_the_model_not_to_cite_doc_ids():
-    assert "Do NOT cite documentation ids" in nodes._CHAT_SYSTEM
+def test_prompt_forbids_bracketed_citations():
+    assert "no square-bracket citations of any kind" in nodes._CHAT_SYSTEM
+
+
+def test_prompt_still_allows_business_identifiers():
+    """Removing ORD-6426 from answers would gut them."""
+    assert "ORD-6426" in nodes._CHAT_SYSTEM
 
 
 async def test_composer_accepts_docs_with_no_incident_sources():

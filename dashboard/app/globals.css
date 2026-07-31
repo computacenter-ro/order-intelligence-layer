@@ -175,13 +175,67 @@ body {
   transition: background-color 200ms ease, box-shadow 200ms ease;
 }
 
-.oil-journey-button:hover {
+/* :not(:disabled) — the Reset button is disabled while the replay is idle, and a
+   hover lift on an inert control reads as interactive. */
+.oil-journey-button:hover:not(:disabled) {
   box-shadow: var(--cc-shadow-md);
 }
 
 .oil-journey-button:focus-visible {
   outline: 2px solid var(--cc-foundation-blue);
   outline-offset: 2px;
+}
+
+/* Journey-replay speed slider. A native <input type="range"> so it stays
+   keyboard-operable (arrows / Home / End) and announces as a slider for free;
+   only the paint is replaced, since the UA default is grey and does not read as
+   part of the diagram's control set. Track and thumb need vendor-prefixed
+   selectors — they cannot be combined into one rule, because an unknown
+   pseudo-element invalidates the whole selector list in both engines. */
+.oil-speed-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.oil-speed-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--cc-grey-five);
+}
+
+.oil-speed-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--cc-grey-five);
+}
+
+.oil-speed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  /* Centres the 14px thumb on the 4px track. */
+  margin-top: -5px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--cc-heritage-blue);
+}
+
+.oil-speed-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--cc-heritage-blue);
+}
+
+.oil-speed-slider:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 /* Diagram nodes are focusable <g> elements. The default UA focus ring hugs the

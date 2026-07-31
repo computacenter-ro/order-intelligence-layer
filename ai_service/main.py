@@ -21,7 +21,7 @@ import asyncio
 import redis.asyncio as aioredis
 import uvicorn
 
-from ai_service import api, llm, ragindex, semcache, settings
+from ai_service import api, docsindex, llm, ragindex, semcache, settings
 from ai_service.breaker import CircuitBreaker
 from ai_service.graph import PipelineDeps
 from ai_service.poller import Poller
@@ -82,6 +82,24 @@ async def _run() -> None:
     )
     await ragindex.restore()
 
+    # Documentation index (docs RAG): the SECOND grounding channel. Built from
+    # files on disk, not pushed up from Postgres, and NOT persisted — it rebuilds
+    # from the corpus in seconds, so a Redis copy could only drift from the source
+    # of truth. Reuses the same encoder again (fourth consumer, still one load).
+    if not settings.DOCSINDEX_ENABLED:
+        docs_encoder = None
+    elif rag_encoder is not None and settings.DOCSINDEX_MODEL == settings.RAGINDEX_MODEL:
+        docs_encoder = rag_encoder
+    elif encoder is not None and settings.DOCSINDEX_MODEL == settings.SEMCACHE_MODEL:
+        docs_encoder = encoder
+    else:
+        docs_encoder = semcache.load_encoder(settings.DOCSINDEX_MODEL)
+    docs_deps = docsindex.build(settings.DOCSINDEX_DIR, docs_encoder)
+    docsindex.configure(docs_deps)
+    if docs_deps.error:
+        # Never fatal: the assistant degrades to incident-only answers.
+        print(f"[ai_service] docs index disabled — {docs_deps.error}", flush=True)
+
     poller = Poller(redis=redis_client, publisher=publisher, pipeline_deps=deps)
 
     # The summary API shares the same breaker + Redis; its model is the stronger
@@ -105,11 +123,12 @@ async def _run() -> None:
     mode = "AI" if settings.llm_configured() else "FALLBACK (no Azure creds)"
     cache_mode = "on" if (encoder is not None) else "off"
     rag_mode = "on" if (rag_encoder is not None) else "off"
+    docs_mode = f"{docs_deps.chunks} chunks" if docs_deps.chunks else "off"
     print(
         f"[ai_service] started — poll every {settings.POLL_INTERVAL}s, "
         f"window [-{settings.WINDOW_START_OFFSET}s, -{settings.WINDOW_END_OFFSET}s], "
         f"API on :8100, LLM mode: {mode}, semantic cache: {cache_mode}, "
-        f"retrieval index: {rag_mode}",
+        f"retrieval index: {rag_mode}, docs index: {docs_mode}",
         flush=True,
     )
     try:

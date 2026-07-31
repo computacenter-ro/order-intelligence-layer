@@ -3,7 +3,7 @@
 Adding a second knowledge source to the existing chatbot so it can answer questions
 about **how the order-engine system works**, not only about **what has failed**.
 
-Status: design agreed, not yet implemented. Open questions in §10.
+Status: design agreed. Corpus split done (§11 step 1); no code yet. Open questions in §10.
 
 ---
 
@@ -96,8 +96,12 @@ says "I only handle these six question types" is the failure mode that kills ado
 **D8 — Store everything; filter by audience at retrieval.** Storage is free (no cap,
 no eviction). Dropping content at index time is irreversible; a filter is one line.
 
-**D9 — `chatbot-context.md` Part 1 is the system prompt, never an indexed chunk.**
+**D9 — `answering-policy.md` is the system prompt, never an indexed chunk.**
 It is answering policy, not knowledge. If indexed it would be retrieved and cited.
+**Done:** it was Part 1 of `chatbot-context.md` and is now its own file, so this is
+enforced by structure rather than by a rule in the loader. It is the only file in the
+corpus with no `yaml` frontmatter block — which is the loader's test for "not a service
+doc", in preference to a hardcoded filename.
 
 **D10 — §7 (log anatomy) is not indexed.** It is engineer-level *and* describes a
 plain-text logback format the simulation never emits.
@@ -106,12 +110,13 @@ plain-text logback format the simulation never emits.
 
 ## 4. The corpus
 
-Five files today, ~2,600 lines. All share a strict template, which is what makes
-mechanical chunking possible.
+Six files, ~2,600 lines: **five service docs plus `answering-policy.md`** (the system
+prompt, not part of the corpus — see D9). The five share a strict template, which is what
+makes mechanical chunking possible.
 
 | Service | File | Notes |
 |---|---|---|
-| order-engine | `chatbot-context.md` Part 2 | the hub; largest file; §12 escalation still `TODO` |
+| order-engine | `order-engine.md` | the hub; largest file; §12 escalation still `TODO`; one extra frontmatter key (`logback_context_name`) |
 | inbound-order | `inbound-order.md` | front door; queue-driven |
 | order-validator | `order-validator-web-service.md` | stateless; 26 log statements |
 | rsm-ws | `rsm-ws.md` | read-only; has §13 provenance |
@@ -329,7 +334,7 @@ Memory: ~600 chunks ≈ under 10 MB. The smallest in-memory store in the system
 |---|---|
 | `ai_service/api.py` | accept a "self-grounded" flag so zero sources ≠ refuse — **do this first** |
 | `ChatRequest` | that flag; ideally separate search query from prompt context |
-| `nodes.py::_CHAT_SYSTEM` | merge Part 1; three labelled blocks |
+| `nodes.py::_CHAT_SYSTEM` | merge `answering-policy.md`; three labelled blocks |
 | `backend/api.py::_context_text` | inject the failing service's doc when scoped |
 | the `.md` files | template changes (§4) |
 
@@ -348,8 +353,8 @@ one: *files own themselves*.
 Ordered by how much they change the implementation.
 
 **1. Prompt and slot budget.** How many doc chunks vs incident records vs anchor text
-per answer? Part 1 alone is ~200 lines and there are now three context blocks. Needs a
-number before coding, because it decides `k` for each index.
+per answer? `answering-policy.md` alone is ~200 lines and there are now three context
+blocks. Needs a number before coding, because it decides `k` for each index.
 
 **2. Should incident retrieval run at all on an explanatory question?** The working
 notes already concluded retrieval adds little under an anchor and can contaminate
@@ -387,18 +392,42 @@ before restructuring, since it is the schema everything else follows.
 
 **No code required**
 
-1. Move the five `.md` files into a tracked `knowledge/` folder; remove from `.gitignore`.
-2. Settle the template (§4) — highest leverage, so the remaining eight files are written
+1. ~~Split `chatbot-context.md` into `answering-policy.md` + `order-engine.md`~~ **done** —
+   the corpus is now six structurally uniform files (see §4).
+2. ~~Move the corpus into a tracked folder~~ **done** — it lives in
+   **`ai_service/knowledge/`**, inside the subsystem that reads it, matching the
+   `pipeline/data/` precedent for subsystem-owned data. Two build properties come free
+   there and are the reason for the location: `build-images.yml` already filters on
+   `ai_service/**`, so a docs-only edit rebuilds the image; and `.dockerignore` excludes
+   only `docs/` and `ways-of-working/`, so nothing here is stripped from the build context.
+   Do not move it to a name inside that "Docs / editor noise" block, or the corpus silently
+   stops reaching the image.
+3. Settle the template (§4) — highest leverage, so the remaining eight files are written
    in the right shape rather than retrofitted.
-3. Write `service-map.yaml` (~13 lines).
+4. ~~Write `service-map.yaml`~~ **done** — `ai_service/knowledge/service-map.yaml`.
+   Three sections rather than one list, because the corpus has three cases: `services`
+   (the 10 app_names that appear in logs; 5 mapped to a doc, 5 `doc: null`), `folded_in`
+   (SOLR and Avalara have **no app_name of their own** — SOLR is emitted inside
+   `cc-order-engine`, Avalara by `cc-validator-service`, so "show me the SOLR logs" has no
+   answer and that is itself the finding), and `not_simulated` (SAP/BTP, Salesforce —
+   answerable from docs, never from logs). Aliases are carried here **only** for entries
+   with no doc file; a documented service's aliases stay in its own frontmatter so the two
+   cannot drift.
 
 **Code**
 
-4. Fix §6.4 — zero sources must not mean refuse. Blocks the rest.
-5. Loader + second index.
-6. Merge the prompt; three labelled blocks; rename away from "incident records".
-7. Entity detection + kind routing, with the plain-similarity fallback.
-8. Evaluation set in CI.
+5. Fix §6.4 — zero sources must not mean refuse. Blocks the rest.
+6. Loader + second index. Chunk ids are **heading-text slugs**
+   (`order-engine#margin-check`), never ordinals — the template work in step 3 renumbers
+   sections, which would silently reassign every ordinal id and invalidate the step 9
+   evaluation set along with any citation already shown to a user.
+7. Merge the prompt; three labelled blocks; rename away from "incident records".
+8. Entity detection + kind routing, with the plain-similarity fallback. The message
+   catalogue matches on **templates, not exact substrings**: documented messages contain
+   `{}` placeholders (`Submitted order:{}`), so a pasted line never matches verbatim —
+   split on `{}` and require the fixed segments in order.
+9. Evaluation set in CI. Worth writing **before** step 6, not after: it is the only way to
+   tell whether a template change improved retrieval or merely moved it.
 
 **Smallest thing that proves it works:** chunk `jam-ws.md` by hand (it is the shortest),
 load it, ask *"what does JAM do?"*, and confirm the answer comes from the doc and not

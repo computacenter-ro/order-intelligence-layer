@@ -24,6 +24,13 @@ langchain-azure-ai>=0.1          # Claude via Azure AI Foundry chat models
 # The AI service runs WITHOUT them — the cache just disables itself (deferred
 # import in ai_service/semcache.py). Install them only to enable the cache.
 
+# --- Documentation corpus (docs RAG) ---
+# The per-service docs in ai_service/knowledge/ open with a ```yaml frontmatter
+# block, and service-map.yaml maps mock app_names to doc files. Both are read by
+# ai_service/knowledge_loader.py. Pure-Python fallback, no compiler, ~250 KB —
+# this is NOT part of the optional ML stack; the loader must work without it.
+pyyaml>=6.0
+
 # --- Messaging / caching / storage ---
 aio-pika>=9.4                    # RabbitMQ (async): baton queues, raw.events, processed.alerts
 redis>=5.0                       # SETNX dedup, breaker state (redis.asyncio)

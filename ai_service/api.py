@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 
-from ai_service import nodes, ragindex, semcache
+from ai_service import docsindex, nodes, ragindex, semcache
 from ai_service.breaker import CircuitBreaker
 from shared.models import LogLine
 
@@ -79,6 +79,17 @@ class ChatRequest(BaseModel):
     # must stay DB-free, so the counts arrive with the request. Absent/empty means
     # rank on relevance alone.
     boosts: dict[str, float] = {}
+    # "There is grounding material in `query` itself." Set by the backend when it
+    # prepended a scoped record's text (backend/api.py::build_scoped_query), which
+    # is read LIVE from Postgres and is more authoritative than anything indexed.
+    #
+    # Without this flag, "retrieval found nothing" and "there is nothing to answer
+    # from" are the same fact — true when the index was the only grounding channel,
+    # false once a caller can supply its own. The failure it fixes: click a NOVEL
+    # failure (nothing similar indexed, which is exactly when you need help), ask
+    # "what does this mean?", and get "No related incidents found — run the
+    # backfill" while the alert's full text sits in this very request.
+    self_grounded: bool = False
 
 
 class ChatSource(BaseModel):
@@ -191,17 +202,30 @@ def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
     return text[:limit].rsplit(" ", 1)[0] + "…"
 
 
-def build_retrieval_answer(query: str, results: list[dict]) -> str:
+def build_retrieval_answer(
+    query: str, results: list[dict], docs: list[dict] | None = None
+) -> str:
     """A deterministic answer assembled from the retrieved records.
 
-    **No LLM in this phase** (by design): the answer is a template listing what
-    was retrieved, so the endpoint is useful and fully testable before any
-    generation step exists. A later phase can replace this function with an LLM
-    call and keep the request/response contract — which is why the response
-    carries ``mode`` and the answer never claims more than "here is what I found".
+    **No LLM here** (by design): the answer is a template listing what was
+    retrieved, so the endpoint stays useful with the LLM completely down — which
+    is why the response carries ``mode`` and the answer never claims more than
+    "here is what I found".
+
+    Documentation chunks are listed under their OWN heading, never merged into the
+    incident count: "found 4 related incidents" when three of them are reference
+    pages is exactly the confusion the labelled blocks exist to prevent.
     """
+    docs = docs or []
     if not results:
-        return NO_RESULTS_ANSWER
+        if not docs:
+            return NO_RESULTS_ANSWER
+        lines = [
+            "No related incidents found in the indexed history, but the system "
+            f"documentation has {len(docs)} relevant section(s) for: {query.strip()}"
+        ]
+        lines += _doc_lines(docs)
+        return "\n".join(lines)
     kinds = {"alert": 0, "journey": 0}
     for record in results:
         kinds[record["kind"]] = kinds.get(record["kind"], 0) + 1
@@ -214,7 +238,23 @@ def build_retrieval_answer(query: str, results: list[dict]) -> str:
             f"{i}. [{record['kind']} {record['id']}] "
             f"(score {record['score']:.2f}) {_snippet(record['text'])}"
         )
+    if docs:
+        lines.append(f"Related system documentation ({len(docs)} section(s)):")
+        lines += _doc_lines(docs)
     return "\n".join(lines)
+
+
+def _doc_lines(docs: list[dict]) -> list[str]:
+    """One display line per documentation chunk, named by service and section."""
+    lines = []
+    for i, chunk in enumerate(docs, 1):
+        meta = chunk.get("metadata") or {}
+        where = " · ".join(str(meta[k]) for k in ("service", "heading") if meta.get(k))
+        lines.append(
+            f"{i}. [{chunk['id']}] ({where or 'documentation'}) "
+            f"(score {chunk['score']:.2f}) {_snippet(chunk['text'])}"
+        )
+    return lines
 
 
 # --- app ---------------------------------------------------------------------
@@ -239,6 +279,32 @@ async def ragindex_stats() -> dict:
     return await ragindex.stats()
 
 
+@app.get("/docs/stats")
+async def docs_stats() -> dict:
+    """Documentation-index size, per-kind breakdown and why it is off if it is.
+
+    ``enabled: false`` with an ``error`` is the normal shape of every failure mode
+    here (no encoder, missing folder, unreadable corpus) — the service starts
+    regardless and answers from incident history alone.
+    """
+    return docsindex.stats()
+
+
+@app.post("/docs/reload")
+async def docs_reload() -> dict:
+    """Re-read ``knowledge/`` and rebuild the index without a restart.
+
+    For editing a doc against a running service. In deployment the corpus ships
+    inside the image, so changing a doc is a deploy and the documentation version
+    always matches the code version (rag-plan.md D4).
+
+    A failed rebuild keeps the previous index rather than emptying it — reloading
+    a corpus you have just broken must not take the working one down with it.
+    """
+    docsindex.reload()
+    return docsindex.stats()
+
+
 @app.post("/index", response_model=IndexResponse)
 async def index(req: IndexRequest) -> IndexResponse:
     """Embed + store one incident record (upsert by id).
@@ -253,24 +319,37 @@ async def index(req: IndexRequest) -> IndexResponse:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    """Answer a question from retrieved incident history, grounded by the LLM.
+    """Answer a question from incident history AND system documentation.
 
-    Retrieve top-k (phase 1) → compose an answer from those records ONLY, under
-    the SHARED circuit breaker. Degradation is layered so the endpoint is always
-    useful:
+    Two grounding channels, retrieved from two separate indexes and kept separate
+    all the way into the prompt:
 
-    * sources + LLM ok        → ``mode="ai"``, a grounded narrative answer
-    * breaker open / LLM error → ``mode="retrieval-only"``, the phase-1 template
-    * nothing retrieved        → ``mode="retrieval-only"``, "no related incidents"
+    * **incident history** (``ragindex``) — what happened: alerts and journeys
+    * **system documentation** (``docsindex``) — how it works: the service docs
+
+    They are queried independently rather than sharing one top-k, which is the
+    whole reason for a second index (rag-plan.md D1): with one shared ``k``, "what
+    does the checker do?" loses its own documentation to five checker *failures*.
+    Separate budgets GUARANTEE a mix instead of hoping for one.
+
+    Degradation is layered so the endpoint is always useful:
+
+    * any context + LLM ok     → ``mode="ai"``, a grounded narrative answer
+    * breaker open / LLM error → ``mode="retrieval-only"``, a deterministic listing
+    * nothing at all retrieved → ``mode="retrieval-only"``, says so plainly
 
     The ``sources`` are the same in every case — only the prose differs — so a UI
-    can render citations without branching on mode. This is the chatbot's share
-    of the system-wide "useful with the LLM completely down" guarantee: an
-    outage costs you the narrative, never the search.
+    can render citations without branching on mode. Documentation chunks appear in
+    that same list with ``kind="doc"``; they carry no journey/order id, so the
+    backend's link builder simply renders them without a dashboard link.
     """
     results = ragindex.retrieve(
         req.query, k=req.k, filters=req.filters, boosts=req.boosts
     )
+    # Deliberately NOT feedback-blended and NOT filtered by `req.filters`: those
+    # filters name incident columns (department, outcome, app_name) that a doc
+    # chunk does not carry, so applying them would silently empty this channel.
+    docs = docsindex.retrieve(req.query)
     sources = [
         ChatSource(
             id=r["id"],
@@ -279,16 +358,25 @@ async def chat(req: ChatRequest) -> ChatResponse:
             snippet=_snippet(r["text"]),
             metadata=r.get("metadata") or {},
         )
-        for r in results
+        for r in [*results, *docs]
     ]
 
-    answer, mode = build_retrieval_answer(req.query, results), RETRIEVAL_ONLY
-    # Only attempt composition when there is something to ground in — with no
-    # sources the model has nothing to answer from, and the template already says
-    # so honestly. (compose_chat_answer also refuses, belt and braces.)
-    if results and _deps is not None:
+    answer, mode = build_retrieval_answer(req.query, results, docs), RETRIEVAL_ONLY
+    # Compose when there is ANY grounding material — incident records, documentation,
+    # or context the caller put in the query itself (`self_grounded`). The guard
+    # still holds for the case it was written for: a bare question that matched
+    # nothing has genuinely nothing to answer from, and the template says so rather
+    # than letting the model invent an incident.
+    grounded = bool(results) or bool(docs) or req.self_grounded
+    if grounded and _deps is not None:
         composed = await _deps.breaker.call(
-            lambda: nodes.compose_chat_answer(req.query, results, _deps.chat),
+            lambda: nodes.compose_chat_answer(
+                req.query,
+                results,
+                _deps.chat,
+                docs=docs,
+                allow_empty_sources=req.self_grounded,
+            ),
             fallback=None,
         )
         if composed:
@@ -300,6 +388,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
         mode=mode,
         # Computed, not generated: retrieval filling every slot it was allowed
         # means matches were almost certainly cut off beyond the limit.
+        #
+        # Describes the INCIDENT channel only, and deliberately so: "truncated"
+        # answers "is there more history I did not see?", which is a real risk on
+        # an unbounded, ever-growing record set. The docs corpus is small, fixed
+        # and authored, so the same word would mean something quite different
+        # there — folding both into one number would make the badge meaningless.
         coverage=ChatCoverage(
             shown=len(results), limit=req.k, truncated=len(results) >= req.k
         ),

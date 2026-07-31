@@ -157,7 +157,7 @@ async def test_compose_system_prompt_states_the_grounding_rules():
     model = CountingChatModel()
     await nodes.compose_chat_answer("why", _sources(), model)
     system = model.prompts[0]
-    assert "ONLY the incident records provided" in system
+    assert "ONLY the context provided" in system
     assert "Never invent" in system
     assert "Cite the record ids" in system
 
@@ -351,7 +351,7 @@ def _backend_client(monkeypatch, *, reply=None, capture=None):
 
     app.dependency_overrides[get_session] = _session_override
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         if capture is not None:
             capture.append({"query": query, "k": k, "filters": filters})
         return reply or {
@@ -587,7 +587,7 @@ def test_backend_chat_context_fetches_and_prepends_the_record(monkeypatch):
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -642,7 +642,7 @@ def test_backend_chat_journey_context_includes_log_lines(monkeypatch):
 
     seen: list[str] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append(query)
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -676,7 +676,7 @@ def test_backend_chat_missing_context_record_degrades_to_the_bare_question(monke
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "retrieval-only"}
 
@@ -1003,7 +1003,7 @@ def _incident_chat(monkeypatch, results, query="how bad is this", incident_id="I
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append({"query": query, "filters": filters})
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -1075,7 +1075,7 @@ def test_backend_chat_unknown_kind_degrades_to_the_bare_question(monkeypatch):
 
     seen: list[str] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append(query)
         return {"answer": "a", "sources": [], "mode": "ai"}
 

@@ -11,6 +11,7 @@ import { groupAlertsByOrder } from "@/lib/incidents";
 import { INCIDENT_STATUS_BADGE, INCIDENT_STATUS_LABEL } from "@/lib/incidentStatus";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { Badge } from "@/components/ui/Badge";
+import { IncidentActionsMenu } from "@/components/incidents/IncidentActionsMenu";
 import { OrderGroupRow } from "@/components/incidents/OrderGroupRow";
 import { formatTime, capitalize } from "@/lib/format";
 import type { IncidentDetail, WsEvent } from "@/lib/types";
@@ -32,14 +33,17 @@ export default function IncidentDetailPage() {
       .finally(() => setLoading(false));
   }, [params.incidentId]);
 
+  // The guards live here, not on a `disabled` prop: the action moved into the
+  // kebab menu (IncidentActionsMenu), which closes on click and exposes no
+  // disabled/loading state, so re-entry has to be refused by the handler itself.
   const handleResolve = useCallback(() => {
-    if (!incident) return;
+    if (!incident || resolving || incident.status === "resolved") return;
     setResolving(true);
     resolveIncident(incident.incident_id)
       .then((updated) => setIncident((prev) => (prev ? { ...prev, status: updated.status } : prev)))
       .catch((err) => console.error("Failed to resolve incident:", err))
       .finally(() => setResolving(false));
-  }, [incident]);
+  }, [incident, resolving]);
 
   const handleEvent = useCallback(
     (event: WsEvent) => {
@@ -112,13 +116,16 @@ export default function IncidentDetailPage() {
             {INCIDENT_STATUS_LABEL[incident.status]}
           </span>
           {incident.department && <Badge status="info">{capitalize(incident.department)}</Badge>}
-          <span style={{ marginLeft: "auto", display: "flex", gap: "8px" }}>
-            {/* Secondary, not primary: "Resolve" is this page's single primary
-                action (guidelines allow at most one), and the assistant is a
-                supporting action. Same treatment as AlertDetailDrawer's
-                "Ask About This". */}
+          <span
+            style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            {/* Primary now. It was secondary while "Resolve" was a button beside
+                it, because the guidelines allow at most one primary action per
+                view. Resolving moved into the kebab below, so the assistant is
+                this page's only prominent action — which also makes it match the
+                journey detail page's "Ask About This Journey". */}
             <Button
-              variant="secondary"
+              variant="primary"
               size="compact"
               leftIcon={<ChatCircleDotsIcon size={20} />}
               onClick={() =>
@@ -130,15 +137,11 @@ export default function IncidentDetailPage() {
             >
               Ask About This Incident
             </Button>
-            <Button
-              variant="primary"
-              size="compact"
-              onClick={handleResolve}
-              disabled={isResolved || resolving}
-              loading={resolving}
-            >
-              {isResolved ? "Resolved" : "Resolve"}
-            </Button>
+            {/* Same menu the incidents list uses (IncidentCard), so "Mark
+                Resolved" is one action with one label everywhere. It renders a
+                "Resolved" chip instead of the kebab once resolved, which is why
+                nothing here branches on isResolved. */}
+            <IncidentActionsMenu isResolved={isResolved} onResolve={handleResolve} />
           </span>
         </div>
         <div

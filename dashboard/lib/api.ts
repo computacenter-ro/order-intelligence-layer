@@ -192,6 +192,16 @@ export function fetchFacets(filter: AlertsFilter = {}): Promise<AlertFacets> {
   return getJson<AlertFacets>(`/alerts/facets${query ? `?${query}` : ""}`);
 }
 
+/**
+ * One alert by id (backend GET /alerts/{alert_id}).
+ *
+ * For callers holding an id and nothing else — the assistant's citation chips.
+ * The list endpoint cannot serve that: it has no alert_id filter.
+ */
+export function fetchAlert(alertId: string): Promise<ProcessedAlert> {
+  return getJson<ProcessedAlert>(`/alerts/${encodeURIComponent(alertId)}`);
+}
+
 export interface JourneysFilter {
   status?: string;
   outcome?: string;

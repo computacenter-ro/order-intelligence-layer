@@ -706,12 +706,39 @@ def test_facets_accepts_the_same_filter_params_as_alerts():
     assert query_params(facets) == query_params(alerts) - paging
 
 
-def test_facets_is_not_shadowed_by_the_resolve_route():
-    """"facets" must not be parsed as an {alert_id}. The resolve route is PATCH
-    /alerts/{alert_id}/resolve so the shapes differ, but a future GET
-    /alerts/{alert_id} would shadow this path — this pins the current behaviour."""
+def test_facets_is_not_shadowed_by_the_single_alert_route():
+    """"facets" must not be parsed as an {alert_id}.
+
+    ``GET /alerts/{alert_id}`` now exists, which is exactly the route this test was
+    written to guard against. Starlette matches in registration order, so the
+    single-alert route MUST stay declared below /alerts/facets in api.py — if it
+    moves above, this request returns an alert lookup for the id "facets" and the
+    dashboard silently loses its facet counts.
+    """
     _facet_session()
     assert TestClient(app).get("/alerts/facets").status_code == 200
+
+
+# --- GET /alerts/{alert_id} ---------------------------------------------------
+
+
+def test_get_alert_returns_the_alert():
+    """The assistant's citation chips hold an id and nothing else, so a
+    single-record read has to exist; the list endpoint has no alert_id filter."""
+    _use([_FakeResult(one=_alert(alert_id="alert-9"))])
+    r = TestClient(app).get("/alerts/alert-9")
+    assert r.status_code == 200
+    assert r.json()["alert_id"] == "alert-9"
+
+
+def test_get_alert_404_when_missing():
+    _use([_FakeResult(one=None)])
+    assert TestClient(app).get("/alerts/nope").status_code == 404
+
+
+def test_get_alert_requires_auth():
+    app.dependency_overrides.clear()
+    assert TestClient(app).get("/alerts/alert-1").status_code == 401
 
 
 # --- free-text search (ILIKE over message OR explanation) --------------------

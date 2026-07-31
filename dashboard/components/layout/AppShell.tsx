@@ -8,7 +8,6 @@ import type { BaseNavItem, SideNavItem } from "@computacenter-ro/style-guide/com
 import {
   BellIcon,
   ChartBarIcon,
-  ChatCircleDotsIcon,
   ClockCounterClockwiseIcon,
   GaugeIcon,
   MapTrifoldIcon,
@@ -19,18 +18,13 @@ import {
 // One mark for both nav states — the expanded header pairs it with the app
 // name, so the wordmark logo it replaced was redundant (and set the brand twice).
 import ccLogoWhiteMark from "@/assets/cc-logo-white-mark.png";
+import { ChatLauncher } from "@/components/chat/ChatLauncher";
 import { ChatPanel } from "@/components/chat/ChatPanel";
 import { useAuth } from "@/lib/auth";
 import { ChatProvider, useChat } from "@/lib/chat";
 import { displayName } from "@/lib/format";
 
 const COLLAPSE_STORAGE_KEY = "oil-sidenav-collapsed";
-
-// The assistant is a drawer, not a page, but SideNavItem requires an href. This
-// sentinel is intercepted in onItemClick and never routed to — so the item sits
-// with the others (icons are required on every side-nav item) without adding a
-// route that would 404.
-const ASSISTANT_HREF = "#assistant";
 
 interface AppShellProps {
   children: React.ReactNode;
@@ -48,7 +42,7 @@ function AppShellInner({ children }: AppShellProps) {
   const router = useRouter();
   const pathname = usePathname();
   const { user, logout } = useAuth();
-  const { open: chatOpen, scope, scopeLabel, openChat, closeChat } = useChat();
+  const { open: chatOpen, scope, scopeLabel, closeChat } = useChat();
   const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
@@ -99,17 +93,6 @@ function AppShellInner({ children }: AppShellProps) {
       active: pathname === "/ai-performance",
     },
     {
-      label: "Assistant",
-      href: ASSISTANT_HREF,
-      icon: <ChatCircleDotsIcon size={20} />,
-      // Never "active": it is an overlay, not a location. Marking it active
-      // would break the one-active-item-at-a-time rule against the real page
-      // underneath it.
-      active: false,
-    },
-    // A normal route, unlike the Assistant above it — so it takes a real href
-    // and highlights from the pathname like every other item.
-    {
       label: "Architecture",
       href: "/architecture",
       icon: <TreeStructureIcon size={20} />,
@@ -117,12 +100,9 @@ function AppShellInner({ children }: AppShellProps) {
     },
   ];
 
+  // Every nav item is now a real route — the assistant moved out to
+  // ChatLauncher, so there is no sentinel href left to intercept.
   const handleItemClick = (item: BaseNavItem) => {
-    // The assistant opens the drawer over the current page instead of navigating.
-    if (item.href === ASSISTANT_HREF) {
-      openChat(null);
-      return;
-    }
     router.push(item.href);
   };
 
@@ -183,14 +163,24 @@ function AppShellInner({ children }: AppShellProps) {
   );
 
   return (
-    <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
+    // The collapsed class is the hook the side-nav header rules in
+    // app/globals.css need: the caret stacks under the logo only on the narrow
+    // rail, and there is no other way to select the nav state from CSS (the
+    // style guide sets the width inline). Put on the existing root rather than a
+    // new wrapper, so the flex row the nav and <main> live in is untouched.
+    <div
+      className={collapsed ? "oil-nav-collapsed" : undefined}
+      style={{ display: "flex", height: "100vh", overflow: "hidden" }}
+    >
       <SideNav
         logo={
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            {/* Same mark AND same 40x30 as the collapsed rail, so the logo does
-                not change size when the panel toggles. 40px is the ceiling: the
-                collapsed rail is 64px wide with 12px padding either side. */}
-            <Image src={ccLogoWhiteMark} alt="Computacenter" height={30} width={40} />
+            {/* Same mark AND same 32x24 as the collapsed rail, so the logo does
+                not change size when the panel toggles. 40px was the ceiling (the
+                collapsed rail is 64px wide with 12px padding either side); 32
+                sits under it deliberately, so the mark reads as a mark rather
+                than competing with the app name beside it. */}
+            <Image src={ccLogoWhiteMark} alt="Computacenter" height={24} width={32} />
             <span style={{ color: "var(--cc-cloud-white)", fontSize: "14px", fontWeight: 600 }}>
               IT Support Dashboard
             </span>
@@ -204,9 +194,11 @@ function AppShellInner({ children }: AppShellProps) {
         // An explicit width is immune to that, and centres on the rail's axis
         // (x=32) alongside the 20px item icons.
         //
-        // The caret now sits on its own row BELOW this one — see the side-nav
-        // header rules in app/globals.css, which also zero the negative margin
-        // this wrapper used to need to overlap it.
+        // While COLLAPSED the caret sits on its own row below this one — see the
+        // side-nav header rules in app/globals.css, which also zero the negative
+        // margin this wrapper used to need to overlap it. Expanded, the caret
+        // stays on the header row at its right end, which is the vendored
+        // component's own `space-between` default.
         //
         // Done here rather than in the shared SideNav, which is vendored from
         // the style guide and used by other apps.
@@ -220,10 +212,14 @@ function AppShellInner({ children }: AppShellProps) {
               alignItems: "center",
             }}
           >
-            {/* 40x30 keeps the asset's 1033x765 ratio (1.3503) — the brand
-                rules forbid stretching the logo, so width and height move
-                together. Same size as the expanded header's mark. */}
-            <Image src={ccLogoWhiteMark} alt="Computacenter" height={30} width={40} />
+            {/* 32x24 holds the same 1.333 the previous 40x30 did against the
+                asset's 1033x765 (1.3503) — the brand rules forbid stretching the
+                logo, so width and height move together and the fidelity is
+                unchanged, only the scale. Same size as the expanded header's
+                mark. The track above stays 40px: it is what keeps the global
+                `img { max-width: 100% }` reset from shrinking the image, and a
+                32px mark still centres on the rail's axis inside it. */}
+            <Image src={ccLogoWhiteMark} alt="Computacenter" height={24} width={32} />
           </span>
         }
         items={items}
@@ -244,6 +240,9 @@ function AppShellInner({ children }: AppShellProps) {
       >
         {children}
       </main>
+      {/* The floating trigger for an unscoped conversation, on every page. It
+          hides itself while the panel is open, so the two are never both here. */}
+      <ChatLauncher />
       {/* Mounted once at the shell so every entry point drives the same drawer.
           The `key` makes a change of scope remount it, discarding the previous
           conversation — carrying turns about a different record over would

@@ -844,9 +844,51 @@ put auth-method specifics in the JWT payload; keep it identity + expiry.
 Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `PASSWORD_LOGIN_ENABLED`,
 `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_REDIRECT_URI`,
 `JWT_SECRET` (≥32 bytes in
-deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS).
+deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS),
+`AUTH_COOKIE_SAMESITE` (default `lax`).
 The dev-run scripts (injector, replay) POST to the collector/RabbitMQ — NOT this
 API — so they are unaffected by auth. `passlib` needs `bcrypt<4.1` (pinned).
+
+### Cross-site deployment (e.g. Azure Container Apps)
+
+Locally the dashboard and backend are same-site (`localhost:3000` → `:8000`), so
+every default below is the local value and docker-compose needs none of them. In a
+deployment where the two get **different hostnames**, three things must change
+together — they are one decision, not three:
+
+| Env var | Local default | Cross-site deploy |
+|---|---|---|
+| `CORS_ALLOW_ORIGINS` | `http://localhost:3000` | the dashboard's origin (comma-separated for several) |
+| `AUTH_COOKIE_SAMESITE` | `lax` | **`none`** |
+| `AUTH_COOKIE_SECURE` | `false` | **`true`** (required by `SameSite=none`) |
+
+- **`allow_credentials=True` forbids a `*` origin**, so the dashboard origin must
+  be listed explicitly — hence an env var rather than a constant.
+- A `lax` cookie is withheld on cross-site fetch **and on the WebSocket upgrade**,
+  so login appears to succeed and then every guarded call 401s. `none` fixes that
+  but browsers reject `SameSite=None` without `Secure`, so `backend/auth.py`
+  validates the pair at import and refuses to start on a bad combination rather
+  than shipping a cookie the browser silently drops.
+- Set and clear read the same two constants, so a logout can never emit different
+  attributes than the login (a mismatch is ignored by the browser and leaves the
+  user signed in).
+- The Entra `oil_oauth_state` cookie stays `lax` regardless — that hop is a
+  top-level redirect, and `strict`/`none` would break or needlessly loosen it.
+
+**TLS to managed backends.** Postgres needs care; Redis and RabbitMQ do not:
+
+- **Postgres** — `DB_SSL=require` turns TLS on without touching the URL. Note
+  `?sslmode=require` (the form the Azure portal gives you) is a **trap on
+  asyncpg**: SQLAlchemy forwards unknown query params straight to
+  `asyncpg.connect()`, which has no `sslmode` parameter (only `ssl`), so it raises
+  `TypeError: connect() got an unexpected keyword argument 'sslmode'` on the FIRST
+  connection — long after startup looked healthy. `backend/db.py` translates
+  `sslmode` → `ssl` for asyncpg and leaves psycopg2 (Alembic's driver, which
+  handles `sslmode` natively) alone.
+- **Redis** — no change needed: `rediss://` in `REDIS_URL` selects
+  `SSLConnection` automatically.
+- **RabbitMQ** — no change needed: `amqps://` in `RABBITMQ_URL` enables TLS
+  (aiormq branches on the scheme).
 
 Dashboard: `lib/auth.tsx` (`AuthProvider` calls `/auth/me` on load) +
 `components/auth/AuthGate.tsx` (renders `LoginScreen` when anonymous, the app
@@ -972,7 +1014,12 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 to enable Entra sign-in; absent = disabled, never a crash),
 `ENTRA_REDIRECT_URI=http://localhost:8000/auth/entra/callback` (must match the
 Azure app registration byte-for-byte), `PASSWORD_LOGIN_ENABLED=true` (set false in
-any deployment), plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
+any deployment),
+`CORS_ALLOW_ORIGINS=http://localhost:3000` (comma-separated browser origins),
+`AUTH_COOKIE_SAMESITE=lax` (`none` for a cross-site deploy — needs
+`AUTH_COOKIE_SECURE=true`), `DB_SSL=` (unset = no TLS; `require` for a managed
+Postgres) — see "Cross-site deployment" under [5] for how these three go
+together — plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
 above.
 
 `LLM_STATS_CACHE_TTL_SECONDS` was **removed** with the TTL cache it belonged to —

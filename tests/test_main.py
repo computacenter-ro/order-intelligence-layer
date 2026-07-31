@@ -88,3 +88,68 @@ async def test_lifespan_survives_consumer_failure(monkeypatch):
     async with main.lifespan(main.app):
         await asyncio.sleep(0.01)  # task fails, but the app stays up
     # no exception propagated out of the lifespan
+
+
+# =============================================================================
+# CORS origins — env-driven (CORS_ALLOW_ORIGINS)
+#
+# The deployed dashboard sits on a different HTTPS subdomain than the backend
+# (Azure Container Apps gives each app its own hostname), so the allowed origin
+# is a deployment detail rather than a constant. `allow_credentials=True` forbids
+# a "*" origin, hence an explicit configurable list.
+# =============================================================================
+def test_cors_default_is_the_local_dashboard(monkeypatch):
+    """Unset => today's local behavior, so docker-compose dev is unchanged."""
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
+    assert main.cors_allow_origins() == ["http://localhost:3000"]
+
+
+def test_cors_reads_a_single_origin_from_env(monkeypatch):
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://dash.example.com")
+    assert main.cors_allow_origins() == ["https://dash.example.com"]
+
+
+def test_cors_splits_a_comma_separated_list(monkeypatch):
+    monkeypatch.setenv(
+        "CORS_ALLOW_ORIGINS",
+        "https://dash.example.com,https://dash-staging.example.com",
+    )
+    assert main.cors_allow_origins() == [
+        "https://dash.example.com",
+        "https://dash-staging.example.com",
+    ]
+
+
+def test_cors_trims_whitespace_and_drops_blanks(monkeypatch):
+    # A trailing comma or a wrapped value in a compose/portal field must not
+    # inject an empty origin (an empty string would never match any Origin
+    # header, but it would be a confusing entry to debug).
+    monkeypatch.setenv(
+        "CORS_ALLOW_ORIGINS",
+        " https://a.example.com , https://b.example.com ,, ",
+    )
+    assert main.cors_allow_origins() == [
+        "https://a.example.com",
+        "https://b.example.com",
+    ]
+
+
+def test_cors_empty_value_allows_nothing_rather_than_everything(monkeypatch):
+    """Empty must NOT be read as a wildcard: with allow_credentials=True a "*"
+    origin is rejected by browsers anyway, so widening would be wrong AND unsafe."""
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "")
+    assert main.cors_allow_origins() == []
+
+
+def test_cors_middleware_is_configured_with_credentials_and_methods():
+    """The pieces the cross-site session cookie depends on stay in place."""
+    cors = [
+        mw for mw in main.app.user_middleware
+        if mw.cls.__name__ == "CORSMiddleware"
+    ]
+    assert len(cors) == 1
+    kwargs = cors[0].kwargs
+    assert kwargs["allow_credentials"] is True
+    assert set(kwargs["allow_methods"]) == {"GET", "POST", "PATCH", "OPTIONS"}
+    # Wired to the resolver, not a hardcoded literal.
+    assert kwargs["allow_origins"] == main.cors_allow_origins()

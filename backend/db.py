@@ -56,7 +56,64 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://oil:oil@localhost:5432/oil",
 )
 
-engine: AsyncEngine = create_async_engine(DATABASE_URL, future=True)
+# TLS to a managed Postgres (Azure Database for PostgreSQL requires it).
+#
+# ``DB_SSL`` values mirror libpq's sslmode vocabulary; anything other than the
+# default "" / "disable" / "prefer" turns TLS on. Unset => no SSL, so local
+# docker-compose is untouched.
+DB_SSL = os.getenv("DB_SSL", "").strip().lower()
+_SSL_OFF = ("", "disable", "prefer", "allow", "false", "0")
+
+
+def _engine_kwargs(url: str, db_ssl: str):
+    """Return the (url, kwargs) to build the async engine with.
+
+    The URL is returned as a SQLAlchemy ``URL`` object, NOT a string:
+    ``str(URL)`` renders the password as ``***`` (deliberate, so URLs are safe to
+    log), so stringifying here would hand the engine a literal ``***`` password
+    and every connection would fail authentication. ``create_async_engine``
+    accepts the object directly.
+
+    Two separate problems, both specific to the **asyncpg** driver:
+
+    1. ``?sslmode=require`` in the URL is a TRAP. SQLAlchemy's asyncpg dialect
+       forwards unknown query params straight to ``asyncpg.connect()``, and
+       asyncpg has no ``sslmode`` parameter (only ``ssl``) — so the URL Azure
+       hands you in its connection-string blade raises
+       ``TypeError: connect() got an unexpected keyword argument 'sslmode'`` on
+       the FIRST connection, long after startup looked fine. psycopg2 accepts
+       ``sslmode``, which is why this is easy to copy across and be surprised by.
+       So a ``sslmode`` param is translated to asyncpg's ``ssl`` here.
+
+    2. ``DB_SSL=require`` enables TLS without touching the URL at all, for
+       deployments that inject a plain URL and configure TLS separately.
+
+    An explicit ``ssl=`` already in the URL is left alone — it is already the
+    form asyncpg wants, and the caller clearly meant it.
+    """
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(url)
+    query = dict(parsed.query)
+
+    # (1) sslmode -> ssl, only for asyncpg (psycopg2 handles sslmode natively).
+    is_asyncpg = parsed.get_driver_name() == "asyncpg"
+    sslmode = query.pop("sslmode", None) if is_asyncpg else None
+    if sslmode is not None and "ssl" not in query:
+        # libpq's "verify-ca"/"verify-full" have no direct asyncpg string form;
+        # "require" is the closest safe equivalent (encrypt, and asyncpg still
+        # verifies against the system trust store).
+        query["ssl"] = "require" if sslmode in ("verify-ca", "verify-full") else sslmode
+
+    # (2) the env flag, when the URL says nothing about TLS.
+    if is_asyncpg and db_ssl not in _SSL_OFF and "ssl" not in query:
+        query["ssl"] = db_ssl
+
+    return parsed.set(query=query), {"future": True}
+
+
+_url, _kwargs = _engine_kwargs(DATABASE_URL, DB_SSL)
+engine: AsyncEngine = create_async_engine(_url, **_kwargs)
 
 SessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
     bind=engine,

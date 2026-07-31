@@ -11,6 +11,9 @@ const DEBOUNCE_MS = 300;
 interface SearchInputProps {
   value: string;
   onChange: (value: string) => void;
+  /** What the box searches, for screen readers. Defaults to the alert wording. */
+  ariaLabel?: string;
+  placeholder?: string;
 }
 
 /**
@@ -27,8 +30,19 @@ interface SearchInputProps {
  * user typed during the round trip — type "abc" fast enough and you get "ab"
  * back. So the last emitted value is remembered and echoes of it are ignored;
  * only a genuinely external change resyncs the field.
+ *
+ * Only the two user-visible strings are parameterised (defaulting to the alert
+ * wording, so every existing call site is untouched). Everything else here — the
+ * debounce, the echo suppression, the immediate clear, Escape-to-clear — is
+ * already generic, which is why the journeys list reuses this rather than forking
+ * a near-identical copy that would drift on the next fix.
  */
-export function SearchInput({ value, onChange }: SearchInputProps) {
+export function SearchInput({
+  value,
+  onChange,
+  ariaLabel = "Search alerts by message or explanation",
+  placeholder = "Search alerts…",
+}: SearchInputProps) {
   const [text, setText] = useState(value);
   // onChange is an inline arrow at the call site, so its identity changes every
   // render. Held in a ref so the debounce effect can depend on `text` alone
@@ -104,8 +118,8 @@ export function SearchInput({ value, onChange }: SearchInputProps) {
             clear();
           }
         }}
-        aria-label="Search alerts by message or explanation"
-        placeholder="Search alerts…"
+        aria-label={ariaLabel}
+        placeholder={placeholder}
         style={{
           flex: 1,
           minWidth: 0,

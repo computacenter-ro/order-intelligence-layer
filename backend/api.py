@@ -37,7 +37,11 @@ Endpoints:
   never collapses that facet's own list — but ``search`` has no facet of its own,
   so it scopes all three. Filter conditions come from the shared
   :func:`alert_filter_conditions`, so the feed and its counts cannot disagree.
-* ``GET /journeys?status=`` — journeys filtered by ``status``.
+* ``GET /journeys?status=&outcome=&search=`` — journeys filtered by ``status``
+  and/or ``outcome`` (both free strings, exact match — see
+  :func:`build_journeys_query` for why neither is a ``Literal``), plus a free-text
+  ``search`` that substring-matches (``ILIKE``) any of the three alias ids
+  (``event_id`` / ``order_id`` / ``cart_header_id``). Blank search = no filter.
 * ``GET /journeys/{journey_id}`` — one journey + its events (ordered by ``ts``)
   + summary; 404 if the journey does not exist.
 * ``GET /stats/insights`` — aggregate counters for the dashboard insights page.
@@ -246,11 +250,65 @@ def build_alert_facet_query(
     )
 
 
-def build_journeys_query(status: str | None) -> Select:
-    """Select journeys, optionally filtered by ``status``."""
+def build_journeys_query(
+    status: str | None,
+    outcome: str | None = None,
+    search: str | None = None,
+) -> Select:
+    """Select journeys, optionally filtered by ``status``, ``outcome`` and ``search``.
+
+    ``search`` is a case-insensitive substring over the three alias ids
+    (``event_id`` / ``order_id`` / ``cart_header_id``) — the only human-meaningful
+    text a journey row carries. Grouped in ONE ``or_`` so it ANDs with the other
+    filters as a unit; flattening it would turn ``status = X AND (a OR b OR c)``
+    into ``(status = X AND a) OR b OR c``, quietly ignoring the status filter for
+    anything matching on the second or third id.
+
+    Three deliberate choices, recorded so they read as decisions rather than
+    oversights:
+
+    * **``outcome`` is a free ``str``, not a ``Literal``.** Its sibling ``status``
+      on the same route is already an unconstrained ``str``, and the ten outcome
+      values are module constants in ``backend/journeys.py`` — restating them in a
+      ``Literal`` here creates two lists to keep in step. The consequence is that a
+      misspelled value yields an empty list rather than a 422, which is exactly how
+      ``status`` already behaves.
+    * **No NULL bucket for ``outcome``.** ``status=IN_PROGRESS`` already selects the
+      journeys that have no outcome yet, and the convention borrowed from
+      ``alert_filter_conditions`` is that a non-empty filter excludes NULLs, as SQL
+      does. Note the corollary for search: ``ILIKE`` on a NULL column is NULL, so a
+      journey with no ``order_id`` never matches an order-id search. Correct, not a
+      gap — it genuinely has no such id.
+    * **Both are sequential scans.** ``outcome`` is unindexed (like ``status``
+      today), and while the three id columns ARE indexed, a leading-wildcard
+      ``ILIKE '%x%'`` cannot use a btree index. Fine at these volumes; nobody
+      should assume the indexes are helping here.
+
+    Every clause stays strictly conditional: with no filters the statement compiles
+    without a WHERE at all.
+    """
     stmt = select(Journey)
+    conditions = []
     if status is not None:
-        stmt = stmt.where(Journey.status == status)
+        conditions.append(Journey.status == status)
+    if outcome is not None:
+        conditions.append(Journey.outcome == outcome)
+    if search and search.strip():
+        # Same helper the alert search uses — it already escapes the LIKE
+        # metacharacters (and the escape char first), and is already covered by
+        # tests. A cart header id is 19 digits and an event id is a UUID, so `_`
+        # and `%` are unlikely in practice, but a second implementation of this
+        # would be a second thing to get wrong.
+        term = _like_term(search.strip())
+        conditions.append(
+            or_(
+                Journey.event_id.ilike(term, escape="\\"),
+                Journey.order_id.ilike(term, escape="\\"),
+                Journey.cart_header_id.ilike(term, escape="\\"),
+            )
+        )
+    if conditions:
+        stmt = stmt.where(*conditions)
     return stmt
 
 
@@ -324,7 +382,7 @@ async def list_alerts(
     search: Annotated[str | None, Query()] = None,
     # Cursor pagination (see backend/pagination.py). limit is clamped to 1..100
     # rather than 422'd so a caller can pass anything and still get a sane page.
-    limit: Annotated[int, Query()] = 16,
+    limit: Annotated[int, Query()] = 12,
     cursor: Annotated[str | None, Query()] = None,
     sort: Annotated[Literal["emitted_at", "resolved_at"], Query()] = "emitted_at",
     session: AsyncSession = Depends(get_session),
@@ -443,7 +501,9 @@ async def resolve_alert(
 @router.get("/journeys", response_model=Page[JourneyOut])
 async def list_journeys(
     status: Annotated[str | None, Query()] = None,
-    limit: Annotated[int, Query()] = 16,
+    outcome: Annotated[str | None, Query()] = None,
+    search: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query()] = 12,
     cursor: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> Page[JourneyOut]:
@@ -451,7 +511,7 @@ async def list_journeys(
     # last_ts is nullable (a journey may exist before its first event lands),
     # so NULLs sort last in the newest-first order.
     stmt = apply_keyset(
-        build_journeys_query(status),
+        build_journeys_query(status, outcome, search),
         Journey.last_ts,
         Journey.journey_id,
         cursor=cursor,
@@ -498,7 +558,7 @@ async def get_journey(
 async def list_incidents(
     status: Annotated[Literal["open", "resolved"] | None, Query()] = None,
     department: Annotated[list[Department] | None, Query()] = None,
-    limit: Annotated[int, Query()] = 16,
+    limit: Annotated[int, Query()] = 12,
     cursor: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> Page[IncidentOut]:

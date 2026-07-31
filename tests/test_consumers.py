@@ -3,7 +3,7 @@
 Exercised without a broker or a DB:
 
 * ``alert_row_values`` — pure mapping ProcessedAlert -> Alert columns; fallback
-  alerts carry null explanation/department/confidence.
+  alerts carry null explanation/department/severity.
 * ``_process`` on each consumer — with a fake session (and, for raw events, a
   fake assembler) we assert the persistence call shape without Postgres.
 * **Idempotency** is asserted structurally: the alert INSERT compiles to an
@@ -58,7 +58,6 @@ def _alert(source: str = "ai", **over) -> ProcessedAlert:
         log=over.pop("log", _log()),
         explanation=None if source == "fallback" else "SPT was unreachable",
         department=None if source == "fallback" else Department.backend,
-        confidence=None if source == "fallback" else 0.82,
         source=source,
     )
 
@@ -131,8 +130,11 @@ def test_alert_row_values_ai_maps_log_and_enrichment():
     assert values["account_number"] == "81036533"
     assert values["explanation"] == "SPT was unreachable"
     assert values["department"] == "backend"  # enum -> its string value
-    assert values["confidence"] == 0.82
     assert values["source"] == "ai"
+    # The router no longer produces a confidence, so it must not reach the row —
+    # the alerts.confidence column is dropped (see the c9b3f07a51de migration),
+    # and a stray key here would make the INSERT fail.
+    assert "confidence" not in values
 
 
 def test_alert_row_values_maps_cached_flag():
@@ -162,7 +164,8 @@ def test_alert_row_values_fallback_nulls_enrichment():
     assert values["source"] == "fallback"
     assert values["explanation"] is None
     assert values["department"] is None
-    assert values["confidence"] is None
+    assert values["severity"] is None
+    assert "confidence" not in values
     # the log fields are still present
     assert values["log_id"] == "log-1"
 

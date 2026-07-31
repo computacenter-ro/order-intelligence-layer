@@ -71,7 +71,6 @@ class AlertOut(BaseModel):
     explanation: str | None = None
     department: str | None = None
     severity: str | None = None
-    confidence: float | None = None
     source: str
     # True when the AI service served this from its semantic cache. Modifies
     # source="ai" (the answer is still AI-authored, just reused); never set on a

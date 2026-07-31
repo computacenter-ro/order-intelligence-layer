@@ -23,6 +23,11 @@ Config (env; defaults keep local dev zero-config but are NOT safe for deploy):
 * ``JWT_TTL_SECONDS``      — token lifetime (default 8h)
 * ``AUTH_COOKIE_SECURE``   — send cookie only over HTTPS (default false for
   localhost http; set true in any real deployment)
+* ``AUTH_COOKIE_SAMESITE`` — SameSite for the session cookie (default ``lax``).
+  Set to ``none`` for a CROSS-SITE deployment (dashboard and backend on different
+  subdomains, as on Azure Container Apps), which additionally REQUIRES
+  ``AUTH_COOKIE_SECURE=true`` — browsers reject ``SameSite=None`` without
+  ``Secure``. Both are validated at import.
 
 Generate a hash for your chosen password with::
 
@@ -55,6 +60,52 @@ JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", str(8 * 60 * 60)))
 
 COOKIE_NAME = "oil_session"
 COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true"
+
+# SameSite for the SESSION cookie. Default "lax" keeps local dev (same-site
+# localhost) exactly as before.
+#
+# **Set this to "none" for a cross-site deployment** — e.g. Azure Container Apps,
+# where the dashboard and the backend get different subdomains. A "lax" cookie is
+# withheld on cross-site XHR/fetch and on the WebSocket upgrade, so login would
+# appear to succeed and then every guarded call would 401.
+#
+# SameSite=None REQUIRES Secure: browsers reject `SameSite=None` without it
+# outright, which would silently drop the session cookie. So that combination is
+# validated below rather than left to fail confusingly at runtime.
+_VALID_SAMESITE = ("lax", "strict", "none")
+
+
+def resolve_cookie_samesite(raw: str | None, secure: bool) -> str:
+    """Validate + normalize the SameSite setting for the session cookie.
+
+    A standalone function (rather than inline module code) so it is testable
+    without reloading this module: ``backend/api.py`` captures
+    :func:`get_current_user` at import, so a reload would swap the function
+    object out from under the app's dependency graph and detach every guarded
+    route from the object the tests override.
+
+    Raises ``RuntimeError`` on an unusable combination — better a hard failure at
+    startup than a session cookie the browser silently discards in production.
+    """
+    samesite = (raw or "lax").strip().lower()
+    if samesite not in _VALID_SAMESITE:
+        raise RuntimeError(
+            f"AUTH_COOKIE_SAMESITE must be one of {_VALID_SAMESITE}, "
+            f"got {samesite!r}"
+        )
+    if samesite == "none" and not secure:
+        raise RuntimeError(
+            "AUTH_COOKIE_SAMESITE=none requires AUTH_COOKIE_SECURE=true — "
+            "browsers reject a SameSite=None cookie that is not Secure, so the "
+            "session cookie would be dropped and every authenticated request "
+            "would fail."
+        )
+    return samesite
+
+
+COOKIE_SAMESITE = resolve_cookie_samesite(
+    os.getenv("AUTH_COOKIE_SAMESITE"), COOKIE_SECURE
+)
 
 
 # Read at CALL time, not import time, so a deployment (and the tests) can flip it
@@ -134,7 +185,7 @@ def set_auth_cookie(response: Response, token: str) -> None:
         max_age=JWT_TTL_SECONDS,
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="lax",
+        samesite=COOKIE_SAMESITE,
         path="/",
     )
 
@@ -142,7 +193,9 @@ def set_auth_cookie(response: Response, token: str) -> None:
 def clear_auth_cookie(response: Response) -> None:
     """Delete the session cookie (logout).
 
-    ``secure``/``samesite`` MUST mirror :func:`set_auth_cookie` exactly. A browser
+    ``secure``/``samesite`` MUST mirror :func:`set_auth_cookie` exactly — both
+    read the same ``COOKIE_SECURE`` / ``COOKIE_SAMESITE`` module constants for
+    that reason, so they cannot drift apart when either is reconfigured. A browser
     treats a cookie's identity as name + Path + Domain, but it will reject an
     incoming ``Set-Cookie`` that drops ``Secure`` on a secure page — so a deletion
     sent without it can be ignored, leaving the session cookie in place and logout
@@ -155,7 +208,7 @@ def clear_auth_cookie(response: Response) -> None:
         path="/",
         secure=COOKIE_SECURE,
         httponly=True,
-        samesite="lax",
+        samesite=COOKIE_SAMESITE,
     )
 
 

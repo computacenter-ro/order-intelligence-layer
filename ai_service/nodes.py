@@ -3,7 +3,7 @@
 * :func:`explain` — LLM call 1: a plain-English explanation of a WARN/ERROR log
   for an IT-support agent (what happened, which service, likely cause).
 * :func:`route`   — LLM call 2: pick one of the five :class:`Department` values
-  plus a confidence in [0,1].
+  plus a per-log :class:`Severity`.
 
 Both take a LangChain ``BaseChatModel`` (or ``None``) and are otherwise pure —
 no breaker, no Redis, no queues here (the graph owns that). They raise
@@ -68,33 +68,31 @@ _DEPARTMENT_GUIDE = (
 _ROUTE_EXAMPLES = (
     "Examples:\n"
     'message=Margin check FAILED for order ORD-6042: overall margin 8.10% below '
-    'threshold 12.00% -> {"department": "general", "severity": "medium", '
-    '"confidence": 0.9}  (the checker worked; the order is simply unprofitable)\n'
+    'threshold 12.00% -> {"department": "general", "severity": "medium"}  '
+    "(the checker worked; the order is simply unprofitable)\n"
     "message=Validation failed: mandatory UDF 'costCenter' missing on line 2 -> "
-    '{"department": "general", "severity": "medium", "confidence": 0.9}  '
+    '{"department": "general", "severity": "medium"}  '
     "(user-supplied data is incomplete; no defect)\n"
     "message=Authentication failed for user RFLORIA: account disabled in JAM -> "
-    '{"department": "general", "severity": "medium", "confidence": 0.88}  '
+    '{"department": "general", "severity": "medium"}  '
     "(access administration, not code)\n"
     "message=Order processing aborted for order ORD-6108: SPT price list service "
     'unavailable after 3 attempt(s) -> {"department": "networking", "severity": '
-    '"high", "confidence": 0.9}  (a real dependency outage)\n'
+    '"high"}  (a real dependency outage)\n'
     # Paired against the timeout above: both are raw HTTP client lines, so the
     # transport framing is identical and only the STATUS separates them. A 403 means
     # the call reached the server and was refused — an authorization decision, not a
     # connectivity fault. Without this pair the model routes 403s to networking on
     # the strength of "HTTP/1.1" alone.
     "message=[JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- "
-    'HTTP/1.1 403 (250ms) -> {"department": "general", "severity": "medium", '
-    '"confidence": 0.85}  (the call SUCCEEDED and was refused — an access '
+    'HTTP/1.1 403 (250ms) -> {"department": "general", "severity": "medium"}  '
+    "(the call SUCCEEDED and was refused — an access "
     "decision; a 4xx authorization refusal is never a networking fault, whereas a "
     "timeout or connection error is)\n"
     "message=Order creation failed for event evt-1a2b: DB_TIMEOUT — no order was "
-    'created -> {"department": "database", "severity": "critical", "confidence": '
-    "0.92}\n"
+    'created -> {"department": "database", "severity": "critical"}\n'
     "message=Max redelivery attempts reached for event evt-1a2b; routing message "
-    'to order.inbound.dlq -> {"department": "devops", "severity": "high", '
-    '"confidence": 0.9}\n'
+    'to order.inbound.dlq -> {"department": "devops", "severity": "high"}\n'
 )
 
 _ROUTE_SYSTEM = (
@@ -115,7 +113,7 @@ _ROUTE_SYSTEM = (
     "consider business impact you cannot see.\n"
     f"{_ROUTE_EXAMPLES}"
     'Reply with a single JSON object: {"department": "<one of the list>", '
-    '"severity": "<one of the list>", "confidence": <0..1>}. '
+    '"severity": "<one of the list>"}. '
     "No prose, no code fence."
 )
 
@@ -216,8 +214,8 @@ async def explain(log: LogLine, model: BaseChatModel | None) -> str:
 
 async def route(
     log: LogLine, explanation: str, model: BaseChatModel | None
-) -> tuple[Department, Severity, float]:
-    """LLM call 2. Returns (department, severity, confidence); raises LLMError otherwise.
+) -> tuple[Department, Severity]:
+    """LLM call 2. Returns (department, severity); raises LLMError otherwise.
 
     Both the department and the severity are validated against their enums — an
     answer outside the allowed values is an LLMError, never a silent wrong
@@ -358,12 +356,14 @@ async def compose_chat_answer(
     return text
 
 
-def _parse_route(text: str) -> tuple[Department, Severity, float]:
-    """Parse the router's JSON reply into a valid (Department, Severity, confidence).
+def _parse_route(text: str) -> tuple[Department, Severity]:
+    """Parse the router's JSON reply into a valid (Department, Severity).
 
     Tolerant of a stray code fence / surrounding prose (grabs the first {...}).
     Raises LLMError if the department or severity isn't one of the allowed values
-    or the JSON is unusable.
+    or the JSON is unusable. Any extra keys the model volunteers (e.g. a
+    "confidence" it was not asked for) are ignored rather than rejected — the
+    contract is only that department and severity are present and valid.
     """
     raw = text.strip()
     start, end = raw.find("{"), raw.rfind("}")
@@ -386,17 +386,7 @@ def _parse_route(text: str) -> tuple[Department, Severity, float]:
     except ValueError as exc:
         raise LLMError(f"router chose an unknown severity: {sev_str!r}") from exc
 
-    confidence = _clamp_confidence(data.get("confidence"))
-    return department, severity, confidence
-
-
-def _clamp_confidence(value: object) -> float:
-    """Coerce the model's confidence into [0,1]; default 0.5 if missing/bad."""
-    try:
-        conf = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.5
-    return max(0.0, min(1.0, conf))
+    return department, severity
 
 
 def _content_text(resp: object) -> str:

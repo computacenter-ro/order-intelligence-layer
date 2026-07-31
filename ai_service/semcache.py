@@ -268,23 +268,28 @@ class CachePayload:
     normalized_explanation: str
     department: str
     severity: str | None
-    confidence: float | None
 
     def to_dict(self) -> dict:
         return {
             "explanation": self.normalized_explanation,
             "department": self.department,
             "severity": self.severity,
-            "confidence": self.confidence,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "CachePayload":
+        """Rebuild a payload from its persisted dict.
+
+        Only the keys this payload defines are read, so a dump written before
+        ``confidence`` was removed loads fine — the stale key is simply ignored.
+        The cache is persisted in Redis (``ai:semcache``) and survives restarts,
+        so without this a leftover dump would raise on every load and disable the
+        cache until someone dropped the key by hand.
+        """
         return cls(
             normalized_explanation=data["explanation"],
             department=data["department"],
             severity=data.get("severity"),
-            confidence=data.get("confidence"),
         )
 
 

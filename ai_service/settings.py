@@ -68,7 +68,7 @@ BREAKER_OPEN_SECONDS = int(os.getenv("BREAKER_OPEN_SECONDS", "60"))
 # semantic cache is consulted (CLAUDE.md [3]): normalize the message (mask
 # volatile ids), exact-match the normalized text, else cosine-compare a local
 # embedding against stored vectors. A hit >= SEMCACHE_THRESHOLD reuses the
-# cached explanation/department/severity/confidence and skips both LLM calls.
+# cached explanation/department/severity and skips both LLM calls.
 # The corpus is highly repetitive, so the hit rate is high after warm-up.
 SEMCACHE_ENABLED = os.getenv("SEMCACHE_ENABLED", "1") not in ("0", "false", "False", "")
 # Cosine-similarity floor for a semantic (non-exact) hit. High by default so

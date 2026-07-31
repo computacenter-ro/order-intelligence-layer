@@ -126,7 +126,6 @@ def _alert(**over) -> Alert:
         explanation="explained",
         department="backend",
         is_resolved=False,
-        confidence=0.8,
     )
     base.update(over)
     return Alert(**base)
@@ -1071,7 +1070,7 @@ def test_journeys_search_combines_with_the_other_filters():
 def test_get_alerts_serializes_schema_not_orm():
     _use([_FakeResult(items=[_alert(alert_id="a1", source="ai"),
                              _alert(alert_id="a2", source="fallback",
-                                    explanation=None, department=None, confidence=None)])])
+                                    explanation=None, department=None)])])
     r = TestClient(app).get("/alerts")
     assert r.status_code == 200
     items = r.json()["items"]

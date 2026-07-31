@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer
+from pydantic import AwareDatetime, BaseModel, ConfigDict, field_serializer
 
 Level = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 BridgeIds = Literal["both", "order", "cart", "random"]
@@ -109,7 +109,6 @@ class ProcessedAlert(BaseModel):
     explanation: str | None
     department: Department | None
     severity: Severity | None = None
-    confidence: float | None = Field(default=None, ge=0, le=1)
     source: Literal["ai", "fallback"]
     # True when this alert's explanation/routing was served from the AI
     # service's semantic cache (a reused AI answer) rather than a fresh LLM

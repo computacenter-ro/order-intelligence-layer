@@ -545,12 +545,18 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
 ```
 - **Explainer Node** — LLM call 1: plain-English explanation of the log for an
   IT-support agent (what happened, which service, likely cause).
-- **Router Node** — LLM call 2: pick a `department`, a per-log `severity`
-  (`critical`/`high`/`medium`/`low`), and a `confidence` (0–1), returned as one
-  JSON object. Both the department and the severity are validated against their
-  enums — an out-of-range value is an `LLMError` → fallback, never coerced.
-  Severity is per-log *technical* urgency judged from the log alone (not
+- **Router Node** — LLM call 2: pick a `department` and a per-log `severity`
+  (`critical`/`high`/`medium`/`low`), returned as one JSON object —
+  `{"department": ..., "severity": ...}` and **nothing else**. Both are validated
+  against their enums — an out-of-range value is an `LLMError` → fallback, never
+  coerced. Severity is per-log *technical* urgency judged from the log alone (not
   business impact, not journey-level).
+
+  There is **no `confidence`**. The router used to also return a 0–1 score; it was
+  removed end to end (prompt, parsing, `ProcessedAlert`, the `alerts` column, the
+  API response, the Teams card, and the dashboard). A model that volunteers a
+  `confidence` key anyway is *ignored* rather than rejected — dropping an
+  otherwise-valid route to fallback over an extra key would be a regression.
 
   **Department semantics (`_DEPARTMENT_GUIDE` + `_ROUTE_EXAMPLES` in `nodes.py`).**
   The prompt's ALLOWED list is generated from the `Department` enum, but the
@@ -595,7 +601,6 @@ class ProcessedAlert(BaseModel):
     explanation: str | None             # plain English; None when source="fallback"
     department: Department | None      # None when source="fallback"
     severity: Severity | None           # per-log technical severity; None when source="fallback"
-    confidence: float | None            # 0..1; None when source="fallback"
     source: Literal["ai", "fallback"]
     cached: bool = False                 # True when served from the semantic cache
                                          # (still source="ai"; routing unchanged)
@@ -723,8 +728,7 @@ possibly later than the alert that referenced it.
 ```
 alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
        event_id, order_id, cart_header_id, account_number,
-       explanation, department, severity, confidence, source, cached, journey_id FK NULL)
-       explanation, department, severity, confidence, source, journey_id FK NULL,
+       explanation, department, severity, source, cached, journey_id FK NULL,
        is_resolved, resolved_at NULL)
 journeys(journey_id PK, status, outcome NULL, first_ts, last_ts,
          event_id, order_id, cart_header_id, summary NULL)
@@ -850,9 +854,51 @@ put auth-method specifics in the JWT payload; keep it identity + expiry.
 Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `PASSWORD_LOGIN_ENABLED`,
 `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_REDIRECT_URI`,
 `JWT_SECRET` (≥32 bytes in
-deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS).
+deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS),
+`AUTH_COOKIE_SAMESITE` (default `lax`).
 The dev-run scripts (injector, replay) POST to the collector/RabbitMQ — NOT this
 API — so they are unaffected by auth. `passlib` needs `bcrypt<4.1` (pinned).
+
+### Cross-site deployment (e.g. Azure Container Apps)
+
+Locally the dashboard and backend are same-site (`localhost:3000` → `:8000`), so
+every default below is the local value and docker-compose needs none of them. In a
+deployment where the two get **different hostnames**, three things must change
+together — they are one decision, not three:
+
+| Env var | Local default | Cross-site deploy |
+|---|---|---|
+| `CORS_ALLOW_ORIGINS` | `http://localhost:3000` | the dashboard's origin (comma-separated for several) |
+| `AUTH_COOKIE_SAMESITE` | `lax` | **`none`** |
+| `AUTH_COOKIE_SECURE` | `false` | **`true`** (required by `SameSite=none`) |
+
+- **`allow_credentials=True` forbids a `*` origin**, so the dashboard origin must
+  be listed explicitly — hence an env var rather than a constant.
+- A `lax` cookie is withheld on cross-site fetch **and on the WebSocket upgrade**,
+  so login appears to succeed and then every guarded call 401s. `none` fixes that
+  but browsers reject `SameSite=None` without `Secure`, so `backend/auth.py`
+  validates the pair at import and refuses to start on a bad combination rather
+  than shipping a cookie the browser silently drops.
+- Set and clear read the same two constants, so a logout can never emit different
+  attributes than the login (a mismatch is ignored by the browser and leaves the
+  user signed in).
+- The Entra `oil_oauth_state` cookie stays `lax` regardless — that hop is a
+  top-level redirect, and `strict`/`none` would break or needlessly loosen it.
+
+**TLS to managed backends.** Postgres needs care; Redis and RabbitMQ do not:
+
+- **Postgres** — `DB_SSL=require` turns TLS on without touching the URL. Note
+  `?sslmode=require` (the form the Azure portal gives you) is a **trap on
+  asyncpg**: SQLAlchemy forwards unknown query params straight to
+  `asyncpg.connect()`, which has no `sslmode` parameter (only `ssl`), so it raises
+  `TypeError: connect() got an unexpected keyword argument 'sslmode'` on the FIRST
+  connection — long after startup looked healthy. `backend/db.py` translates
+  `sslmode` → `ssl` for asyncpg and leaves psycopg2 (Alembic's driver, which
+  handles `sslmode` natively) alone.
+- **Redis** — no change needed: `rediss://` in `REDIS_URL` selects
+  `SSLConnection` automatically.
+- **RabbitMQ** — no change needed: `amqps://` in `RABBITMQ_URL` enables TLS
+  (aiormq branches on the scheme).
 
 Dashboard: `lib/auth.tsx` (`AuthProvider` calls `/auth/me` on load) +
 `components/auth/AuthGate.tsx` (renders `LoginScreen` when anonymous, the app
@@ -876,9 +922,9 @@ Webhook per department channel + general, Teams channels like `#devops-logs`,
 ... , `#general-logs`:
 `TEAMS_WEBHOOK_NETWORKING`, `_DEVOPS`, `_BACKEND`, `_DATABASE`, `_GENERAL`.
 Card (simple title + fields, easy to adapt between an Incoming Webhook and a
-Power Automate flow): level/outcome, service, explanation (or "unprocessed —
-LLM unavailable" for `source="fallback"`), ids, confidence, `AI` vs `fallback`
-badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
+Power Automate flow): level/outcome, severity, department, service, explanation
+(or "unprocessed — LLM unavailable" for `source="fallback"`), ids, `AI` vs
+`fallback` badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
 `journey_id`/`order_id`. **If a channel's webhook env var is unset, print the
 card to stdout** — never crash on missing config.
 
@@ -895,7 +941,8 @@ failing sink so one never stops the other or the consumers.
 
 Connects to backend WS + REST. Feature contract:
 - Real-time alert feed with plain-English explanations.
-- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**, plus a
+- Department + severity per alert (no confidence score — it was removed end to
+  end); **badge `AI-analyzed` vs `fallback`**, plus a
   **`Cached` badge alongside `AI-analyzed`** when `ProcessedAlert.cached` is set
   (a cache hit is the same AI answer reused — a modifier, never a replacement, so
   the two badges show together). An "Answer" filter (`all` / `cached` / `fresh`)
@@ -977,7 +1024,12 @@ plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks above.
 to enable Entra sign-in; absent = disabled, never a crash),
 `ENTRA_REDIRECT_URI=http://localhost:8000/auth/entra/callback` (must match the
 Azure app registration byte-for-byte), `PASSWORD_LOGIN_ENABLED=true` (set false in
-any deployment), plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
+any deployment),
+`CORS_ALLOW_ORIGINS=http://localhost:3000` (comma-separated browser origins),
+`AUTH_COOKIE_SAMESITE=lax` (`none` for a cross-site deploy — needs
+`AUTH_COOKIE_SECURE=true`), `DB_SSL=` (unset = no TLS; `require` for a managed
+Postgres) — see "Cross-site deployment" under [5] for how these three go
+together — plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
 above.
 
 `LLM_STATS_CACHE_TTL_SECONDS` was **removed** with the TTL cache it belonged to —

@@ -129,7 +129,7 @@ def _render_txt(overview: dict, data: dict) -> str:
     lines += ["", bar, f"ALERTS ({len(data['alerts'])})", bar]
     for a in data["alerts"]:
         lines.append("")
-        lines.append(f"  [{a.get('source')}] {a.get('level')} {a.get('app_name')} — dept={a.get('department')} conf={a.get('confidence')}")
+        lines.append(f"  [{a.get('source')}] {a.get('level')} {a.get('app_name')} — dept={a.get('department')} sev={a.get('severity')}")
         lines.append(f"    message    : {a.get('message')}")
         lines.append(f"    explanation: {a.get('explanation')}")
     return "\n".join(lines) + "\n"

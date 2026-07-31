@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowCounterClockwiseIcon,
   ArrowsOutIcon,
   MagnifyingGlassMinusIcon,
   MagnifyingGlassPlusIcon,
+  PauseIcon,
   PlayIcon,
-  StopIcon,
 } from "@phosphor-icons/react";
 import {
   ARCH_EDGES,
@@ -19,7 +20,11 @@ import {
 import { CATEGORY_STYLE, edgePath } from "@/lib/architectureStyle";
 import { ArchNodeShape } from "@/components/architecture/ArchNodeShape";
 import { JOURNEY_STEPS } from "@/lib/architectureJourney";
-import { useJourneyPlayback } from "@/components/architecture/useJourneyPlayback";
+import {
+  MAX_SPEED,
+  MIN_SPEED,
+  useJourneyPlayback,
+} from "@/components/architecture/useJourneyPlayback";
 import { JourneyStatusBar } from "@/components/architecture/JourneyStatusBar";
 
 /**
@@ -293,10 +298,24 @@ export function PipelineDiagram() {
   // The motion preference is read at Play time, not held in state: it is an
   // input to starting a journey, never something the idle map renders
   // differently, so mirroring it into React would be a copy with no reader.
-  const { state: playback, play, stop } = useJourneyPlayback();
+  const {
+    state: playback,
+    speed,
+    play,
+    pause,
+    reset,
+    setSpeed,
+  } = useJourneyPlayback();
   const currentStep = playback.stepIndex >= 0 ? JOURNEY_STEPS[playback.stepIndex] : null;
-  /** Playing OR holding the finished state — i.e. the map is in replay mode. */
-  const journeyRunning = playback.playing || playback.finished;
+  /**
+   * Playing, paused mid-way, OR holding the finished state — i.e. the map is in
+   * replay mode and should dim untouched nodes / hide the legend. A paused
+   * journey still counts: freezing the token does not put the map back to its
+   * idle reading.
+   */
+  const journeyRunning = playback.playing || playback.paused || playback.finished;
+  /** Anything to reset — a journey is under way, paused, or finished. */
+  const journeyStarted = journeyRunning || playback.stepIndex >= 0;
 
   /**
    * Every journey hop's geometry, precomputed.
@@ -329,7 +348,9 @@ export function PipelineDiagram() {
    */
   const activeHopPath = playback.stepIndex >= 0 ? hopPaths[playback.stepIndex] : null;
   const tokenPos =
-    activeHopPath && playback.playing
+    // `paused` as well as `playing`: pausing must FREEZE the token in place, and
+    // gating on `playing` alone would make it disappear instead.
+    activeHopPath && (playback.playing || playback.paused)
       ? // A reversed hop is the same drawn line walked from the far end — that
         // is how the bridge ack goes visibly BACKWARDS to Inbound without the
         // diagram needing a duplicate return edge.
@@ -475,17 +496,19 @@ export function PipelineDiagram() {
               so the active leg reads as lit rather than merely having a dot on
               it. Drawn between edges and nodes: above the lines, under the
               boxes. */}
-          {playback.playing && playback.stepIndex >= 0 && hopPaths[playback.stepIndex] && (
-            <path
-              d={hopPaths[playback.stepIndex] as string}
-              fill="none"
-              stroke="var(--cc-heritage-blue)"
-              strokeWidth={2.6}
-              strokeLinecap="round"
-              opacity={0.5}
-              style={{ pointerEvents: "none" }}
-            />
-          )}
+          {(playback.playing || playback.paused) &&
+            playback.stepIndex >= 0 &&
+            hopPaths[playback.stepIndex] && (
+              <path
+                d={hopPaths[playback.stepIndex] as string}
+                fill="none"
+                stroke="var(--cc-heritage-blue)"
+                strokeWidth={2.6}
+                strokeLinecap="round"
+                opacity={0.5}
+                style={{ pointerEvents: "none" }}
+              />
+            )}
 
           {ARCH_NODES.map((node) => (
             <ArchNodeShape
@@ -550,39 +573,102 @@ export function PipelineDiagram() {
         </ZoomButton>
       </div>
 
-      {/* Play control — top-left, opposite the zoom stack. */}
+      {/* Transport controls — top-left, opposite the zoom stack. Play/Pause and
+          Reset on one row, the speed slider beneath them. */}
       <div
-        style={{ position: "absolute", top: "12px", left: "12px" }}
+        style={{
+          position: "absolute",
+          top: "12px",
+          left: "12px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+          alignItems: "flex-start",
+        }}
+        // The controls sit inside the pan surface, so their own pointerdown must
+        // not also start a drag — this is what lets the slider thumb be dragged
+        // without panning the diagram underneath it.
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <button
-          type="button"
-          onClick={journeyRunning ? stop : play}
-          className="oil-journey-button"
-          aria-label={
-            journeyRunning
-              ? "Stop the order journey replay"
-              : "Play an order journey through the pipeline"
-          }
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: "8px",
-            height: "32px",
-            padding: "0 16px",
-            background: journeyRunning ? "var(--cc-cloud-white)" : "var(--cc-heritage-blue)",
-            border: journeyRunning ? "1px solid var(--cc-grey-five)" : "none",
-            borderRadius: "8px",
-            color: journeyRunning ? "var(--cc-heritage-blue)" : "var(--cc-cloud-white)",
-            fontSize: "14px",
-            fontWeight: 600,
-            lineHeight: "20px",
-            cursor: "pointer",
-          }}
-        >
-          {journeyRunning ? <StopIcon size={20} /> : <PlayIcon size={20} />}
-          {journeyRunning ? "Stop Replay" : "Play Order Journey"}
-        </button>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <button
+            type="button"
+            // Playing -> pause. Paused -> resume. Idle or finished -> start over.
+            onClick={playback.playing ? pause : play}
+            className="oil-journey-button"
+            aria-label={
+              playback.playing
+                ? "Pause the order journey replay"
+                : playback.paused
+                  ? "Resume the order journey replay"
+                  : "Play an order journey through the pipeline"
+            }
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              height: "32px",
+              padding: "0 16px",
+              // Hollow while playing so "pause" never looks like the page's
+              // primary call to action; filled whenever pressing it starts
+              // motion (idle, paused, or replaying a finished journey).
+              background: playback.playing
+                ? "var(--cc-cloud-white)"
+                : "var(--cc-heritage-blue)",
+              border: playback.playing ? "1px solid var(--cc-grey-five)" : "none",
+              borderRadius: "8px",
+              color: playback.playing
+                ? "var(--cc-heritage-blue)"
+                : "var(--cc-cloud-white)",
+              fontSize: "14px",
+              fontWeight: 600,
+              lineHeight: "20px",
+              cursor: "pointer",
+            }}
+          >
+            {playback.playing ? <PauseIcon size={20} /> : <PlayIcon size={20} />}
+            {playback.playing
+              ? "Pause Journey"
+              : playback.paused
+                ? "Resume Journey"
+                : "Play Order Journey"}
+          </button>
+
+          {/* Hollow, never primary: Reset is a way back, not the main action.
+              Disabled while idle — there is nothing to reset, and a live-looking
+              button that does nothing is worse than a visibly inert one. */}
+          <button
+            type="button"
+            onClick={reset}
+            disabled={!journeyStarted}
+            className="oil-journey-button"
+            aria-label="Reset the order journey replay to the start"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              height: "32px",
+              padding: "0 16px",
+              background: "var(--cc-cloud-white)",
+              border: `1px solid ${
+                journeyStarted ? "var(--cc-grey-five)" : "var(--cc-grey-four)"
+              }`,
+              borderRadius: "8px",
+              color: journeyStarted
+                ? "var(--cc-heritage-blue)"
+                : "var(--cc-grey-three)",
+              fontSize: "14px",
+              fontWeight: 600,
+              lineHeight: "20px",
+              cursor: journeyStarted ? "pointer" : "not-allowed",
+            }}
+          >
+            <ArrowCounterClockwiseIcon size={20} />
+            Reset
+          </button>
+        </div>
+
+        <JourneySpeedControl speed={speed} onChange={setSpeed} />
       </div>
 
       {/* Legend — bottom-left, inside the canvas so it travels with the diagram
@@ -686,6 +772,89 @@ export function PipelineDiagram() {
       )}
     </div>
   );
+}
+
+/**
+ * Speed slider for the journey replay.
+ *
+ * The slider is LOGARITHMIC, not linear: the useful range is 0.25x..4x, and on a
+ * linear track 1x — by far the most-wanted value — would sit at 20%, with three
+ * quarters of the travel spent on speeds faster than normal. Mapping through
+ * log2 puts 1x exactly at the midpoint and gives each halving/doubling the same
+ * width, so "one notch slower" feels the same at either end.
+ *
+ * `step` is fine-grained rather than snapped to presets: the request was a
+ * continuous speed control, and the label reports the exact multiplier.
+ */
+const SPEED_EXP_MIN = Math.log2(MIN_SPEED); // -2
+const SPEED_EXP_MAX = Math.log2(MAX_SPEED); // +2
+
+function JourneySpeedControl({
+  speed,
+  onChange,
+}: {
+  speed: number;
+  onChange: (next: number) => void;
+}) {
+  const labelId = "oil-journey-speed-label";
+  return (
+    <div
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "8px",
+        height: "32px",
+        padding: "0 12px",
+        background: "var(--cc-cloud-white)",
+        border: "1px solid var(--cc-grey-five)",
+        borderRadius: "8px",
+      }}
+    >
+      <span
+        id={labelId}
+        style={{
+          fontSize: "14px",
+          fontWeight: 500,
+          lineHeight: "18px",
+          color: "var(--cc-grey-two)",
+        }}
+      >
+        Speed
+      </span>
+      <input
+        type="range"
+        min={SPEED_EXP_MIN}
+        max={SPEED_EXP_MAX}
+        step={0.05}
+        value={Math.log2(speed)}
+        onChange={(e) => onChange(2 ** Number(e.target.value))}
+        aria-labelledby={labelId}
+        // The visible label reads "Speed" and the value shows as a multiplier;
+        // without this a screen reader would announce the raw log2 exponent.
+        aria-valuetext={`${formatSpeed(speed)} times normal speed`}
+        className="oil-speed-slider"
+        style={{ width: "104px" }}
+      />
+      {/* Fixed width so the row does not reflow as the number changes width. */}
+      <span
+        style={{
+          minWidth: "38px",
+          fontSize: "14px",
+          fontWeight: 600,
+          lineHeight: "18px",
+          color: "var(--cc-heritage-blue)",
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {formatSpeed(speed)}x
+      </span>
+    </div>
+  );
+}
+
+/** 0.5 -> "0.5", 2 -> "2" — no trailing ".0" on whole multipliers. */
+function formatSpeed(speed: number): string {
+  return Number.isInteger(speed) ? String(speed) : speed.toFixed(2).replace(/0$/, "");
 }
 
 function ZoomButton({

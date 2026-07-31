@@ -56,6 +56,26 @@ def test_registry_includes_undocumented_and_unsimulated_services(registry):
     assert "Salesforce" in registry.services    # not_simulated
 
 
+def test_undocumented_services_point_at_their_second_hand_doc(registry):
+    """cc-checker-service has no file, but order-engine.md §4.3 is the Order
+    Engine's account of the margin check."""
+    assert registry.services["cc-checker-service"].see_also == "order-engine"
+
+
+def test_folded_in_components_inherit_the_doc_of_their_emitter(registry):
+    """SOLR and Avalara have no app_name of their own — their lines come out of
+    another service, whose doc is therefore the one describing them. No explicit
+    see_also needed: `emitted_by` already is one."""
+    assert registry.services["SOLR"].see_also == "order-engine"
+    assert registry.services["Avalara"].see_also == "order-validator-web-service"
+
+
+def test_a_genuinely_undocumented_service_has_no_see_also(registry):
+    """Nothing in the corpus describes SPT — that absence must stay honest."""
+    assert registry.services["cc-spt-service"].see_also is None
+    assert registry.services["SAP / BTP"].see_also is None
+
+
 def test_registry_terms_are_longest_first(registry):
     """"SAP submission" (OSW) must beat "SAP" (SAP/BTP)."""
     lengths = [len(term) for term, _ in registry.all_terms()]
@@ -219,6 +239,63 @@ def test_kind_mode_off_ignores_the_question_kind(registry):
     )
     hits = kr.retrieve_docs(index, "what does jam-ws do?", registry, k=5, kind_mode="off")
     assert [h["id"] for h in hits] == ["jam-ws#trap", "jam-ws#what"]
+
+
+def test_undocumented_service_searches_its_see_also_doc_only(registry):
+    """A cc-checker-service question must NOT fall through to all five docs.
+
+    The observed failure: a margin-check alert cited `rsm-ws#key-concepts--
+    availablequantity` and an order-validator "concepts this document does not
+    cover" section — both pulled in purely because the question said "means" and
+    "concepts" sections are full of that word.
+    """
+    index = _FakeIndex(
+        [
+            _rec("order-engine#margin", "order-engine", "rule", 0.50),
+            _rec("rsm-ws#concepts", "rsm-ws", "concept", 0.95),
+        ]
+    )
+    hits = kr.retrieve_docs(
+        index,
+        "Regarding this incident: ERROR cc-checker-service margin check FAILED\n\n"
+        "Question: what does this mean?",
+        registry,
+        k=5,
+    )
+    assert [h["id"] for h in hits] == ["order-engine#margin"]
+
+
+def test_undocumented_service_with_no_doc_returns_nothing(registry):
+    """"I have no documentation for SPT" must be deterministic, not a lucky miss.
+
+    Deliberately NOT the D7 fallback: D7 widens an UNRECOGNISED question. Here the
+    question was recognised, and we positively know there is no documentation.
+    """
+    index = _FakeIndex([_rec("rsm-ws#anything", "rsm-ws", "concept", 0.99)])
+    assert kr.retrieve_docs(index, "what does SPT do?", registry, k=5) == []
+
+
+def test_a_documented_service_still_wins_over_an_undocumented_one(registry):
+    """Naming both must narrow to the documented one, not to a see_also."""
+    index = _FakeIndex(
+        [
+            _rec("jam-ws#a", "jam-ws", "trap", 0.4),
+            _rec("order-engine#b", "order-engine", "trap", 0.9),
+        ]
+    )
+    hits = kr.retrieve_docs(index, "jam-ws called SPT and it timed out", registry, k=5)
+    assert [h["id"] for h in hits] == ["jam-ws#a"]
+
+
+def test_folded_in_component_routes_to_its_emitter(registry):
+    index = _FakeIndex(
+        [
+            _rec("order-engine#solr", "order-engine", "flow", 0.4),
+            _rec("rsm-ws#x", "rsm-ws", "flow", 0.9),
+        ]
+    )
+    hits = kr.retrieve_docs(index, "where are the SOLR logs?", registry, k=5)
+    assert [h["id"] for h in hits] == ["order-engine#solr"]
 
 
 def test_results_are_capped_at_k(registry):

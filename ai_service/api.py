@@ -16,6 +16,7 @@ holders so tests can inject fakes; ``main.py`` wires the real ones at startup.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from fastapi import FastAPI
@@ -202,6 +203,38 @@ def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
     return text[:limit].rsplit(" ", 1)[0] + "…"
 
 
+# What a documentation citation becomes in the prose. A doc id names a chunk of a
+# repository the support agent cannot open, so it is noise rather than provenance
+# — the useful fact is only that the claim came from documentation rather than
+# from log evidence. The UI collapses the doc sources into one "Official
+# documentation" chip for the same reason.
+DOC_CITATION_TEXT = "the official documentation"
+
+
+def replace_doc_citations(answer: str, doc_ids: list[str]) -> str:
+    """Swap ``[<doc chunk id>]`` in the prose for a plain phrase.
+
+    The prompt already asks the model not to cite doc ids, but "do not do X" is a
+    conditional instruction and a small/fast deployment follows those unreliably —
+    the same reason the coverage caveat became a computed field instead of a
+    prompt rule. This is the deterministic backstop: the ids are known exactly, so
+    a hidden citation can never leak into an answer as an unresolvable
+    ``[jam-ws#blind-spots-and-traps--role-matching-is-exact]``.
+
+    Substituting a phrase rather than deleting keeps the sentence intact: "as
+    described in [jam-ws#escalation]." would otherwise become "as described in ."
+    """
+    if not doc_ids:
+        return answer
+    for doc_id in doc_ids:
+        answer = answer.replace(f"[{doc_id}]", DOC_CITATION_TEXT)
+    # Several doc chunks in one citation list collapse to one mention, so
+    # "..., the official documentation, the official documentation" reads right.
+    phrase = re.escape(DOC_CITATION_TEXT)
+    answer = re.sub(rf"{phrase}(?:\s*(?:,|;|and)\s*{phrase})+", DOC_CITATION_TEXT, answer)
+    return answer
+
+
 def build_retrieval_answer(
     query: str, results: list[dict], docs: list[dict] | None = None
 ) -> str:
@@ -380,7 +413,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
             fallback=None,
         )
         if composed:
-            answer, mode = composed, AI_COMPOSED
+            answer, mode = replace_doc_citations(composed, [d["id"] for d in docs]), AI_COMPOSED
 
     return ChatResponse(
         answer=answer,

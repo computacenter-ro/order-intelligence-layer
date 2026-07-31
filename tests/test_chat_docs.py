@@ -190,6 +190,58 @@ def test_retrieval_only_answer_with_nothing_is_unchanged():
     assert api.build_retrieval_answer("q", []) == api.NO_RESULTS_ANSWER
 
 
+# --- doc citations never reach the reader as ids ------------------------------
+def test_doc_citation_becomes_a_plain_phrase():
+    """A doc id names a chunk of a repo the agent cannot open. The UI hides those
+    sources, so a bracketed id left in the prose would dangle."""
+    answer = api.replace_doc_citations(
+        "JAM returns privileges [jam-ws#what-this-service-does].",
+        ["jam-ws#what-this-service-does"],
+    )
+    assert answer == "JAM returns privileges the official documentation."
+
+
+def test_doc_citation_is_substituted_not_deleted():
+    """Deleting would leave "as described in ." — the sentence must survive."""
+    answer = api.replace_doc_citations("as described in [jam-ws#escalation]", ["jam-ws#escalation"])
+    assert answer == "as described in the official documentation"
+
+
+def test_repeated_doc_citations_collapse_to_one_mention():
+    answer = api.replace_doc_citations(
+        "See [a#one], [a#two] and [a#three].", ["a#one", "a#two", "a#three"]
+    )
+    assert answer == "See the official documentation."
+
+
+def test_incident_citations_are_left_alone():
+    """Those DO resolve — the UI renders them as linked chips."""
+    answer = api.replace_doc_citations(
+        "Evidence: [alert-123], [jam-ws#escalation].", ["jam-ws#escalation"]
+    )
+    assert "[alert-123]" in answer
+    assert "jam-ws#escalation" not in answer
+
+
+def test_no_docs_leaves_the_answer_untouched():
+    assert api.replace_doc_citations("Evidence: [alert-1].", []) == "Evidence: [alert-1]."
+
+
+def test_endpoint_strips_doc_ids_from_the_composed_answer(wired, monkeypatch):
+    _serve(monkeypatch, alerts=[], docs=[DOC_HIT])
+    body = wired.post("/chat", json={"query": "what does JAM do?"}).json()
+    # The fake model replies with exactly the citation the prompt asks it to avoid.
+    assert "[jam-ws#what-this-service-does]" not in body["answer"]
+    assert api.DOC_CITATION_TEXT in body["answer"]
+    # ...but the source is still RETURNED, so the UI can show its one chip and the
+    # id stays available for the evaluation set and network-tab debugging.
+    assert [s["id"] for s in body["sources"]] == ["jam-ws#what-this-service-does"]
+
+
+def test_prompt_tells_the_model_not_to_cite_doc_ids():
+    assert "Do NOT cite documentation ids" in nodes._CHAT_SYSTEM
+
+
 async def test_composer_accepts_docs_with_no_incident_sources():
     answer = await nodes.compose_chat_answer("q", [], _FakeChat(), docs=[DOC_HIT])
     assert answer.startswith("answer")

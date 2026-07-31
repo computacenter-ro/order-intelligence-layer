@@ -159,7 +159,10 @@ async def test_compose_system_prompt_states_the_grounding_rules():
     system = model.prompts[0]
     assert "ONLY the context provided" in system
     assert "Never invent" in system
-    assert "Cite the record ids" in system
+    # INCIDENT ids specifically: doc chunk ids name sections of a repository the
+    # agent cannot open, and the UI hides those sources behind one badge, so a
+    # cited doc id would be an unresolvable reference.
+    assert "Cite the INCIDENT record ids" in system
 
 
 async def test_compose_raises_without_a_model():

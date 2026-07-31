@@ -109,6 +109,12 @@ class ServiceEntry:
     aliases: list[str] = field(default_factory=list)
     mock_app_name: str | None = None
     documented: bool = False
+    # For an UNDOCUMENTED service: the doc that covers it second-hand, if any.
+    # cc-checker-service has no file of its own, but order-engine.md §4.3 is the
+    # Order Engine's account of the margin check. Without this the routing has
+    # only "search nothing" or "search everything", and everything is how a
+    # margin-check question ends up citing rsm-ws key concepts.
+    see_also: str | None = None
 
 
 @dataclass
@@ -177,18 +183,25 @@ def build_registry(knowledge_dir: str | Path) -> Registry:
     except yaml.YAMLError:
         return registry  # a broken map degrades to frontmatter-only, never a crash
 
+    app_to_doc: dict[str, str] = {}
     for entry in data.get("services") or []:
         doc = entry.get("doc")
         app_name = entry.get("mock_app_name")
         aliases = [str(a) for a in (entry.get("aliases") or [])]
         if doc and doc in registry.services:
             registry.services[doc].mock_app_name = app_name
+            if app_name:
+                app_to_doc[app_name] = doc
         elif app_name:
             # Emitted but undocumented (SPT, Checker, ...). Knowing it EXISTS is
             # what makes "no documented knowledge of that service" deterministic
             # rather than a fallback (rag-plan.md §10 open question 7).
             registry.services[app_name] = ServiceEntry(
-                name=app_name, aliases=aliases, mock_app_name=app_name, documented=False
+                name=app_name,
+                aliases=aliases,
+                mock_app_name=app_name,
+                documented=False,
+                see_also=(str(entry["see_also"]) if entry.get("see_also") else None),
             )
 
     for key in ("folded_in", "not_simulated"):
@@ -196,10 +209,16 @@ def build_registry(knowledge_dir: str | Path) -> Registry:
             name = str(entry.get("name") or "").strip()
             if not name or name in registry.services:
                 continue
+            # A folded_in component has no app_name of its own — its lines are
+            # emitted by another service, whose doc is therefore the one that
+            # describes it. No explicit see_also needed: emitted_by already is one.
+            emitter = entry.get("emitted_by")
+            see_also = entry.get("see_also") or app_to_doc.get(str(emitter or ""))
             registry.services[name] = ServiceEntry(
                 name=name,
                 aliases=[str(a) for a in (entry.get("aliases") or [])],
                 documented=False,
+                see_also=str(see_also) if see_also else None,
             )
     return registry
 
@@ -268,7 +287,31 @@ def retrieve_docs(
     * ``"off"`` — service filtering only.
     """
     detection = detect_services(question, registry)
-    services = detection.documented or [None]
+    services: list[str | None] = list(detection.documented)
+
+    if not services and detection.undocumented:
+        # The question names a service we KNOW has no doc of its own. That is
+        # knowledge, not ignorance, so it must not fall through to the wide search
+        # — a cc-checker-service question searching all five docs is how a margin
+        # check ends up citing rsm-ws key concepts.
+        #
+        # This is NOT the D7 gate it might look like. D7 says an UNRECOGNISED
+        # question must search wider; here the question was recognised, and the
+        # honest scope is the doc that covers the service second-hand (if any) or
+        # nothing at all — which is what makes "I have no documentation for SPT" a
+        # deterministic answer rather than a lucky miss.
+        services = [
+            s
+            for s in dict.fromkeys(
+                registry.services[name].see_also for name in detection.undocumented
+            )
+            if s and s in registry.services
+        ]
+        if not services:
+            return []
+    elif not services:
+        services = [None]  # nothing named at all — search everything (D7)
+
     kinds = detect_kinds(question) if kind_mode != "off" else []
 
     def _filters(service: str | None, kind: str | None) -> dict | None:

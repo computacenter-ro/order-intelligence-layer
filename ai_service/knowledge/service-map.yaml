@@ -30,6 +30,13 @@
 # there. This file carries aliases ONLY for services with no doc file, because
 # nothing else records them.
 #
+# SEE_ALSO: for an UNDOCUMENTED service, the doc that covers it second-hand. It
+# decides what a question scoped to that service searches. Without it the routing
+# has only two options — search nothing, or search everything — and "everything"
+# is how a margin-check question ends up citing rsm-ws key concepts. `folded_in`
+# entries need no explicit value: their `emitted_by` service IS the doc that
+# describes them.
+#
 # GROUND TRUTH: mock_app_name / mock_host come from
 # pipeline/services/profiles.py PROFILES. If a profile changes, change it here too.
 
@@ -87,9 +94,13 @@ services:
     doc: null
     file: null
     aliases: ["Checker", "Cart Checker", "margin check"]
+    see_also: order-engine
     note: >
       A second-hand account exists in order-engine.md §4.3 — that is the Order
       Engine's view of the Checker, not documentation of the Checker itself.
+      `see_also` points retrieval there: a question scoped to a cc-checker-service
+      alert must search THAT doc rather than falling back to all five, and an
+      answer built from it should say whose view it is.
 
   - mock_app_name: cc-outbound-osw
     mock_host: CCECMEWEBT002

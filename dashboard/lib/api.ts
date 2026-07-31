@@ -8,6 +8,7 @@ import type {
   IncidentDetail,
   IncidentStatus,
   Journey,
+  LlmStats,
   OverviewStats,
   ProcessedAlert,
 } from "@/lib/types";
@@ -191,8 +192,21 @@ export function fetchFacets(filter: AlertsFilter = {}): Promise<AlertFacets> {
   return getJson<AlertFacets>(`/alerts/facets${query ? `?${query}` : ""}`);
 }
 
+/**
+ * One alert by id (backend GET /alerts/{alert_id}).
+ *
+ * For callers holding an id and nothing else — the assistant's citation chips.
+ * The list endpoint cannot serve that: it has no alert_id filter.
+ */
+export function fetchAlert(alertId: string): Promise<ProcessedAlert> {
+  return getJson<ProcessedAlert>(`/alerts/${encodeURIComponent(alertId)}`);
+}
+
 export interface JourneysFilter {
   status?: string;
+  outcome?: string;
+  /** Substring match over event_id / order_id / cart_header_id (server-side ILIKE). */
+  search?: string;
   limit?: number;
   cursor?: string;
 }
@@ -200,6 +214,10 @@ export interface JourneysFilter {
 export function fetchJourneys(filter: JourneysFilter = {}): Promise<Page<Journey>> {
   const params = new URLSearchParams();
   if (filter.status) params.set("status", filter.status);
+  if (filter.outcome) params.set("outcome", filter.outcome);
+  // Only when non-empty, matching alertFilterParams: an empty `search=` would be
+  // sent as a param the server then has to treat as absent anyway.
+  if (filter.search) params.set("search", filter.search);
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.cursor) params.set("cursor", filter.cursor);
   const query = params.toString();
@@ -248,6 +266,21 @@ export async function resolveIncident(incidentId: string): Promise<Incident> {
 /** Aggregate counters for the Insights page (backend GET /stats/insights). */
 export function fetchStats(): Promise<OverviewStats> {
   return getJson<OverviewStats>("/stats/insights");
+}
+
+/**
+ * Per-logical-model LLM run stats + semantic-cache savings.
+ *
+ * The window is a closed set here because the backend passes it straight through
+ * to the AI service, which silently defaults anything it doesn't recognise — so a
+ * typo would return 24h data under a "7d" label rather than an error. The union
+ * makes that unreachable from this side.
+ *
+ * Resolves even when the AI service or LangSmith is unavailable: the response is
+ * then the same shape with nulls (see `LlmStats`), not a rejection.
+ */
+export function fetchLlmStats(window: "1h" | "24h" | "7d" = "24h"): Promise<LlmStats> {
+  return getJson<LlmStats>(`/llm-stats?window=${window}`);
 }
 
 // --- chat --------------------------------------------------------------------

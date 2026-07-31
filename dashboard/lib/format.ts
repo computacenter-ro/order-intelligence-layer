@@ -11,6 +11,14 @@ export function levelLabel(level: LogLevel): string {
   return LEVEL_LABEL[level];
 }
 
+/** Live "N new …" pills (alerts, incidents) must never show an unbounded
+ *  number — a stretch during a burst reads worse than a stale-feeling cap. */
+const NOTIFICATION_COUNT_CAP = 20;
+
+export function formatNotificationCount(count: number): string {
+  return count > NOTIFICATION_COUNT_CAP ? `${NOTIFICATION_COUNT_CAP}+` : String(count);
+}
+
 /**
  * Turn a session identity into a person's name for display:
  * `"larisa.muntean@computacenter.com"` -> `"Larisa Muntean"`.
@@ -189,6 +197,49 @@ export function formatDuration(seconds: number | null): string {
   const rest = Math.round(seconds - minutes * 60);
   if (rest === 60) return `${minutes + 1}m`;
   return rest === 0 ? `${minutes}m` : `${minutes}m ${rest}s`;
+}
+
+/**
+ * "Updated just now" / "Updated 3 min ago" / "Updated 14:32" / "Collecting…".
+ *
+ * The only relative formatter here — everything else in this file renders an
+ * absolute instant. It exists for "last updated" labels, where the AGE is the fact
+ * worth reading rather than the wall-clock time.
+ *
+ * **Minute granularity, deliberately.** An earlier version ticked mm:ss every
+ * second. Two things were wrong with that: the data behind it only changes on the
+ * refresh interval, so a running seconds counter is false precision — it implies
+ * the page knows something new every second when nothing has moved; and it made
+ * the only permanently animated element on a page built for careful reading.
+ * Past an hour it switches to an absolute time: at that distance "Updated 14:32"
+ * is both shorter and more useful than a minute count nobody will subtract.
+ *
+ * `now` is a parameter rather than a `Date.now()` call inside so tests get a fixed
+ * frame of reference, and so the caller controls when the value is recomputed.
+ *
+ * A negative age clamps to "just now" rather than rendering a future time: the
+ * server stamps the timestamp and the browser subtracts it, so a second or two of
+ * clock skew between the two machines is normal and must not produce garbage.
+ */
+export function formatUpdatedAt(iso: string | null, now: number): string {
+  // Not "Updated 0 min ago" — nothing has been collected, so there is no
+  // "updated" to report. This is the cold-start state, and saying it plainly is
+  // the whole reason the timestamp is nullable.
+  if (iso === null) return "Collecting…";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "Collecting…";
+
+  const seconds = Math.max(0, Math.floor((now - then) / 1000));
+  if (seconds < 60) return "Updated just now";
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `Updated ${minutes} min ago`;
+
+  return `Updated ${new Date(then).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })}`;
 }
 
 export function stoppedAt(journey: Journey): string {

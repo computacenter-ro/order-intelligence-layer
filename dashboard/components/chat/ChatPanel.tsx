@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  ArrowLeftIcon,
   PaperPlaneRightIcon,
   ThumbsDownIcon,
   ThumbsUpIcon,
@@ -9,10 +10,11 @@ import {
 } from "@phosphor-icons/react";
 import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
-import { sendChat, sendChatFeedback, UnauthorizedError } from "@/lib/api";
+import { AlertDetailBody } from "@/components/alerts/AlertDetailBody";
+import { fetchAlert, sendChat, sendChatFeedback, UnauthorizedError } from "@/lib/api";
 import { localizeUtcStamps } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
-import type { ChatContext, ChatMode, ChatSource } from "@/lib/types";
+import type { ChatContext, ChatMode, ChatSource, ProcessedAlert } from "@/lib/types";
 
 /**
  * The assistant drawer: ask questions about incident history and get an answer
@@ -206,6 +208,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
+<<<<<<< HEAD
  * Documentation sources are collapsed into ONE chip, never listed individually.
  *
  * A doc citation is `jam-ws#blind-spots-and-traps--role-matching-is-exact` — a
@@ -241,8 +244,26 @@ function DocumentationChip({ count }: { count: number }) {
 
 /** One cited record: a pill linking to the journey view when a link exists. */
 function SourceChip({ source }: { source: ChatSource }) {
+=======
+ * One cited record.
+ *
+ * Three shapes, in priority order. An ALERT citation opens the alert in this
+ * panel (`onOpen`) rather than navigating: the record is fully renderable here,
+ * and sending the reader to another page would abandon the conversation that
+ * cited it. Anything else with a link is an ordinary anchor to the journey view.
+ * A citation with neither stays plain text.
+ */
+function SourceChip({
+  source,
+  onOpen,
+}: {
+  source: ChatSource;
+  onOpen?: (source: ChatSource) => void;
+}) {
+>>>>>>> origin/prep-for-prod
   const label = `${source.kind} · ${source.id.slice(0, 8)}`;
   const title = `${source.snippet}\n\nrelevance ${source.score.toFixed(2)}`;
+  const opensInPanel = source.kind === "alert" && onOpen !== undefined;
 
   const chipStyle: React.CSSProperties = {
     display: "inline-flex",
@@ -251,7 +272,7 @@ function SourceChip({ source }: { source: ChatSource }) {
     borderRadius: "9999px",
     border: "1px solid var(--cc-grey-five)",
     background: "var(--cc-grey-six)",
-    color: source.link ? "var(--cc-heritage-blue)" : "var(--cc-grey-two)",
+    color: opensInPanel || source.link ? "var(--cc-heritage-blue)" : "var(--cc-grey-two)",
     fontSize: "12px",
     fontWeight: 600,
     lineHeight: "16px",
@@ -262,6 +283,21 @@ function SourceChip({ source }: { source: ChatSource }) {
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
   };
+
+  if (opensInPanel) {
+    return (
+      <button
+        type="button"
+        onClick={() => onOpen?.(source)}
+        // font/family are inherited by anchors and spans but NOT by buttons, so
+        // without these the one chip that is a button renders in the UA default.
+        style={{ ...chipStyle, cursor: "pointer", fontFamily: "inherit" }}
+        title={title}
+      >
+        {label}
+      </button>
+    );
+  }
 
   // Heritage Blue is reserved for navigable text, so an unlinked citation stays
   // grey rather than looking clickable (guidelines: tables/lists colour rules).
@@ -282,9 +318,11 @@ function SourceChip({ source }: { source: ChatSource }) {
 function TurnBubble({
   turn,
   onVote,
+  onOpenSource,
 }: {
   turn: Turn;
   onVote?: (turn: Turn, liked: boolean) => void;
+  onOpenSource?: (source: ChatSource) => void;
 }) {
   if (turn.role === "user") {
     return (
@@ -347,6 +385,7 @@ function TurnBubble({
           <>
             <SectionLabel>{turn.sourcesLabel ?? "Sources"}</SectionLabel>
             <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+<<<<<<< HEAD
               {turn.sources
                 .filter((s) => s.kind !== DOC_KIND)
                 .map((s) => (
@@ -358,6 +397,11 @@ function TurnBubble({
                   count={turn.sources.filter((s) => s.kind === DOC_KIND).length}
                 />
               )}
+=======
+              {turn.sources.map((s) => (
+                <SourceChip key={s.id} source={s} onOpen={onOpenSource} />
+              ))}
+>>>>>>> origin/prep-for-prod
             </div>
           </>
         )}
@@ -366,22 +410,41 @@ function TurnBubble({
   );
 }
 
+/**
+ * A cited alert, shown over the conversation.
+ *
+ * `alert` stays null while the fetch is in flight and after a failure, so the
+ * three states are distinguishable without a second flag. `id` is kept so a late
+ * response can be matched against the view that is actually open.
+ */
+interface DetailView {
+  id: string;
+  alert: ProcessedAlert | null;
+  error: string | null;
+}
+
 export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatPanelProps) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [detail, setDetail] = useState<DetailView | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Escape closes, matching AlertDetailDrawer.
+  // Escape steps back ONE level: out of a cited record first, out of the panel
+  // only from the conversation. Closing the whole panel from a detail view would
+  // make the reader re-open it and re-find their place, and the conversation is
+  // still right behind the record they are reading.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (detail) setDetail(null);
+      else onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, onClose, detail]);
 
   // Focus the composer when the panel opens so it is keyboard-usable immediately
   // (WCAG 2.1 focus management: opening an overlay should move focus into it).
@@ -389,10 +452,13 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
     if (open) inputRef.current?.focus();
   }, [open]);
 
-  // Keep the newest turn in view as the conversation grows.
+  // Keep the newest turn in view as the conversation grows. Skipped while a cited
+  // record is open: the scroll region is showing the record then, and scrolling it
+  // to the bottom would drop the reader at the raw log line.
   useEffect(() => {
+    if (detail) return;
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
-  }, [turns, busy]);
+  }, [turns, busy, detail]);
 
   if (!open) return null;
 
@@ -426,6 +492,32 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
       scoped_kind: context?.kind ?? null,
       scoped_id: context?.id ?? null,
     });
+  };
+
+  /**
+   * Open a cited alert over the conversation.
+   *
+   * Every `setDetail` in the async paths re-checks `prev.id`: clicking chip A then
+   * chip B before A resolves must leave B on screen, and without the guard A's
+   * late response would overwrite it. Nothing here touches `turns`, so the
+   * conversation is untouched and Back restores it exactly.
+   */
+  const openSource = (source: ChatSource) => {
+    if (source.kind !== "alert") return;
+    setDetail({ id: source.id, alert: null, error: null });
+    fetchAlert(source.id)
+      .then((alert) =>
+        setDetail((prev) => (prev && prev.id === source.id ? { ...prev, alert } : prev))
+      )
+      .catch((err) => {
+        // Same two shapes the composer distinguishes: an expired session is
+        // actionable, anything else is not.
+        const message =
+          err instanceof UnauthorizedError
+            ? "Your session has expired. Please sign in again to view this alert."
+            : "That alert could not be loaded. It may have been removed since the answer cited it.";
+        setDetail((prev) => (prev && prev.id === source.id ? { ...prev, error: message } : prev));
+      });
   };
 
   const ask = async (question: string) => {
@@ -510,14 +602,40 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
             borderBottom: "1px solid var(--cc-grey-six)",
           }}
         >
-          <div>
-            <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
-              Incident Assistant
+          {detail ? (
+            // Back, not a second close: the conversation is still mounted behind
+            // this record, so the reader has somewhere to return TO. A close X
+            // here would throw away the thread that cited the record.
+            <button
+              type="button"
+              onClick={() => setDetail(null)}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                background: "none",
+                border: "none",
+                padding: "4px 0",
+                color: "var(--cc-heritage-blue)",
+                fontSize: "14px",
+                fontWeight: 600,
+                fontFamily: "inherit",
+                cursor: "pointer",
+              }}
+            >
+              <ArrowLeftIcon size={16} />
+              Back to conversation
+            </button>
+          ) : (
+            <div>
+              <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
+                Incident Assistant
+              </div>
+              <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginTop: "4px" }}>
+                {contextLabel ? `Scoped to ${contextLabel}` : "Answers grounded in indexed incidents"}
+              </div>
             </div>
-            <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginTop: "4px" }}>
-              {contextLabel ? `Scoped to ${contextLabel}` : "Answers grounded in indexed incidents"}
-            </div>
-          </div>
+          )}
           <button
             onClick={onClose}
             aria-label="Close assistant"
@@ -534,11 +652,29 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           </button>
         </div>
 
-        {/* Message list — the only scrolling region. */}
+        {/* Message list — the only scrolling region. A cited record takes it over
+            rather than stacking a second overlay: the panel already owns Escape
+            and a scrim, and a nested dialog would duplicate both. */}
         <div
           ref={listRef}
           style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px 24px" }}
         >
+          {detail ? (
+            detail.alert ? (
+              // No onAsk: this record IS being read inside the assistant, so
+              // offering to ask the assistant about it would loop back here.
+              <AlertDetailBody alert={detail.alert} onNavigate={onClose} />
+            ) : (
+              <div
+                role="status"
+                aria-live="polite"
+                style={{ color: "var(--cc-grey-three)", fontSize: "14px" }}
+              >
+                {detail.error ?? "Loading alert…"}
+              </div>
+            )
+          ) : (
+            <>
           {turns.length === 0 && !busy && (
             <div style={{ color: "var(--cc-grey-three)", fontSize: "16px", lineHeight: "22px" }}>
               <p style={{ margin: "0 0 16px" }}>
@@ -570,7 +706,7 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           )}
 
           {turns.map((turn, i) => (
-            <TurnBubble key={i} turn={turn} onVote={vote} />
+            <TurnBubble key={i} turn={turn} onVote={vote} onOpenSource={openSource} />
           ))}
 
           {busy && (
@@ -582,9 +718,14 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
               Searching incident history…
             </div>
           )}
+            </>
+          )}
         </div>
 
-        {/* Composer — pinned. */}
+        {/* Composer — pinned, and hidden while a cited record is open: there is
+            nothing to ask into from a record view, and leaving it would invite a
+            question that silently lands back in the conversation behind. */}
+        {!detail && (
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -628,6 +769,7 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
             Send
           </Button>
         </form>
+        )}
       </aside>
     </>
   );

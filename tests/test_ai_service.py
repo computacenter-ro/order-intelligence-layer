@@ -23,6 +23,7 @@ from langchain_core.messages import AIMessage
 from ai_service import settings
 from ai_service.breaker import CLOSED, HALF_OPEN, OPEN, CircuitBreaker
 from ai_service.graph import PipelineDeps, process
+from ai_service import llm
 from ai_service.llm import LLMError
 from ai_service.nodes import route
 from ai_service.publisher import Publisher
@@ -250,7 +251,7 @@ def _healthy_deps() -> PipelineDeps:
     return PipelineDeps(
         breaker=_breaker(FakeRedis(), FakeClock()),
         explainer=_fake("SPT pricing service was unreachable; the order engine could not price the order."),
-        router=_fake('{"department": "backend", "severity": "high", "confidence": 0.82}'),
+        router=_fake('{"department": "backend", "severity": "high"}'),
     )
 
 
@@ -261,7 +262,6 @@ async def test_pipeline_ai_alert_on_healthy_llm():
     assert alert.explanation and "SPT" in alert.explanation
     assert alert.department == Department.backend
     assert alert.severity == Severity.high
-    assert alert.confidence == 0.82
     assert alert.log.log_id == "log-1"
     assert alert.emitted_at.tzinfo is not None  # tz-aware UTC
 
@@ -280,15 +280,15 @@ async def test_router_rejects_unknown_department():
     with pytest.raises(LLMError):
         await route(
             _log(), "explained",
-            _fake('{"department": "frontend", "severity": "high", "confidence": 0.9}'),
+            _fake('{"department": "frontend", "severity": "high"}'),
         )
 
 
 async def test_router_accepts_all_five_departments():
     for dept in Department:
-        d, s, c = await route(
+        d, s = await route(
             _log(), "x",
-            _fake(f'{{"department": "{dept.value}", "severity": "medium", "confidence": 0.5}}'),
+            _fake(f'{{"department": "{dept.value}", "severity": "medium"}}'),
         )
         assert d == dept
 
@@ -329,7 +329,9 @@ def test_route_prompt_examples_are_valid_enum_values():
         obj = json.loads(raw)
         Department(obj["department"])  # raises if not a real department
         Severity(obj["severity"])
-        assert 0.0 <= obj["confidence"] <= 1.0
+        # The router is asked for department + severity ONLY — an example that
+        # still showed a confidence would teach a field the parser now ignores.
+        assert set(obj) == {"department", "severity"}, f"unexpected keys in {raw}"
 
 
 def test_route_prompt_examples_cover_general_and_technical_routes():
@@ -341,26 +343,30 @@ def test_route_prompt_examples_cover_general_and_technical_routes():
 
 
 async def test_router_tolerates_code_fence_and_prose():
-    d, s, c = await route(
+    d, s = await route(
         _log(), "x",
-        _fake('Here you go:\n```json\n{"department": "database", "severity": "low", "confidence": 0.7}\n```'),
+        _fake('Here you go:\n```json\n{"department": "database", "severity": "low"}\n```'),
     )
-    assert d == Department.database and c == 0.7
+    assert d == Department.database and s == Severity.low
 
 
-async def test_router_clamps_out_of_range_confidence():
-    d, s, c = await route(
-        _log(), "x", _fake('{"department": "devops", "severity": "high", "confidence": 5}')
+async def test_router_ignores_an_unrequested_confidence_key():
+    """The router is no longer asked for a confidence, but a model may still
+    volunteer one. That extra key must be IGNORED, not treated as bad output —
+    rejecting it would turn a perfectly good route into a fallback."""
+    d, s = await route(
+        _log(), "x",
+        _fake('{"department": "devops", "severity": "high", "confidence": 0.9}'),
     )
-    assert c == 1.0
+    assert d == Department.devops and s == Severity.high
 
 
 # --- severity: validated against the enum, threaded onto the alert -----------
 async def test_router_accepts_all_severities():
     for sev in Severity:
-        d, s, c = await route(
+        d, s = await route(
             _log(), "x",
-            _fake(f'{{"department": "backend", "severity": "{sev.value}", "confidence": 0.5}}'),
+            _fake(f'{{"department": "backend", "severity": "{sev.value}"}}'),
         )
         assert s == sev
 
@@ -371,7 +377,7 @@ async def test_router_rejects_unknown_severity():
     with pytest.raises(LLMError):
         await route(
             _log(), "x",
-            _fake('{"department": "backend", "severity": "apocalyptic", "confidence": 0.9}'),
+            _fake('{"department": "backend", "severity": "apocalyptic"}'),
         )
 
 
@@ -381,7 +387,6 @@ def _assert_fallback(alert):
     assert alert.explanation is None
     assert alert.department is None
     assert alert.severity is None
-    assert alert.confidence is None
 
 
 async def test_pipeline_fallback_when_no_models():
@@ -393,7 +398,7 @@ async def test_pipeline_fallback_when_breaker_open():
     b = _breaker(FakeRedis(), FakeClock())
     for _ in range(3):
         await b.record_failure()  # force open
-    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","severity":"low","confidence":0.5}'))
+    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","severity":"low"}'))
     _assert_fallback(await process(_log(), deps))
 
 
@@ -401,7 +406,7 @@ async def test_pipeline_fallback_when_router_returns_bad_department():
     deps = PipelineDeps(
         breaker=_breaker(FakeRedis(), FakeClock()),
         explainer=_fake("a clear explanation"),
-        router=_fake('{"department": "nonsense", "confidence": 0.9}'),
+        router=_fake('{"department": "nonsense"}'),
     )
     # explainer succeeds but router output is invalid → clean fallback, no partial AI alert.
     _assert_fallback(await process(_log(), deps))
@@ -447,7 +452,6 @@ def _alert(source: str = "fallback") -> ProcessedAlert:
         explanation=None if source == "fallback" else "explained",
         department=None if source == "fallback" else Department.backend,
         severity=None if source == "fallback" else Severity.high,
-        confidence=None if source == "fallback" else 0.7,
         source=source,
     )
 
@@ -937,7 +941,7 @@ async def test_raw_events_published_before_alert_llm_runs():
     deps = PipelineDeps(
         breaker=_breaker(redis, FakeClock()),
         explainer=_BlockingModel(),
-        router=_fake('{"department": "backend", "severity": "medium", "confidence": 0.5}'),
+        router=_fake('{"department": "backend", "severity": "medium"}'),
     )
     poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
     poller.fetch_logs = lambda f, t: _async(logs)  # type: ignore[method-assign]
@@ -1125,3 +1129,93 @@ def test_summary_request_contract_shape():
     req = api.SummaryRequest(**_summary_request())
     assert req.journey_id and req.outcome
     assert isinstance(req.logs[0], LogLine)  # logs deserialize to the model
+
+
+# --- llm.py: per-model LangSmith tags ----------------------------------------
+#
+# Each factory tags its model with the logical role it plays so runs land in
+# LangSmith already labelled, instead of as N indistinguishable calls to the same
+# Azure endpoint. Asserted here because nothing downstream can see the tags —
+# nodes.py only ever awaits `.ainvoke()`.
+
+
+@pytest.fixture
+def _llm_configured(monkeypatch):
+    """Point llm.py at a fake Azure endpoint so _build() actually constructs.
+
+    The provider model builds offline (no network call at construction), so this
+    exercises the real code path without creds or a request.
+    """
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "https://fake.invalid/openai/v1")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "fake-key")
+    for name in (
+        "AZURE_DEPLOYMENT_EXPLAINER",
+        "AZURE_DEPLOYMENT_ROUTER",
+        "AZURE_DEPLOYMENT_SUMMARY",
+        "AZURE_DEPLOYMENT_CHAT",
+    ):
+        monkeypatch.setattr(settings, name, "fake-deployment")
+
+
+def test_explainer_model_is_tagged_explainer(_llm_configured):
+    model = llm.explainer_model()
+    assert model is not None
+    # with_config stores tags on the RunnableBinding's `config` dict — there is no
+    # `.tags` attribute in langchain-core 1.x, so read it the way the API exposes it.
+    assert "explainer" in model.config.get("tags", [])
+
+
+@pytest.mark.parametrize(
+    "factory, tag",
+    [
+        ("explainer_model", "explainer"),
+        ("router_model", "router"),
+        ("summary_model", "summary"),
+        ("chat_model", "chat"),
+    ],
+)
+def test_every_factory_tags_its_logical_role(_llm_configured, factory, tag):
+    model = getattr(llm, factory)()
+    assert model is not None
+    assert model.config.get("tags") == [tag]
+
+
+def test_tagged_model_still_supports_ainvoke(_llm_configured):
+    """The contract nodes.py depends on: a Runnable you can await, whose result
+    carries `.content`. with_config wraps the model in a RunnableBinding, so this
+    pins that the wrapper stays duck-type compatible."""
+    model = llm.explainer_model()
+    assert hasattr(model, "ainvoke")
+
+
+def test_chat_falls_back_to_summary_deployment_but_keeps_the_chat_tag(monkeypatch):
+    """The tag names the JOB, not the deployment — which is the whole point when
+    chat and summary share one deployment."""
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "https://fake.invalid/openai/v1")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "fake-key")
+    monkeypatch.setattr(settings, "AZURE_DEPLOYMENT_CHAT", "")
+    monkeypatch.setattr(settings, "AZURE_DEPLOYMENT_SUMMARY", "summary-deployment")
+
+    model = llm.chat_model()
+    assert model is not None
+    assert model.config.get("tags") == ["chat"]
+
+
+def test_factories_still_return_none_without_creds(monkeypatch):
+    """Tagging must not disturb the creds-free path — None means "take the
+    fallback", and every factory has to keep saying it."""
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "")
+    assert llm.explainer_model() is None
+    assert llm.router_model() is None
+    assert llm.summary_model() is None
+    assert llm.chat_model() is None
+
+
+def test_build_without_tags_returns_the_bare_model(_llm_configured):
+    """`with_config(tags=None)` is a pydantic ValidationError, so an untagged
+    build must not go through it. Guards the optional-parameter default."""
+    model = llm._build("fake-deployment")
+    assert model is not None
+    assert not hasattr(model, "config")  # not wrapped in a RunnableBinding
+    assert hasattr(model, "ainvoke")

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
+import { formatNotificationCount } from "@/lib/format";
 
 interface NewAlertsBannerProps {
   count: number;
@@ -53,7 +54,9 @@ export function NewAlertsBanner({ count, onClick, noun = "alert" }: NewAlertsBan
   if (!visible) return null;
 
   const tone = badgeColors.pending;
-  const label = count === 1 ? `1 new ${noun}` : `${count} new ${noun}s`;
+  // Pluralization and "1 new …" reflect the REAL count — only the printed
+  // number itself is capped, so "1 new alert" never becomes "1+ new alert".
+  const label = count === 1 ? `1 new ${noun}` : `${formatNotificationCount(count)} new ${noun}s`;
 
   return (
     // Full-width sticky strip; transparent + click-through so only the pill

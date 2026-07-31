@@ -6,10 +6,11 @@ import type { ChatContext as ChatScope } from "@/lib/types";
 /**
  * One assistant panel, opened from several places.
  *
- * The side-nav "Assistant" item, the alert drawer's "Ask about this" button and
- * the journey view's all open the SAME drawer — so its open/scope state lives
- * here rather than in each caller. Mounted once in ``AppShell``; anything under
- * the shell opens it with :func:`useChat`.
+ * The floating ``ChatLauncher`` in the bottom-right corner opens it unscoped;
+ * the "Ask about this" buttons on the alert drawer, the journey view and the
+ * incident view open the SAME drawer anchored to that record. So its open/scope
+ * state lives here rather than in each caller. Mounted once in ``AppShell``;
+ * anything under the shell opens it with :func:`useChat`.
  *
  * Deliberately no persistence (no localStorage): a conversation is scoped to the
  * record you were looking at, and silently resurrecting yesterday's thread about

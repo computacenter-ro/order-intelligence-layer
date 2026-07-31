@@ -441,6 +441,59 @@ def test_backend_chat_attaches_dashboard_links(monkeypatch):
         app.dependency_overrides.clear()
 
 
+def test_backend_chat_link_is_none_for_an_alert_with_only_an_order_id(monkeypatch):
+    """An order id is not a journey id, so it cannot become a journey link.
+
+    It used to be the fallback, producing ``/journeys/ORD-8944`` against a route
+    that resolves a journey id — the citation chip led straight to "Journey not
+    found". An alert's journey_id is nullable, so this was the common case, not an
+    edge one. No link is correct: the UI renders an unlinked citation as plain
+    text, and an alert chip opens the alert in the assistant panel anyway.
+    """
+    monkeypatch.setenv("DASHBOARD_URL", "http://dash.local")
+    client, app = _backend_client(
+        monkeypatch,
+        reply={
+            "answer": "a",
+            "sources": [
+                {
+                    "id": "A1",
+                    "kind": "alert",
+                    "score": 0.9,
+                    "snippet": "ERROR ...",
+                    "metadata": {"order_id": "ORD-8944"},
+                }
+            ],
+            "mode": "ai",
+        },
+    )
+    try:
+        assert client.post("/chat", json={"query": "q"}).json()["sources"][0]["link"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_backend_chat_links_a_journey_record_by_its_own_id(monkeypatch):
+    """A journey record's id IS the journey id — the last-resort branch, kept so
+    the most link-worthy citation kind never renders unlinked."""
+    monkeypatch.setenv("DASHBOARD_URL", "http://dash.local")
+    client, app = _backend_client(
+        monkeypatch,
+        reply={
+            "answer": "a",
+            "sources": [
+                {"id": "J9", "kind": "journey", "score": 0.9, "snippet": "s", "metadata": {}}
+            ],
+            "mode": "ai",
+        },
+    )
+    try:
+        body = client.post("/chat", json={"query": "q"}).json()
+        assert body["sources"][0]["link"] == "http://dash.local/journeys/J9"
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_backend_chat_link_is_none_without_dashboard_url(monkeypatch):
     monkeypatch.delenv("DASHBOARD_URL", raising=False)
     client, app = _backend_client(monkeypatch)

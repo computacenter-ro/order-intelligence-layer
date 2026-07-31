@@ -37,7 +37,7 @@ Six subsystems, chained:
                                                  [6] Next.js IT Support Dashboard + Teams
 ```
 
-Two later additions fold into the chain rather than extending it:
+Three later additions fold into the chain rather than extending it:
 
 - **Incident clustering** ([5], `backend/incidents.py`) collapses one order's many
   alerts into ONE incident, and merges the same *infrastructure* failure across
@@ -46,6 +46,13 @@ Two later additions fold into the chain rather than extending it:
   [5] `POST /chat`) answers questions over the incident history the system has
   already produced. The backend owns the DB and pushes records **up** to the AI
   service, which owns the encoder — the one reverse-direction dependency.
+- **System documentation** ([3] `ai_service/docsindex.py`) is a SECOND grounding
+  channel for the same `POST /chat`: per-service docs describing how the real
+  pipeline works. The first two channels answer *what happened*; this one answers
+  *how things work* — "what does the margin check even do, and is a margin block
+  a fault?" — which no amount of incident history contains. Unlike everything
+  else indexed, it comes from **files in git, not from Postgres**: a third,
+  simpler path where *files own themselves*.
 
 Nothing here touches production — all services, hosts, and data are simulated.
 
@@ -62,9 +69,10 @@ Nothing here touches production — all services, hosts, and data are simulated.
 ├── .github/workflows/            # ci.yml (dashboard build) + build-images.yml (GHCR push)
 ├── alembic.ini                   # DB migrations config (backend/migrations)
 ├── pytest.ini                    # asyncio_mode=auto, testpaths=tests
-├── requirements.txt
+├── requirements.txt              # includes pyyaml (doc frontmatter + service-map.yaml) — NOT optional
 ├── requirements-ml.txt           # optional: embedding deps (sentence-transformers + CPU torch)
-│                                 #   — powers BOTH the semantic cache and the retrieval index
+│                                 #   — powers the semantic cache, incident clustering, the
+│                                 #     retrieval index AND the documentation index (one model)
 ├── shared/                       # cross-cutting: used by pipeline/, ai_service/, and backend/
 │   ├── models.py                 # Pydantic: LogLine, Baton, ProcessedAlert
 │   ├── log_client.py             # POST log lines to the collector (all services use this)
@@ -82,13 +90,20 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
 │   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
 │   │   dump_backend.py           # dev harness: dump backend DB state to JSON
-│   └── data/                     # reference fixtures — **v5 is current** (17 flows, matches
-│                                 #   shared/scenarios.py); v2/v3/v4 retained for history
+│   └── data/                     # reference fixtures — **v6 is current** (captured from the
+│                                 #   emitters, read by the tests); v2–v5 kept for history
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 │   ├── settings.py  llm.py        # config + the ONE provider-wiring module
 │   ├── semcache.py               # semantic cache (normalize + embed + LRU) — skips LLM on repeat log types
-│   └── ragindex.py               # retrieval index over incident history (RAG) — reuses semcache's encoder
+│   ├── ragindex.py               # retrieval index over incident history (RAG) — reuses semcache's encoder
+│   ├── langsmith_stats.py        # per-model LLM run stats, refreshed on a timer (GET /llm-stats)
+│   ├── docsindex.py              # documentation index — SECOND grounding channel, built from files
+│   ├── knowledge_loader.py       # cuts knowledge/*.md into budget-bounded chunks (pure text, no ML)
+│   ├── knowledge_routing.py      # question -> which service + which section kind (plain matching)
+│   ├── knowledge/                # THE CORPUS (tracked): 5 service docs + answering-policy.md
+│   │                             #   + service-map.yaml (mock app_name <-> doc, see_also)
+│   └── scripts/eval_knowledge.py # scores docs retrieval against tests/data/knowledge_eval.yaml
 ├── backend/                      # [5] :8000
 │   ├── main.py  consumers.py  journeys.py  stitching.py  linking.py  teams.py  ws.py  db.py
 │   ├── auth.py  auth_entra.py    # session auth (password escape hatch + Entra ID SSO)
@@ -121,12 +136,25 @@ A microservice order pipeline. One order's path in the real system:
    order** (persists cart header to BM DB, generates the order number), and
    publishes a **creation response** to `order.response.queue`, which inbound
    reads (→ *bridge event*, see Correlation Model).
-4. cc-order-engine then enriches the order via HTTP/Feign calls:
-   **SPT** (pricing/price lists), **RSM** (rebates/PVC), **SOLR** (product
-   search), **Settings** (margin thresholds, SQL-backed, pushed from
-   Salesforce), **JAM** (user auth/privileges → JWT), **Checker** (margin
-   check — can block the order), **Avalara** (US ship-to address verification,
-   US orders only).
+4. cc-order-engine then enriches the order via HTTP/Feign calls, in **this
+   exact order** (`ENRICH_SATELLITES` in `shared/scenarios.py` — ground truth):
+
+   ```
+   Settings → SPT → RSM → SOLR → JAM → Checker → Avalara (US only, last)
+   ```
+
+   **Settings is FIRST**: the engine reads the account's margin thresholds and
+   settings before it prices anything. Then **SPT** (pricing/price lists),
+   **RSM** (rebates/PVC), **SOLR** (product search / id resolution), **JAM**
+   (user auth/privileges → JWT), **Checker** (margin check — can block the
+   order), and finally **Avalara** (US ship-to address verification, **US orders
+   only**, the last enrichment step before dispatch).
+
+   All seven are **standalone services with their own emitters** and their own
+   `serve` block. SOLR and Avalara used to be folded in elsewhere (SOLR inside
+   the order engine, Avalara inside cc-validator-service); they are now
+   first-class, and the validator no longer emits Avalara lines, so the ship-to
+   verification appears exactly once.
 5. **cc-validator-service** runs validation strategies; then RabbitMQ
    `order.outbound.queue` → **cc-outbound-osw** submits to SAP fulfilment
    (RFC) → **cc-track-trace** registers the order for tracking
@@ -246,9 +274,15 @@ never crosses journeys, because that line already belongs to exactly one).
    between the creation logs and phase 2 still joins.
 
 Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
-NOT stitch — it processes individual logs. The current reference fixture is
-**`pipeline/data/mock-order-flows-v5.json`** (17 flows, one per scenario;
-v2/v3/v4 retained for history — v3 was the first to reflect the honest bridge).
+NOT stitch — it processes individual logs. The reference fixture reflecting the
+honest bridge is **`pipeline/data/mock-order-flows-v6.json`** — the current
+reference fixture, and the one the tests read. It is **captured from the
+emitters** (never hand-written), so it always reflects what the services
+actually produce: the Settings-first enrichment order, `cc-solr-service` events
+in every flow that reaches SOLR, and `cc-avalara-service` events in the US
+success flow. v2–v5 are retained for history (v5 still shows the older
+SPT-first order and has no SOLR/Avalara events; v3 was the first to reflect the
+honest bridge).
 
 ---
 
@@ -265,7 +299,8 @@ tells the next service "your turn to emit", carrying the flow context.
   "flow_id": "internal-uuid",
   "scenario": 6,
   "steps": [["inbound","receive"],["order_engine","create"],["inbound","bridge"],
-            ["order_engine","enrich"],["spt","serve"], "..."],
+            ["order_engine","enrich_settings_call"],["settings","serve"],
+            ["order_engine","enrich_settings_resp"],["order_engine","enrich_spt_call"], "..."],
   "cursor": 3,
   "ctx": {
     "eventId": "evt-...",
@@ -290,6 +325,22 @@ tells the next service "your turn to emit", carrying the flow context.
   defines the exact (service, block) sequence, including satellite
   interleaving during enrichment (OE client log → satellite server log → OE
   response log) and early termination on failures.
+  - Satellite ORDER comes from `ENRICH_SATELLITES` =
+    `[SETTINGS, SPT, RSM, SOLR, JAM, CHECKER]`. Nothing hardcodes it: the order
+    engine derives which satellite owns the one-off orchestration preamble from
+    `ENRICH_SATELLITES[0]`, so reordering the list moves the preamble with it.
+  - **AVALARA is deliberately NOT in that list.** It is US-only, so the chain
+    compiler appends its call→serve→resp trio conditionally on
+    `ctx.country == "US"`, after CHECKER, as the last enrichment step. Its
+    order-engine handlers are still registered unconditionally, or a US chain
+    would dispatch to a missing block.
+  - A scenario that fails **at Settings** (15/16/17) now fails at the *first*
+    enrichment step, so its flow contains **no other satellite**. That is
+    correct, not a truncation bug.
+  - SOLR needs no special-casing per scenario: it is included automatically in
+    every flow that reaches it (successes and failures that fail later — JAM,
+    margin, validation, SAP) and absent from those that die earlier (transform,
+    create, Settings failure, SPT-down, RSM).
 - **Timing:** a service sleeps 10–110 ms (random) between its log lines, and
   the baton hop adds natural delay — so timestamps (always real `utcnow`)
   interleave realistically across concurrently running flows.
@@ -316,12 +367,12 @@ tells the next service "your turn to emit", carrying the flow context.
 | order_engine | cc-order-engine | CCECMEWEBT001 | `create` (fills ids; creation-response publish log), `enrich` (client `--->`/`<---` Feign-style logs around each satellite), `dispatch` (publish to order.outbound.queue log). Fail `create`: BM-DB timeout ×3 → failure response (still eventId-only). |
 | spt | cc-spt-service | CCECMSRVT001 | price list lookup logs. Fail `spt`: OE logs timeouts ×3 → `"Order processing aborted"`. |
 | rsm | cc-rsm-service | CCECMSRVT001 | rebates / PVC rates logs. |
-| solr | cc-solr-service | CCECMSRVT001 | product search / id resolution logs. |
+| solr | cc-solr-service | CCECMSRVT001 | `serve`: product search / id resolution logs. Standalone satellite (after RSM, before JAM). Success-path only — no failure variant. |
 | jam | cc-jam-service | CCECMSRVT001 | auth + privileges + JWT logs. Fail `jam`: 403 account disabled → abort. |
 | settings | cc-settings-service | CCECMSRVT002 | margin threshold settings; Hibernate-style SQL log. |
 | checker | cc-checker-service | CCECMSRVT002 | per-line margin logs. Fail `margin`: below threshold → `"blocked by margin check"`. |
-| avalara | cc-avalara-service | CCECMSRVT002 | US address verification (US flows only). |
-| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs. Fail `udf`: missing `costCenter` UDF → 422 → abort. |
+| avalara | cc-avalara-service | CCECMSRVT002 | `serve`: US ship-to address verification (**US flows only**), the last enrichment step, after Checker. Standalone satellite — the validator no longer emits these lines. Success-path only — no failure variant. |
+| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs (the ship-to strategy is one, for every country — the real Avalara call moved to `cc-avalara-service`). Fail `udf`: missing `costCenter` UDF → 422 → abort. |
 | outbound_osw | cc-outbound-osw | CCECMEWEBT002 | SAP submission logs. Fail `sap`: RFC failure ×3 → `"moved to order.outbound.queue_error"`. |
 | track_trace | cc-track-trace | CCECMEWEBT002 | `"Registered order ... for tracking"` (**success terminal**). |
 
@@ -330,18 +381,28 @@ tells the next service "your turn to emit", carrying the flow context.
 **1–10 are the canonical set** — one per distinct outcome. Every test that means
 "the corpus" means these ten.
 
-| # | Outcome | fail_at | bridge_ids |
-|---|---|---|---|
-| 1 | `SUCCESS` (UK, 3 lines) | — | both |
-| 2 | `SUCCESS` (DE via Salesforce) | — | order |
-| 3 | `SUCCESS` (US, Avalara runs) | — | cart |
-| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) |
-| 5 | `ORDER_CREATION_FAILED` | create | — (never created) |
-| 6 | `MARGIN_CHECK_FAILED` | margin | order |
-| 7 | `VALIDATION_FAILED` | udf | both |
-| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart |
-| 9 | `AUTH_FAILED` (JAM 403) | jam | order |
-| 10 | `SAP_SUBMISSION_FAILED` | sap | both |
+The **Satellites** column is derived, not configured — it is what the chain
+compiler produces. `SOLR` appears in every flow that reaches it; `Avalara` only
+in the US flow that gets all the way to the end of enrichment.
+
+| # | Outcome | fail_at | bridge_ids | Satellites reached |
+|---|---|---|---|---|
+| 1 | `SUCCESS` (UK, 3 lines) | — | both | settings → spt → rsm → **solr** → jam → checker |
+| 2 | `SUCCESS` (DE via Salesforce) | — | order | settings → spt → rsm → **solr** → jam → checker |
+| 3 | `SUCCESS` (US, Avalara runs) | — | cart | settings → spt → rsm → **solr** → jam → checker → **avalara** |
+| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) | — (dies in phase 1) |
+| 5 | `ORDER_CREATION_FAILED` | create | — (never created) | — (dies in phase 1) |
+| 6 | `MARGIN_CHECK_FAILED` | margin | order | settings → spt → rsm → **solr** → jam → checker |
+| 7 | `VALIDATION_FAILED` | udf | both | settings → spt → rsm → **solr** → jam → checker |
+| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart | settings → spt (no solr — dies here) |
+| 9 | `AUTH_FAILED` (JAM 403) | jam | order | settings → spt → rsm → **solr** → jam |
+| 10 | `SAP_SUBMISSION_FAILED` | sap | both | settings → spt → rsm → **solr** → jam → checker |
+
+Scenarios 11–17 (clustering / novel-failure cases, also in `shared/scenarios.py`)
+follow the same rules: 11/12 are SPT-down (settings → spt only, and 12 is US but
+never reaches Avalara — country alone is not sufficient), 13 is a margin failure
+(reaches solr), 14 is SAP-down (reaches solr), and 15/16/17 fail **at Settings**,
+so they reach `settings` and nothing else.
 
 **11–17 exist to exercise incident clustering** (see [5] Incident Clustering) —
 they add no new failure *modes*, they put SEVERAL orders through the same one so
@@ -557,12 +618,18 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
 ```
 - **Explainer Node** — LLM call 1: plain-English explanation of the log for an
   IT-support agent (what happened, which service, likely cause).
-- **Router Node** — LLM call 2: pick a `department`, a per-log `severity`
-  (`critical`/`high`/`medium`/`low`), and a `confidence` (0–1), returned as one
-  JSON object. Both the department and the severity are validated against their
-  enums — an out-of-range value is an `LLMError` → fallback, never coerced.
-  Severity is per-log *technical* urgency judged from the log alone (not
+- **Router Node** — LLM call 2: pick a `department` and a per-log `severity`
+  (`critical`/`high`/`medium`/`low`), returned as one JSON object —
+  `{"department": ..., "severity": ...}` and **nothing else**. Both are validated
+  against their enums — an out-of-range value is an `LLMError` → fallback, never
+  coerced. Severity is per-log *technical* urgency judged from the log alone (not
   business impact, not journey-level).
+
+  There is **no `confidence`**. The router used to also return a 0–1 score; it was
+  removed end to end (prompt, parsing, `ProcessedAlert`, the `alerts` column, the
+  API response, the Teams card, and the dashboard). A model that volunteers a
+  `confidence` key anyway is *ignored* rather than rejected — dropping an
+  otherwise-valid route to fallback over an extra key would be a regression.
 
   **Department semantics (`_DEPARTMENT_GUIDE` + `_ROUTE_EXAMPLES` in `nodes.py`).**
   The prompt's ALLOWED list is generated from the `Department` enum, but the
@@ -607,7 +674,6 @@ class ProcessedAlert(BaseModel):
     explanation: str | None             # plain English; None when source="fallback"
     department: Department | None      # None when source="fallback"
     severity: Severity | None           # per-log technical severity; None when source="fallback"
-    confidence: float | None            # 0..1; None when source="fallback"
     source: Literal["ai", "fallback"]
     cached: bool = False                 # True when served from the semantic cache
                                          # (still source="ai"; routing unchanged)
@@ -651,6 +717,97 @@ differ by design and must not be unified:
   **NEUTRAL 0.5, not zero**; and `w=0` is an exact no-op. Both `score` and
   `final_score` come back so the effect is inspectable.
 
+### Documentation index (`docsindex.py` + `knowledge_loader.py` + `knowledge_routing.py`)
+The second grounding channel: per-service docs in **`ai_service/knowledge/`**
+(5 service docs + `answering-policy.md` + `service-map.yaml`). Same encoder again —
+one model, now four consumers.
+
+**Why a separate index and not a new `kind` in `ragindex`** — four reasons, the
+first decisive:
+1. `ragindex` evicts **oldest-first**. Docs load once at startup, so they are
+   permanently the oldest entries and the continuous alert stream would silently
+   evict them within days — no error, just a chatbot that stops knowing what JAM is.
+2. One shared `k` makes docs and alerts compete: "what does the checker do?" loses
+   its own documentation to five checker *failures*. Separate budgets **guarantee**
+   a mix instead of hoping for one.
+3. `RAGINDEX_MIN_SCORE` is tuned for incident history.
+4. Feedback boosts would let a downvote on a badly-worded answer demote correct
+   reference material — so this index is queried with **no feedback blend at all**.
+
+**Chunking — a chunk is a section, bounded by a token budget.** Two constraints,
+and the second is the one that matters:
+1. `all-MiniLM-L6-v2` truncates at ~256 word-piece tokens. 13 of jam-ws's 21
+   sections exceed that; §11 is ~1114 tokens, so three quarters of it would never
+   be embedded — silently, with every structural test still passing.
+2. **One chunk becomes one vector, i.e. one meaning.** §11 is 17 unrelated
+   warnings; averaged together they match every jam-ws question weakly and none
+   well. **A bigger encoder fixes (1) and leaves (2) untouched** — which is why the
+   answer is chunking, not a model swap (a swap would also invalidate every vector
+   already in `alerts.embedding` and de-tune all three cosine thresholds).
+
+So sections split at their own natural repeated unit — table row, list item, bold
+sub-block, paragraph — never mid-sentence, packed up to `CHUNK_BUDGET_CHARS`. A
+table row is always re-issued **with its header** (a row torn from its header means
+nothing), and every piece is prefixed `[service · heading]` so a fragment carries
+its identity into any prompt. Each chunk also keeps its **whole parent section**,
+so retrieval can match the precise piece and still hand the LLM the surrounding
+context — the useful half of "summarise each section", with no LLM and no loss of
+exact wording. Current corpus: **274 chunks**, avg ~712 chars.
+
+**Chunk ids are content-derived, never positional** —
+`jam-ws#blind-spots-and-traps--role-matching-is-exact`, not `jam-ws#11-4`. Ordinals
+shift the moment anyone inserts a section, silently re-pointing every citation
+already shown to a user and invalidating the evaluation set.
+
+**Section kinds come from heading TEXT, never the number.** The five docs word the
+same section differently ("The rules that stop **an order**" vs "…stop
+**something**") and the numbering will be revised, so `kind_for()` keyword-matches
+the heading and a nested section **inherits its parent's verdict** — which is what
+keeps §7.1/7.2/7.3 out of the index when their own headings match no rule. §7 (log
+anatomy — engineer-level, and a logback format the simulation never emits) and §13
+(provenance — about the document) are excluded outright. An **unrecognised heading
+is indexed unlabelled, never dropped**.
+
+**Retrieval is three steps** (`knowledge_routing.py`), cheapest first:
+1. exact match on a pasted log message — **not built yet**; the highest-value
+   support action and it needs no AI at all.
+2. **narrow by service and question kind**, by plain string matching. Service
+   aliases come from each doc's own frontmatter (single source of truth) plus
+   `service-map.yaml`, which adds the mock `cc-*` app_names — so a question scoped
+   to a `cc-jam-service` alert narrows to `jam-ws` without the user naming it.
+3. cosine over what survives.
+
+Measured on `tests/data/knowledge_eval.yaml` (17 questions, 274 chunks): similarity
+alone **top-1 29% / top-3 53%**; adding the question-kind filter **41% / 82%**. The
+narrowing is not optional — unfiltered, one chunk about the three spellings of the
+word "JAM" won three unrelated questions.
+
+- **Routing is a fast path, not a gate.** No service named, or an unrecognised
+  phrasing, means search wider — never refuse (you lose precision, never the answer).
+- **`kind_mode="soft"`** ranks kind-matched chunks first but still fills leftover
+  slots, so a mis-detected kind costs ranking, not the answer. Question phrasing is
+  genuinely ambiguous in a way a service name is not.
+- **A named-but-undocumented service does NOT fall through to the wide search.**
+  That is knowledge, not ignorance. `see_also` in `service-map.yaml` points at the
+  doc covering it second-hand (`cc-checker-service` → `order-engine`, and
+  `folded_in` components inherit their `emitted_by` service's doc); with no
+  `see_also` the docs channel returns `[]`, which is what makes "I have no
+  documentation for SPT" deterministic rather than four unrelated RSM sections.
+- **No persistence, deliberately.** Rebuilt from the files in seconds, so a Redis
+  copy could only drift. `GET /docs/stats` reports size/kinds/why-it-is-off;
+  `POST /docs/reload` re-reads without a restart, and a **failed reload keeps the
+  previous index** rather than emptying it.
+- **Self-disabling** like semcache/ragindex: no encoder, missing folder or an
+  unreadable corpus all leave an empty index and an assistant that answers from
+  incident history alone — never a crash at startup.
+- **`answering-policy.md` is the system prompt, never an indexed chunk.** It is the
+  only corpus file with **no `yaml` frontmatter block**, and that absence — not a
+  hardcoded filename — is the loader's test for "not a service doc".
+
+**Eight services are still undocumented** (SPT, Settings, Checker, SOLR, Avalara,
+Track & Trace, Outbound OSW, SAP/Salesforce); `service-map.yaml` records them so the
+"no documentation" answer is a lookup rather than a guess.
+
 ### Chat / summary API (`api.py`)
 `POST /summarize-journey` — body: journey meta + ordered raw logs. Returns an
 LLM-written summary (services touched, where it stopped, why) plus a
@@ -658,27 +815,103 @@ LLM-written summary (services touched, where it stopped, why) plus a
 backend **on journey completion**. Same breaker; when LLM is down return a
 plain template built from journey meta (`source: "fallback"`).
 
-`POST /chat` — retrieve top-k from the index, then compose an answer **grounded
-in those records only**, under the same breaker. Degradation is layered so the
-endpoint is always useful, and the `sources` are **identical in every case** —
-only the prose differs, so a UI never branches on mode to render citations:
+`POST /chat` — retrieve from **both** grounding channels (incident history via
+`ragindex`, documentation via `docsindex`), then compose an answer grounded in
+what came back, under the same breaker. Degradation is layered so the endpoint is
+always useful, and the `sources` are **identical in every case** — only the prose
+differs, so a UI never branches on mode to render citations:
 
 | situation | `mode` |
 |---|---|
-| sources retrieved + LLM ok | `"ai"` — a grounded narrative |
+| any context retrieved + LLM ok | `"ai"` — a grounded narrative |
 | breaker open / LLM error | `"retrieval-only"` — deterministic template listing what was found |
-| nothing retrieved | `"retrieval-only"` — says so plainly, never invents a source |
+| nothing retrieved anywhere | `"retrieval-only"` — says so plainly, never invents a source |
+
+`self_grounded` (bool, default false) is the caller asserting **"grounding
+material is in `query` itself"** — the backend sets it when it prepended a scoped
+record's text, which is read LIVE from Postgres and is more authoritative than
+anything indexed. Without it, "retrieval found nothing" and "there is nothing to
+answer from" are the same fact, which was true only while the index was the sole
+channel. The failure it fixes: click a NOVEL failure (nothing similar is indexed —
+exactly when you need help), ask "what does this mean?", and get *"No related
+incidents found — run the backfill"* while the alert's full text sits in that very
+request. The original guard still holds for the case it was written for: a bare
+question that matched nothing composes nothing.
+
+**Record ids never appear in the answer prose.** They identify rows the reader
+cannot look up by id, and the UI lists the sources beside the answer anyway. The
+prompt forbids bracketed citations, and `clean_answer_citations()` is the
+deterministic backstop ("do not do X" is a conditional instruction a small
+deployment follows unreliably — the same reason `coverage` became a computed
+field). Doc ids are SUBSTITUTED with "the official documentation" so the sentence
+survives; alert/journey ids are DELETED, with the orphaned "Evidence:" lead-in
+removed as a unit. **Business identifiers (`ORD-6426`, `evt-…`, cart header ids)
+are never touched** — only ids of retrieved records, and only inside brackets.
 
 `coverage` (`shown` / `limit` / `truncated`) is **computed by the server, never
-generated**. Top-k has no notion of coverage: several alerts about one incident
-can crowd out a second distinct incident that also matched, and an answer built
-from that sample reads as if it described the whole history. Two prompt-based
-attempts at self-caveating were followed about half the time in each direction; a
-field is deterministic and costs no tokens. `truncated` is the one a caller should
-act on.
+generated**, and describes the **incident channel only**: "truncated" answers "is
+there more history I did not see?", a real risk on an ever-growing record set,
+whereas the docs corpus is small, fixed and authored. Top-k has no notion of
+coverage: several alerts about one incident can crowd out a second distinct
+incident that also matched, and an answer built from that sample reads as if it
+described the whole history. Two prompt-based attempts at self-caveating were
+followed about half the time in each direction; a field is deterministic and costs
+no tokens. `truncated` is the one a caller should act on.
 
-`GET /semcache/stats` and `GET /ragindex/stats` expose cache hit rate and index
-size.
+`GET /semcache/stats`, `GET /ragindex/stats` and `GET /docs/stats` expose cache
+hit rate and index sizes. `POST /docs/reload` rebuilds the documentation index
+from the folder without a restart.
+
+### LLM observability (`langsmith_stats.py`) — `GET /llm-stats`
+Per-logical-model run stats (calls, p50/p99 latency, error rate, cost, tokens)
+read back from LangSmith, split by the tag `llm.py` puts on each model
+(`explainer` / `router` / `summary` / `chat`), plus what the semantic cache saved.
+The backend forwards it (`backend/llm_stats_client.py`) so :8100 stays off the
+browser; the dashboard renders it at `/ai-performance`.
+
+**LangSmith is NOT on the read path.** A background task (`run_refresher`, started
+in `main.py` beside the poller) refreshes a snapshot of all 3 windows x 4 tags on a
+timer; `GET /llm-stats` is a pure snapshot read, so no user click can produce a
+request to LangSmith. That is a rate-limit fix and it had to be structural: with a
+TTL cache, volume was driven by clicks — 1h/24h/7d are three keys, so the first
+visit to each cost 4 queries, i.e. 12 requests in a few seconds, and no TTL helps a
+*first* visit. Load is now a constant function of time (12 requests per interval),
+independent of how many people are watching.
+
+Two disciplines inside the refresher:
+- **Every request is spaced** by `LLM_STATS_STAGGER_SECONDS`, including across the
+  window boundary — 12 back-to-back requests is the burst `/runs/stats` rejects
+  even when the average rate is low. The arithmetic (12 x stagger = cycle
+  duration) lives in the knob's comment in `settings.py`; keep it in step.
+- **A failure never overwrites a good value.** A tag that fails this cycle keeps
+  its previous number, so one 429 can't blank a card. Never a fabricated 0 — a
+  value that was never read is `null`.
+
+Three fields travel the whole chain into the UI (route → `llm_stats_client`,
+including its `degraded()` shape → `lib/types.ts`) so the page can explain a null
+node instead of guessing:
+
+- **`fetched_at`** — ISO UTC, `null` until a cycle completes. Stamped at the END of
+  a cycle, never the start: a cycle takes ~18s, and stamping it early would date
+  the numbers from before they were gathered. Wall clock, not monotonic (it is
+  persisted and displayed).
+- **`langsmith_configured`** — separates "no credentials" from "nothing collected
+  yet". Together with `fetched_at` these give the three distinct reasons a node is
+  null: collecting / not configured / that tag's query failed. The page used to
+  report all three as "not configured yet".
+- **`refresh_interval_s`** — the configured period. The UI adds it to `fetched_at`
+  ("next update in ~Xs") and multiplies it (`STALE_INTERVALS`) to decide the
+  refresher has died, so the backend substitutes a positive default rather than
+  forwarding a zero.
+
+**The age on screen is the refresher's only health signal.** It publishes into a
+snapshot, so a dead task keeps serving its last numbers — plausible, well-formed,
+increasingly wrong, with no error anywhere. Past `3 x refresh_interval_s` the label
+says so in words. Pure logic for all of this lives in
+`dashboard/lib/aiPerformance.ts` (tested with `npm test` — Node's built-in runner,
+no jest/vitest); the page polls the snapshot every 30s and has **no per-second
+timer** — the data moves once a cycle, so a ticking seconds counter was false
+precision.
 
 ### LLM config — Claude via Azure AI Foundry
 All provider wiring in ONE module (`llm.py`), via LangChain's chat-model
@@ -864,7 +1097,7 @@ url-safe token carrying `(sort_value, id_value)`; datetimes round-trip as ISO-86
 ```
 alerts(alert_id PK, emitted_at, log_id UNIQUE, level, app_name, logger, message,
        event_id, order_id, cart_header_id, account_number,
-       explanation, department, severity, confidence, source, cached,
+       explanation, department, severity, source, cached,
        embedding JSONB NULL,                    -- masked-message vector, for clustering
        journey_id FK NULL, incident_id FK NULL,
        is_resolved, resolved_at NULL)
@@ -914,7 +1147,17 @@ GET  /alerts/facets                     # 🔒 per-value counts for the 3 multi-
                                         # the other filters still scope it. NULLs are
                                         # skipped (no filter option to count them on).
 PATCH /alerts/{alert_id}/resolve        # 🔒 manual triage — is_resolved=True, resolved_at=now()
-GET  /journeys?status=                  # 🔒 requires session
+GET  /journeys?status=&outcome=&search= # 🔒 requires session. status/outcome are
+                                        # exact-match FREE STRINGS (not Literals —
+                                        # the 10 outcomes are module constants in
+                                        # backend/journeys.py and a second list
+                                        # would drift), so an unknown value is an
+                                        # empty list, not a 422. search is an ILIKE
+                                        # substring over event_id/order_id/
+                                        # cart_header_id, OR'd as ONE group so it
+                                        # ANDs with the other two. Blank = no
+                                        # filter. No NULL bucket for outcome —
+                                        # status=IN_PROGRESS already selects those.
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
 GET  /incidents?status=&department=      # 🔒 status is open|resolved; department multi-valued
 GET  /incidents/{id}                    # 🔒 incident + its member alerts
@@ -1014,9 +1257,51 @@ put auth-method specifics in the JWT payload; keep it identity + expiry.
 Config: `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `PASSWORD_LOGIN_ENABLED`,
 `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_REDIRECT_URI`,
 `JWT_SECRET` (≥32 bytes in
-deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS).
+deploy), `JWT_TTL_SECONDS` (default 8h), `AUTH_COOKIE_SECURE` (true behind TLS),
+`AUTH_COOKIE_SAMESITE` (default `lax`).
 The dev-run scripts (injector, replay) POST to the collector/RabbitMQ — NOT this
 API — so they are unaffected by auth. `passlib` needs `bcrypt<4.1` (pinned).
+
+### Cross-site deployment (e.g. Azure Container Apps)
+
+Locally the dashboard and backend are same-site (`localhost:3000` → `:8000`), so
+every default below is the local value and docker-compose needs none of them. In a
+deployment where the two get **different hostnames**, three things must change
+together — they are one decision, not three:
+
+| Env var | Local default | Cross-site deploy |
+|---|---|---|
+| `CORS_ALLOW_ORIGINS` | `http://localhost:3000` | the dashboard's origin (comma-separated for several) |
+| `AUTH_COOKIE_SAMESITE` | `lax` | **`none`** |
+| `AUTH_COOKIE_SECURE` | `false` | **`true`** (required by `SameSite=none`) |
+
+- **`allow_credentials=True` forbids a `*` origin**, so the dashboard origin must
+  be listed explicitly — hence an env var rather than a constant.
+- A `lax` cookie is withheld on cross-site fetch **and on the WebSocket upgrade**,
+  so login appears to succeed and then every guarded call 401s. `none` fixes that
+  but browsers reject `SameSite=None` without `Secure`, so `backend/auth.py`
+  validates the pair at import and refuses to start on a bad combination rather
+  than shipping a cookie the browser silently drops.
+- Set and clear read the same two constants, so a logout can never emit different
+  attributes than the login (a mismatch is ignored by the browser and leaves the
+  user signed in).
+- The Entra `oil_oauth_state` cookie stays `lax` regardless — that hop is a
+  top-level redirect, and `strict`/`none` would break or needlessly loosen it.
+
+**TLS to managed backends.** Postgres needs care; Redis and RabbitMQ do not:
+
+- **Postgres** — `DB_SSL=require` turns TLS on without touching the URL. Note
+  `?sslmode=require` (the form the Azure portal gives you) is a **trap on
+  asyncpg**: SQLAlchemy forwards unknown query params straight to
+  `asyncpg.connect()`, which has no `sslmode` parameter (only `ssl`), so it raises
+  `TypeError: connect() got an unexpected keyword argument 'sslmode'` on the FIRST
+  connection — long after startup looked healthy. `backend/db.py` translates
+  `sslmode` → `ssl` for asyncpg and leaves psycopg2 (Alembic's driver, which
+  handles `sslmode` natively) alone.
+- **Redis** — no change needed: `rediss://` in `REDIS_URL` selects
+  `SSLConnection` automatically.
+- **RabbitMQ** — no change needed: `amqps://` in `RABBITMQ_URL` enables TLS
+  (aiormq branches on the scheme).
 
 Dashboard: `lib/auth.tsx` (`AuthProvider` calls `/auth/me` on load) +
 `components/auth/AuthGate.tsx` (renders `LoginScreen` when anonymous, the app
@@ -1040,9 +1325,9 @@ Webhook per department channel + general, Teams channels like `#devops-logs`,
 ... , `#general-logs`:
 `TEAMS_WEBHOOK_NETWORKING`, `_DEVOPS`, `_BACKEND`, `_DATABASE`, `_GENERAL`.
 Card (simple title + fields, easy to adapt between an Incoming Webhook and a
-Power Automate flow): level/outcome, service, explanation (or "unprocessed —
-LLM unavailable" for `source="fallback"`), ids, confidence, `AI` vs `fallback`
-badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
+Power Automate flow): level/outcome, severity, department, service, explanation
+(or "unprocessed — LLM unavailable" for `source="fallback"`), ids, `AI` vs
+`fallback` badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
 `journey_id`/`order_id`. **If a channel's webhook env var is unset, print the
 card to stdout** — never crash on missing config.
 
@@ -1061,7 +1346,8 @@ failing sink so one never stops the other or the consumers.
 
 Connects to backend WS + REST. Feature contract:
 - Real-time alert feed with plain-English explanations.
-- Department + confidence per alert; **badge `AI-analyzed` vs `fallback`**, plus a
+- Department + severity per alert (no confidence score — it was removed end to
+  end); **badge `AI-analyzed` vs `fallback`**, plus a
   **`Cached` badge alongside `AI-analyzed`** when `ProcessedAlert.cached` is set
   (a cache hit is the same AI answer reused — a modifier, never a replacement, so
   the two badges show together). An "Answer" filter (`all` / `cached` / `fresh`)
@@ -1097,6 +1383,13 @@ Connects to backend WS + REST. Feature contract:
   badge), its cited sources with dashboard links, the server-computed coverage
   badge, and thumbs up/down. Deliberately **not persisted** — silently resurrecting
   yesterday's thread about a different order would mislead more than it helps.
+  **Documentation sources collapse into ONE `info` badge reading "Official
+  documentation"**, never listed individually: a doc citation names a chunk of a
+  repository the agent cannot open, so four of them offer nothing to verify and
+  push the incident citations — which DO link somewhere — out of sight. They still
+  travel in `sources` (no API change; ids stay available for the eval set and the
+  network tab), and they are excluded from the `record_ids` sent with a vote, since
+  the docs index ranks without feedback and that credit could never be spent.
 - **Insights page** (`/insights`) — `GET /stats/insights` rendered as stat tiles
   and breakdown bars (`components/insights/`).
 - **Alert detail drawer** (`AlertDetailDrawer.tsx`), **search**
@@ -1115,6 +1408,11 @@ Connects to backend WS + REST. Feature contract:
 | `ai:semcache` | string | — | semantic-cache dump (LRU entries persisted across restarts). Rebuildable — safe to drop. |
 | `ai:semcache:hits` / `:misses` | string | — | semantic-cache hit/miss counters (the demo number; `GET /semcache/stats`) |
 | `ai:ragindex` | string | — | retrieval-index dump (incident records + vectors). Rebuildable — drop it and run `python -m backend.scripts.backfill_rag`. |
+| `ai:llmstats:snapshot` | string | — | LangSmith per-model stats snapshot + its `fetched_at` (all 3 windows x 4 tags), refreshed on a timer and read by `GET /llm-stats`. Rebuildable — safe to drop; it exists so a restart doesn't blank `/ai-performance` until the first cycle lands. |
+
+The **documentation index has no Redis key on purpose** — it is rebuilt from
+`ai_service/knowledge/*.md` at every startup in seconds, so a persisted copy could
+only drift from the files that are its source of truth.
 
 Journey, incident and feedback state lives in Postgres — the backend owns them.
 
@@ -1140,6 +1438,8 @@ cd dashboard && npm run dev                   # [6] :3000
 python -m pipeline.injector.inject --all      # fire every scenario
 python -m backend.scripts.backfill_rag        # optional: index existing history for /chat
 pytest                                        # the test suite (pytest.ini: asyncio_mode=auto)
+cd dashboard && npm test                      # [6] pure-logic unit tests (node --test)
+python -m ai_service.scripts.eval_knowledge   # optional: score docs retrieval (needs the encoder)
 ```
 
 ### Everything in Docker
@@ -1213,14 +1513,34 @@ gate; see [3]), `RAGINDEX_MAX_ENTRIES=5000`, `RAGINDEX_MODEL=all-MiniLM-L6-v2`
 (same value as `SEMCACHE_MODEL` reuses the ONE loaded encoder; a different value
 loads a second one), `RAGINDEX_FEEDBACK_WEIGHT=0.15` (0 = feedback off, exact
 no-op), `INCIDENT_COSINE_THRESHOLD=0.95` (novel-path incident match),
+`DOCSINDEX_ENABLED=1`, `DOCSINDEX_DIR=ai_service/knowledge`,
+`DOCSINDEX_MODEL` (defaults to `RAGINDEX_MODEL` — the FOURTH consumer of the one
+loaded encoder), `DOCSINDEX_MIN_SCORE=0.20` (lower than the incident floor because
+the service+kind narrowing already did the coarse work), `DOCSINDEX_K=4` (its own
+budget, so docs and incidents cannot crowd each other out),
+`DOCSINDEX_KIND_MODE=soft`,
 `AI_SERVICE_URL=http://localhost:8100`, `RAG_INDEX_TIMEOUT=5`,
 `RAG_CHAT_TIMEOUT=30`,
+`LANGSMITH_API_KEY` + `LANGSMITH_PROJECT` (both required before `/llm-stats`
+queries anything; absent = a 200 full of nulls),
+`LLM_STATS_REFRESH_INTERVAL_SECONDS=60` (one cycle = 12 requests, so this alone
+sets the average rate), `LLM_STATS_STAGGER_SECONDS=1.5` (pause between EVERY
+request in a cycle; sized for 12 requests, not 4 — see `settings.py` for the
+arithmetic), `LLM_STATS_SNAPSHOT_KEY=ai:llmstats:snapshot`,
 `ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET` (all three required
 to enable Entra sign-in; absent = disabled, never a crash),
 `ENTRA_REDIRECT_URI=http://localhost:8000/auth/entra/callback` (must match the
 Azure app registration byte-for-byte), `PASSWORD_LOGIN_ENABLED=true` (set false in
-any deployment), plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
+any deployment),
+`CORS_ALLOW_ORIGINS=http://localhost:3000` (comma-separated browser origins),
+`AUTH_COOKIE_SAMESITE=lax` (`none` for a cross-site deploy — needs
+`AUTH_COOKIE_SECURE=true`), `DB_SSL=` (unset = no TLS; `require` for a managed
+Postgres) — see "Cross-site deployment" under [5] for how these three go
+together — plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
 above.
+
+`LLM_STATS_CACHE_TTL_SECONDS` was **removed** with the TTL cache it belonged to —
+reads no longer fetch, so there is nothing to expire.
 
 ---
 
@@ -1275,6 +1595,27 @@ above.
   still returns the same sources; `coverage.truncated` is true exactly when
   `shown == limit`; an index push failure never fails alert persistence or journey
   completion.
+- **Documentation RAG** (`tests/test_knowledge_loader.py`, `test_knowledge_routing.py`,
+  `test_docsindex.py`, `test_chat_docs.py`, `test_chat_grounding.py`): every chunk
+  fits the encoder budget (over-budget text is truncated with NO error, so this is
+  the guard against silent loss) and all 17 of §11's traps survive the split;
+  excluded sections (§7 and its children, §13) produce no chunks; `answering-policy.md`
+  is skipped for the STRUCTURAL reason (no frontmatter), not by filename; ids are
+  content-derived and unique; a table row keeps its header; `kind` is right for both
+  wordings of §1/§3/§4; a nested section inherits its parent's exclusion; an
+  unrecognised heading is indexed unlabelled, not dropped; chunking is deterministic.
+  Routing: a short alias (`oe`) never matches inside a word; an undocumented service
+  routes to its `see_also` doc, or returns `[]` when it has none; a documented
+  service beats an undocumented one; soft mode keeps non-matching kinds reachable
+  while hard mode drops them. Index: every failure mode (no encoder, missing folder,
+  empty corpus, unconfigured) disables it rather than raising, and a FAILED reload
+  keeps the previous index. Chat: docs alone suffice to compose; `self_grounded`
+  composes with zero sources while a bare question still refuses and never calls the
+  model; `coverage` still counts incidents only; incident filters never reach the
+  docs channel; no record id survives into the prose while `ORD-…` always does.
+  `tests/data/knowledge_eval.yaml` is pinned in CI (every expected chunk id must
+  exist, every kind must have a question) — the scored run needs the encoder and is
+  manual.
 - **Feedback**: silence scores neutral, not negative; 1/1 ranks below 8/10;
   `MIN_VOTES` suppresses a single stray click; a re-vote replaces rather than
   stacks; decay ages votes out.
@@ -1347,7 +1688,33 @@ above.
   or they never leave the live feed.
 - The retrieval index and the semantic cache share an encoder but **not a
   threshold** (0.30 recall floor vs 0.95 near-identical). Do not unify them: the
-  cache must fail toward a miss, retrieval wants recall.
+  cache must fail toward a miss, retrieval wants recall. The docs index is the
+  FOURTH consumer of that one encoder and has its own floor (0.20) and its own `k`.
+- **Never merge the docs index back into `ragindex`.** Its eviction is oldest-first,
+  and docs — loaded once at startup — are permanently the oldest entries, so they
+  would be evicted within days with no error at all. Separate budgets are also the
+  only thing that guarantees an answer gets both documentation and incidents.
+- **Never swap the encoder to "fix" chunk truncation.** A bigger context window
+  leaves the real problem — one chunk is one vector, so a section holding 17
+  unrelated warnings means nothing in particular — and it invalidates every vector
+  already persisted in `alerts.embedding` while de-tuning `SEMCACHE_THRESHOLD`,
+  `INCIDENT_COSINE_THRESHOLD` and `RAGINDEX_MIN_SCORE`, all chosen for THIS model.
+- **Doc chunk ids are content-derived, never positional**, and section `kind` comes
+  from heading TEXT, never the section number. Both exist because the template will
+  be renumbered, and an ordinal id silently re-points citations already shown to a
+  user and invalidates the evaluation set.
+- **The corpus must stay in git and inside `ai_service/`.** Not tracked ⇒ not in the
+  image ⇒ an empty index in production, silently. `build-images.yml` filters on
+  `ai_service/**` so a docs-only edit rebuilds the image, and `.dockerignore`
+  excludes only `docs/` and `ways-of-working/` — moving the corpus into a name
+  inside that block stops it reaching the build context.
+- **Zero retrieved sources must not mean "refuse"** — see `self_grounded` in [3].
+  The guard against composing with nothing to ground in stays, but "grounded" is not
+  a synonym for "retrieval returned rows" now that a caller supplies its own context.
+- **Record ids never appear in answer prose.** The prompt forbids them and
+  `clean_answer_citations()` enforces it deterministically. Business identifiers
+  (`ORD-…`, `evt-…`, cart header ids) are explicitly NOT record ids — stripping
+  those would gut the answer.
 - **Feedback is a nudge, never a gate.** Keep the relevance floor on raw cosine,
   keep unvoted records at `NEUTRAL`, and keep the blend weight low — every one of
   those is a countermeasure to a specific documented bias (see [5] `feedback.py`).

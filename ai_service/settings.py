@@ -69,7 +69,7 @@ BREAKER_OPEN_SECONDS = int(os.getenv("BREAKER_OPEN_SECONDS", "60"))
 # semantic cache is consulted (CLAUDE.md [3]): normalize the message (mask
 # volatile ids), exact-match the normalized text, else cosine-compare a local
 # embedding against stored vectors. A hit >= SEMCACHE_THRESHOLD reuses the
-# cached explanation/department/severity/confidence and skips both LLM calls.
+# cached explanation/department/severity and skips both LLM calls.
 # The corpus is highly repetitive, so the hit rate is high after warm-up.
 SEMCACHE_ENABLED = os.getenv("SEMCACHE_ENABLED", "1") not in ("0", "false", "False", "")
 # Cosine-similarity floor for a semantic (non-exact) hit. High by default so
@@ -225,6 +225,80 @@ def llm_configured() -> bool:
     is the switch that lets the whole pipeline run without credentials.
     """
     return bool(AZURE_AI_FOUNDRY_ENDPOINT and AZURE_AI_FOUNDRY_API_KEY)
+
+
+# --- LangSmith (tracing read-back, GET /llm-stats) ----------------------------
+# langchain-core WRITES traces on its own from the standard LANGSMITH_* env vars,
+# and langsmith.Client() likewise picks up LANGSMITH_API_KEY / LANGSMITH_ENDPOINT
+# from the environment. These two are read here only so the service can answer
+# "should we even try to query?" — nothing passes them to the SDK by hand.
+#
+# The project name is required for querying (run stats are per-project), which is
+# why it counts toward "configured" even though tracing itself would default to
+# a "default" project.
+LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
+LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "")
+
+# --- LangSmith is OFF the read path: a background refresher owns the queries ---
+#
+# LangSmith rate-limits /runs/stats far harder than trace ingestion (analytics
+# aggregation on a personal plan), and a Monitoring tab open in a browser draws on
+# the same per-project budget. Observed in production as
+# "Rate limit exceeded for /runs/stats. HTTPError('429 ...')".
+#
+# The root cause was that request volume was driven by USER CLICKS: each window
+# was 4 queries, and 1h/24h/7d were three separate cache keys, so clicking through
+# all three fired 12 requests within a few seconds no matter how long the TTL was.
+# A TTL cache cannot fix that — it only helps the SECOND visit to a window.
+#
+# So the shape changed instead: one background task refreshes a snapshot of all 3
+# windows x 4 tags, and GET /llm-stats only ever reads that snapshot. Request
+# volume is now a constant function of time, completely independent of how many
+# people are looking at the page or how fast they click.
+#
+# How often a full refresh cycle runs. Every cycle costs exactly 12 requests, so
+# this is the ONLY knob that sets the average rate: 12 requests per interval.
+# At 60s that is 0.2 req/s average — two orders of magnitude under the limit, with
+# the page never more than ~a minute stale. The sleep happens AFTER the cycle, so
+# the real period is interval + cycle duration (~76s at these defaults).
+LLM_STATS_REFRESH_INTERVAL_SECONDS = float(
+    os.getenv("LLM_STATS_REFRESH_INTERVAL_SECONDS", "60")
+)
+
+# Pause between EVERY pair of successive requests in a cycle — including across
+# the window boundary, not just between the four tags of one window. That gap was
+# the remaining burst: 12 requests fired back-to-back is the shape LangSmith
+# rejects even when the total rate is low.
+#
+# The arithmetic that picks this number:
+#   * one cycle = 3 windows x 4 tags = 12 requests
+#   * cycle duration ~= 12 x stagger  (11 gaps, plus each round-trip)
+#   * LangSmith's query endpoints allow roughly 10 requests / 10 seconds
+# At 1.5s a cycle spans ~16.5s and issues 12 requests over it — about 0.73 req/s
+# instantaneous, so even a burst-sensitive limiter sees headroom, and a Monitoring
+# tab can share the budget. (The previous 0.3s was sized for 4 requests, not 12:
+# it would have pushed 3.3 req/s and tripped the limit on its own.)
+#
+# Latency is no longer a reason to keep this small — nothing user-facing waits on
+# a cycle any more, which is the whole point of the snapshot. 0 disables the
+# spacing (the tests set this so the suite doesn't spend minutes sleeping).
+LLM_STATS_STAGGER_SECONDS = float(os.getenv("LLM_STATS_STAGGER_SECONDS", "1.5"))
+
+# Redis key holding the persisted snapshot. Same posture as SEMCACHE_KEY:
+# rebuildable, safe to drop — the next cycle refills it. It exists so a restart
+# (a deploy, a crash) doesn't leave the page blank until the first cycle lands;
+# without it the first person to open the page after every deploy sees
+# "Collecting…" instead of the numbers that were true a minute earlier.
+LLM_STATS_SNAPSHOT_KEY = os.getenv("LLM_STATS_SNAPSHOT_KEY", "ai:llmstats:snapshot")
+
+
+def langsmith_configured() -> bool:
+    """True only if LangSmith can be queried for run stats.
+
+    False is a normal state, not an error: ``GET /llm-stats`` then answers with
+    nulls instead of failing, exactly as the pipeline treats missing Azure creds.
+    """
+    return bool(LANGSMITH_API_KEY and LANGSMITH_PROJECT)
 
 
 # --- Suppression helper (pure) ------------------------------------------------

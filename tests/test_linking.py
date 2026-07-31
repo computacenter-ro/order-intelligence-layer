@@ -36,7 +36,7 @@ def _alert(**over) -> ProcessedAlert:
         alert_id=over.pop("alert_id", "a1"),
         emitted_at=datetime(2026, 7, 20, 8, 0, 1, tzinfo=timezone.utc),
         log=over.pop("log", _log()), explanation=None, department=None,
-        confidence=None, source="fallback",
+        source="fallback",
     )
 
 

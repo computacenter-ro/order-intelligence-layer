@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
+import { formatNotificationCount } from "@/lib/format";
 
 interface NewIncidentsBannerProps {
   count: number;
@@ -42,7 +43,9 @@ export function NewIncidentsBanner({ count, onReveal }: NewIncidentsBannerProps)
   if (!visible) return null;
 
   const tone = badgeColors.pending;
-  const label = count === 1 ? "1 new incident" : `${count} new incidents`;
+  // Pluralization and "1 new incident" reflect the REAL count — only the
+  // printed number itself is capped.
+  const label = count === 1 ? "1 new incident" : `${formatNotificationCount(count)} new incidents`;
 
   return (
     // Full-width sticky strip; transparent + click-through so only the pill

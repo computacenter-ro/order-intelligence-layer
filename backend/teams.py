@@ -64,9 +64,17 @@ def channel_for(event: dict) -> str | None:
 
 
 def _dashboard_link(data: dict) -> str | None:
-    """Link to the journey view: ``DASHBOARD_URL`` + journey_id (or order_id)."""
+    """Link to the journey view: ``DASHBOARD_URL`` + **journey_id**.
+
+    ``order_id`` is deliberately NOT a fallback, though it used to be. The route
+    is ``/journeys/{journey_id}``, so ``/journeys/ORD-8944`` renders "Journey not
+    found" — and since an alert's ``journey_id`` is nullable (one not yet stitched
+    has none), that fallback fired routinely and shipped a dead "View journey"
+    button in the Teams card. Omitting the action is better than offering a 404.
+    Same rule as ``backend/api.py::_dashboard_link``; change them together.
+    """
     base = os.getenv("DASHBOARD_URL", "").rstrip("/")
-    ref = data.get("journey_id") or data.get("order_id")
+    ref = data.get("journey_id")
     if not base or not ref:
         return None
     return f"{base}/journeys/{ref}"
@@ -117,7 +125,7 @@ def build_card(event: dict) -> dict:
     if text:
         body.append({"type": "TextBlock", "text": text, "wrap": True})
 
-    # FactSet: level|outcome, severity, department, confidence, order/event/cart ids.
+    # FactSet: level|outcome, severity, department, order/event/cart ids.
     facts: list[dict] = []
     status = data.get("level") or data.get("outcome")
     if status:
@@ -126,8 +134,6 @@ def build_card(event: dict) -> dict:
         facts.append({"title": "Severity", "value": str(data["severity"]).capitalize()})
     if data.get("department"):
         facts.append({"title": "Department", "value": str(data["department"])})
-    if data.get("confidence") is not None:
-        facts.append({"title": "Confidence", "value": f"{data['confidence']:.2f}"})
     for label, key in (
         ("Order", "order_id"),
         ("Event", "event_id"),

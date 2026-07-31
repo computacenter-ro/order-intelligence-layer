@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 
+from ai_service import langsmith_stats, nodes, ragindex, semcache, settings
 from ai_service import docsindex, nodes, ragindex, semcache
 from ai_service.breaker import CircuitBreaker
 from shared.models import LogLine
@@ -357,6 +358,51 @@ async def semcache_stats() -> dict:
 async def ragindex_stats() -> dict:
     """Retrieval-index size + enabled flag."""
     return await ragindex.stats()
+
+
+@app.get("/llm-stats")
+async def llm_stats(window: str = langsmith_stats.DEFAULT_WINDOW) -> dict:
+    """Per-logical-model LangSmith stats + what the semantic cache saved.
+
+    ``window`` is one of ``1h`` / ``24h`` / ``7d``; anything else is treated as the
+    default rather than rejected (see ``langsmith_stats.resolve_window``), so a
+    typo'd param still renders a dashboard.
+
+    **A pure snapshot read.** LangSmith is queried by a background refresher, never
+    by this handler, so no amount of clicking can produce a request to the provider
+    (that click-driven volume was what triggered its rate limit).
+
+    Never 500s: with no LangSmith creds every node is ``None`` and
+    ``estimated_saved_usd`` is ``null``, which is the honest answer rather than an
+    error or a fabricated figure.
+
+    ``fetched_at`` and ``langsmith_configured`` exist so a null node can be
+    EXPLAINED rather than guessed at. The three reasons a node is null are
+    different facts and the server is the only side that knows which applies:
+    nothing collected yet (``fetched_at`` null → "Collecting…"), no credentials
+    (``langsmith_configured`` false → "not configured"), or a cycle ran and that
+    tag's query failed. Reporting all of them as "not configured yet" — which is
+    what the dashboard did before — was a lie in two cases out of three.
+
+    ``refresh_interval_s`` is the configured refresh period. The dashboard needs it
+    for two things it cannot otherwise know: telling the reader when the next update
+    is due, and deciding when a timestamp is old enough that the background
+    refresher has probably died. Hardcoding a guess in the frontend would silently
+    break the health check the moment the interval is retuned — which is exactly
+    what someone does after a rate-limit incident.
+    """
+    nodes_stats = await langsmith_stats.node_stats(window)
+    return {
+        "window": window,
+        "nodes": nodes_stats,
+        "fetched_at": langsmith_stats.fetched_at_iso(),
+        "refresh_interval_s": settings.LLM_STATS_REFRESH_INTERVAL_SECONDS,
+        "langsmith_configured": settings.langsmith_configured(),
+        # Passing the already-fetched stats keeps this to ONE LangSmith round of
+        # queries per request, and guarantees the savings estimate is computed
+        # over the same window the caller asked for.
+        "cache_savings": await langsmith_stats.cache_savings(nodes_stats),
+    }
 
 
 @app.get("/docs/stats")

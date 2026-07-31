@@ -28,7 +28,6 @@ def _alert_event(**over) -> dict:
         "account_number": "81036533",
         "explanation": "SPT pricing service was unreachable",
         "department": "backend",
-        "confidence": 0.82,
         "source": "ai",
         "journey_id": "J1",
     }
@@ -115,7 +114,9 @@ def test_build_card_ai_alert(monkeypatch):
     facts = _facts(card)
     assert facts["Level"] == "ERROR"
     assert facts["Department"] == "backend"
-    assert facts["Confidence"] == "0.82"
+    # The router no longer produces a confidence, so the card never shows one —
+    # not even when an upstream payload still carries the key.
+    assert "Confidence" not in facts
     assert facts["Order"] == "ORD-1"
     assert facts["Event"] == "evt-1"
     assert facts["Cart"] == "C1"
@@ -129,7 +130,7 @@ def test_build_card_ai_alert(monkeypatch):
 def test_build_card_badge_and_text_differ_between_ai_and_fallback():
     ai = build_card(_alert_event(source="ai"))
     fb = build_card(_alert_event(source="fallback", explanation=None,
-                                 department=None, confidence=None))
+                                 department=None))
     # badge differs
     assert "AI-analyzed" in _text_blocks(ai)
     assert "AI-analyzed" not in _text_blocks(fb)
@@ -141,10 +142,18 @@ def test_build_card_badge_and_text_differ_between_ai_and_fallback():
 
 def test_build_card_fallback_alert_uses_placeholder_explanation():
     card = build_card(_alert_event(source="fallback", explanation=None,
-                                   department=None, confidence=None))
+                                   department=None))
     assert "fallback" in _text_blocks(card)
     assert "unprocessed — LLM unavailable" in _text_blocks(card)
-    # no confidence fact when it is null
+    # the card never renders a confidence fact — the field no longer exists
+    assert "Confidence" not in _facts(card)
+
+
+def test_build_card_ignores_a_stale_confidence_in_the_payload():
+    """Defensive: an in-flight event from an older build could still carry a
+    ``confidence`` key. The card must ignore it rather than render a score the
+    system no longer produces."""
+    card = build_card(_alert_event(confidence=0.82))
     assert "Confidence" not in _facts(card)
 
 
@@ -163,10 +172,24 @@ def test_build_card_no_action_without_dashboard_url(monkeypatch):
     assert "actions" not in _content(build_card(_alert_event()))
 
 
-def test_build_card_link_falls_back_to_order_id(monkeypatch):
+def test_build_card_has_no_action_with_only_an_order_id(monkeypatch):
+    """An order id must NOT become a journey link.
+
+    It used to: the link was ``journey_id or order_id``, which produced
+    ``/journeys/ORD-9`` against a route that resolves a *journey* id — so the
+    "View journey" button always landed on "Journey not found". And because an
+    alert's journey_id is nullable, that fired routinely rather than rarely.
+    Omitting the action is the honest outcome; this pins that it stays omitted.
+    """
     monkeypatch.setenv("DASHBOARD_URL", "https://d")
     card = build_card(_journey_completed_event(journey_id=None, order_id="ORD-9"))
-    assert _content(card)["actions"][0]["url"].endswith("ORD-9")
+    assert "actions" not in _content(card)
+
+
+def test_build_card_link_uses_the_journey_id_when_both_are_present(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_URL", "https://d")
+    card = build_card(_journey_completed_event(journey_id="J7", order_id="ORD-9"))
+    assert _content(card)["actions"][0]["url"] == "https://d/journeys/J7"
 
 
 # --- notify (I/O, faked) -----------------------------------------------------

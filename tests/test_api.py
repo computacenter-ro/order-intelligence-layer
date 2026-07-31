@@ -9,7 +9,13 @@ ORM instances. This mirrors the compiled-SQL testing style already used for
 Contract checked (CLAUDE.md [5] "API"):
 
 * ``GET /alerts?since=&department=&source=`` — filtered, newest-first.
-* ``GET /journeys?status=`` — filtered.
+* ``GET /journeys?status=&outcome=&search=`` — filtered by status and/or outcome
+  (exact match, free strings — an unknown value is an empty list, not a 422) and by
+  a free-text substring search over the three alias ids. The search's OR is
+  asserted to be *grouped*, since flattening it would silently drop the other
+  filters for rows matching on the second or third id.
+* the default page size the three list routes serve, which no frontend page
+  overrides.
 * ``GET /journeys/{id}`` — a journey + its events (ordered by ts) + summary; 404
   when it does not exist.
 * responses are Pydantic schemas (never raw ORM), and every datetime is
@@ -23,6 +29,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
+import httpx
+
+from backend import api, llm_stats_client
 from backend.main import app
 from backend.db import get_session, Alert, Journey, JourneyEvent
 from backend.api import (
@@ -117,7 +126,6 @@ def _alert(**over) -> Alert:
         explanation="explained",
         department="backend",
         is_resolved=False,
-        confidence=0.8,
     )
     base.update(over)
     return Alert(**base)
@@ -173,7 +181,9 @@ def _event(**over) -> JourneyEvent:
 # --- auth enforcement --------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/alerts", "/journeys", "/journeys/J1"])
+@pytest.mark.parametrize(
+    "path", ["/alerts", "/journeys", "/journeys/J1", "/alerts/facets", "/llm-stats"]
+)
 def test_requires_auth(path):
     """Without a valid session, every read route is 401 — no cookie, no data."""
     app.dependency_overrides.clear()  # drop the autouse stub user for this test
@@ -696,12 +706,39 @@ def test_facets_accepts_the_same_filter_params_as_alerts():
     assert query_params(facets) == query_params(alerts) - paging
 
 
-def test_facets_is_not_shadowed_by_the_resolve_route():
-    """"facets" must not be parsed as an {alert_id}. The resolve route is PATCH
-    /alerts/{alert_id}/resolve so the shapes differ, but a future GET
-    /alerts/{alert_id} would shadow this path — this pins the current behaviour."""
+def test_facets_is_not_shadowed_by_the_single_alert_route():
+    """"facets" must not be parsed as an {alert_id}.
+
+    ``GET /alerts/{alert_id}`` now exists, which is exactly the route this test was
+    written to guard against. Starlette matches in registration order, so the
+    single-alert route MUST stay declared below /alerts/facets in api.py — if it
+    moves above, this request returns an alert lookup for the id "facets" and the
+    dashboard silently loses its facet counts.
+    """
     _facet_session()
     assert TestClient(app).get("/alerts/facets").status_code == 200
+
+
+# --- GET /alerts/{alert_id} ---------------------------------------------------
+
+
+def test_get_alert_returns_the_alert():
+    """The assistant's citation chips hold an id and nothing else, so a
+    single-record read has to exist; the list endpoint has no alert_id filter."""
+    _use([_FakeResult(one=_alert(alert_id="alert-9"))])
+    r = TestClient(app).get("/alerts/alert-9")
+    assert r.status_code == 200
+    assert r.json()["alert_id"] == "alert-9"
+
+
+def test_get_alert_404_when_missing():
+    _use([_FakeResult(one=None)])
+    assert TestClient(app).get("/alerts/nope").status_code == 404
+
+
+def test_get_alert_requires_auth():
+    app.dependency_overrides.clear()
+    assert TestClient(app).get("/alerts/alert-1").status_code == 401
 
 
 # --- free-text search (ILIKE over message OR explanation) --------------------
@@ -928,7 +965,130 @@ def test_build_alerts_query_and_facets_share_the_same_conditions():
 
 def test_journeys_query_status_filter():
     assert "status =" in _compiled(build_journeys_query("SUCCESS"))
+    assert "outcome =" in _compiled(build_journeys_query(None, "MARGIN_CHECK_FAILED"))
+    assert "event_id ILIKE" in _compiled(build_journeys_query(None, None, "ORD-6001"))
+    # No filter at all compiles WITHOUT a WHERE. Every clause must stay strictly
+    # conditional — an always-on predicate (e.g. `outcome IS NOT NULL`) would break
+    # this and silently change what an unfiltered list returns.
     assert "WHERE" not in _compiled(build_journeys_query(None))
+    assert "WHERE" not in _compiled(build_journeys_query(None, None, None))
+    assert "WHERE" not in _compiled(build_journeys_query(None, None, "   "))
+
+
+def test_journeys_status_and_outcome_are_exact_matches():
+    """`==`, not ILIKE: these come from dropdowns of known values, so a substring
+    match would let SUCCESS also select nothing-in-particular."""
+    where = _compiled(build_journeys_query("FAILED", "AUTH_FAILED")).split("WHERE")[1]
+    assert "status = " in where and "outcome = " in where
+    assert "ILIKE" not in where
+
+
+def test_journeys_outcome_filter_does_not_add_a_null_bucket():
+    """status=IN_PROGRESS already selects the journeys with no outcome, and the
+    convention from alerts is that a non-empty filter excludes NULLs as SQL does."""
+    where = _compiled(build_journeys_query(None, "SUCCESS")).split("WHERE")[1]
+    assert "IS NULL" not in where
+
+
+def test_journeys_filters_are_anded_not_ored():
+    where = _compiled(build_journeys_query("FAILED", "AUTH_FAILED")).split("WHERE")[1]
+    assert " AND " in where
+
+
+# --- journeys: free-text search over the three alias ids ----------------------
+#
+# Mirrors the alert search suite above, because the same three hazards apply: LIKE
+# metacharacter escaping, the escape character escaping itself, and — the one that
+# actually loses data — OR precedence.
+
+
+def _journeys_where(**kwargs) -> str:
+    sql = _compiled(build_journeys_query(None, **kwargs))
+    return sql.split("WHERE")[1] if "WHERE" in sql else ""
+
+
+def test_journeys_search_covers_all_three_ids():
+    where = _journeys_where(search="6001")
+    # An OR across the three alias ids: which one a journey has depends on how far
+    # it got (a pre-creation failure has only an event id), so a search must not
+    # privilege one of them.
+    assert "event_id ILIKE" in where
+    assert "order_id ILIKE" in where
+    assert "cart_header_id ILIKE" in where
+    assert " OR " in where
+
+
+def test_journeys_search_is_a_substring_match():
+    params = _params(build_journeys_query(None, None, "6001"))
+    # The same %term% on all three columns — no column searched differently.
+    assert params["event_id_1"] == "%6001%"
+    assert params["order_id_1"] == "%6001%"
+    assert params["cart_header_id_1"] == "%6001%"
+
+
+def test_journeys_search_is_case_insensitive():
+    """ILIKE, not LIKE — an agent typing "ord-6001" must find "ORD-6001"."""
+    where = _journeys_where(search="ord-6001")
+    assert "ILIKE" in where and "event_id LIKE" not in where
+    # Passed through verbatim: case-insensitivity is the operator's job, and
+    # lowercasing here would corrupt the ESCAPE handling.
+    assert _params(build_journeys_query(None, None, "OrD"))["order_id_1"] == "%OrD%"
+
+
+def test_journeys_search_or_is_grouped_not_flattened():
+    """The precedence bug this guards: an unparenthesised OR turns
+    `status = X AND (e OR o OR c)` into `(status = X AND e) OR o OR c`, quietly
+    ignoring the status filter for every row that matches on the second or third
+    id — i.e. the filter appears to work until you combine it with a search.
+
+    Compiled with literal binds so the assertion reads the real SQL text; the
+    default paramstyle renders `%(order_id_1)s`, whose parens would make any
+    bracket-matching check meaningless.
+    """
+    sql = str(
+        build_journeys_query("FAILED", "AUTH_FAILED", "x").compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    where = " ".join(sql.split("WHERE")[1].split())
+    # The OR group opens right after an AND and closes at the end of the clause, so
+    # it binds as one unit rather than splitting the surrounding predicates.
+    assert "AND (journeys.event_id ILIKE" in where
+    assert "OR journeys.order_id ILIKE" in where
+    assert "OR journeys.cart_header_id ILIKE" in where
+    assert where.endswith(")")
+
+
+@pytest.mark.parametrize("search", ["", "   ", "\t\n", None])
+def test_journeys_blank_search_applies_no_filter(search):
+    """A cleared search box is "no filter", never a match-everything %%."""
+    assert _journeys_where(search=search) == ""
+
+
+def test_journeys_search_escapes_like_wildcards():
+    """Reuses _like_term, so the escaping is the same one the alert search uses
+    (and is covered by its tests too) rather than a second implementation."""
+    params = _params(build_journeys_query(None, None, "12% ORD_1"))
+    assert params["order_id_1"] == r"%12\% ORD\_1%"
+
+
+def test_journeys_search_escapes_the_escape_character_first():
+    """A literal backslash must be doubled BEFORE % and _ get their own, or the
+    escaping corrupts its own output."""
+    params = _params(build_journeys_query(None, None, r"a\b"))
+    assert params["order_id_1"] == r"%a\\b%"
+
+
+def test_journeys_search_strips_surrounding_whitespace():
+    params = _params(build_journeys_query(None, None, "  ORD-6001  "))
+    assert params["order_id_1"] == "%ORD-6001%"
+
+
+def test_journeys_search_combines_with_the_other_filters():
+    where = _compiled(build_journeys_query("FAILED", "AUTH_FAILED", "6001")).split("WHERE")[1]
+    assert "status = " in where and "outcome = " in where
+    assert "AND (" in where and "event_id ILIKE" in where
 
 
 # --- GET /alerts -------------------------------------------------------------
@@ -937,7 +1097,7 @@ def test_journeys_query_status_filter():
 def test_get_alerts_serializes_schema_not_orm():
     _use([_FakeResult(items=[_alert(alert_id="a1", source="ai"),
                              _alert(alert_id="a2", source="fallback",
-                                    explanation=None, department=None, confidence=None)])])
+                                    explanation=None, department=None)])])
     r = TestClient(app).get("/alerts")
     assert r.status_code == 200
     items = r.json()["items"]
@@ -1071,6 +1231,74 @@ def test_get_alerts_invalid_filter_value_is_422(params):
     assert any("query" in loc for loc in locs)
 
 
+# --- GET /llm-stats (forwarded to the AI service) ----------------------------
+#
+# The dashboard cannot reach :8100 (loopback + unauthenticated), so this route is
+# the front door. Its contract is that it always answers: a stopped AI service
+# must look like "no data", never like a broken dashboard.
+
+
+def test_llm_stats_forwards_and_returns_the_body(monkeypatch):
+    captured = {}
+
+    async def _fake(window, *, client=None):
+        captured["window"] = window
+        return {
+            "window": window,
+            "nodes": {"explainer": {"run_count": 7}, "router": None,
+                      "summary": None, "chat": None},
+            "cache_savings": {"hits": 3, "misses": 1, "hit_rate": 0.75,
+                              "estimated_saved_usd": 0.5},
+        }
+
+    monkeypatch.setattr(api, "fetch_llm_stats", _fake)
+    r = TestClient(app).get("/llm-stats", params={"window": "7d"})
+    assert r.status_code == 200
+    assert captured["window"] == "7d"
+    assert r.json()["nodes"]["explainer"]["run_count"] == 7
+
+
+def test_llm_stats_defaults_to_24h(monkeypatch):
+    captured = {}
+
+    async def _fake(window, *, client=None):
+        captured["window"] = window
+        return llm_stats_client.degraded(window)
+
+    monkeypatch.setattr(api, "fetch_llm_stats", _fake)
+    assert TestClient(app).get("/llm-stats").status_code == 200
+    assert captured["window"] == "24h"
+
+
+def test_llm_stats_is_200_when_the_ai_service_is_stopped(monkeypatch):
+    """The acceptance criterion. A refused connection is what a stopped service
+    looks like from here, and it must degrade rather than 502."""
+
+    async def _refused(url, params=None, timeout=None):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _refused)
+    r = TestClient(app).get("/llm-stats")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["nodes"] == {tag: None for tag in llm_stats_client.NODES}
+    assert body["cache_savings"]["estimated_saved_usd"] is None
+
+
+def test_llm_stats_window_is_not_validated_by_the_backend(monkeypatch):
+    """The AI service owns which windows it understands (and defaults unknown
+    ones), so the backend passes the value through instead of 422-ing on it."""
+    captured = {}
+
+    async def _fake(window, *, client=None):
+        captured["window"] = window
+        return llm_stats_client.degraded(window)
+
+    monkeypatch.setattr(api, "fetch_llm_stats", _fake)
+    assert TestClient(app).get("/llm-stats", params={"window": "banana"}).status_code == 200
+    assert captured["window"] == "banana"
+
+
 # --- GET /journeys -----------------------------------------------------------
 
 
@@ -1080,6 +1308,54 @@ def test_get_journeys_filters_by_status():
     assert r.status_code == 200
     assert r.json()["items"][0]["journey_id"] == "J9"
     assert "status =" in _compiled(session.statements[0])
+
+
+def test_get_journeys_filters_by_outcome():
+    session = _use([_FakeResult(items=[_journey(journey_id="J9", outcome="AUTH_FAILED")])])
+    r = TestClient(app).get("/journeys", params={"outcome": "AUTH_FAILED"})
+    assert r.status_code == 200
+    stmt = session.statements[0]
+    assert "outcome =" in _compiled(stmt)
+    assert _params(stmt)["outcome_1"] == "AUTH_FAILED"
+
+
+def test_get_journeys_search_param_reaches_the_query():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/journeys", params={"search": "ORD-6001"})
+    assert r.status_code == 200
+    stmt = session.statements[0]
+    assert "order_id ILIKE" in _compiled(stmt)
+    assert _params(stmt)["order_id_1"] == "%ORD-6001%"
+
+
+def test_get_journeys_combines_all_three_filters():
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get(
+        "/journeys",
+        params={"status": "FAILED", "outcome": "SAP_SUBMISSION_FAILED", "search": "6001"},
+    )
+    assert r.status_code == 200
+    where = _compiled(session.statements[0]).split("WHERE")[1]
+    assert "status =" in where and "outcome =" in where and "ILIKE" in where
+
+
+def test_get_journeys_unknown_outcome_is_an_empty_list_not_a_422():
+    """`outcome` is a free str rather than a Literal (see build_journeys_query for
+    why), so a bad value filters to nothing — the same behaviour `status` has always
+    had on this route."""
+    _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/journeys", params={"outcome": "NOT_AN_OUTCOME"})
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_get_journeys_blank_search_is_not_a_filter():
+    """An empty ?search= must not become a %%-matches-everything predicate — nor a
+    WHERE clause at all."""
+    session = _use([_FakeResult(items=[])])
+    r = TestClient(app).get("/journeys", params={"search": "   "})
+    assert r.status_code == 200
+    assert "WHERE" not in _compiled(session.statements[0])
 
 
 # --- GET /journeys/{id} ------------------------------------------------------
@@ -1292,6 +1568,56 @@ def test_get_journeys_last_page_has_null_next_cursor():
     body = TestClient(app).get("/journeys", params={"limit": 5}).json()
     assert [j["journey_id"] for j in body["items"]] == ["J1", "J2"]
     assert body["next_cursor"] is None
+
+
+# --- the default page size ---------------------------------------------------
+
+
+def _sql_limit(stmt) -> int:
+    """The LIMIT value from a compiled statement.
+
+    Read out of the params by looking up the placeholder's name in the SQL, rather
+    than assuming it is ``param_1`` — the position depends on how many filter binds
+    precede it, so a route with filters would number it differently.
+    """
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "LIMIT %(" in sql, sql
+    name = sql.split("LIMIT %(")[1].split(")")[0]
+    return compiled.params[name]
+
+
+@pytest.mark.parametrize("path", ["/alerts", "/journeys", "/incidents"])
+def test_the_default_page_size_is_twelve(path):
+    """Pins the page size the three list routes serve when the caller says nothing.
+
+    Worth a test because NO frontend page sends `limit` — every list relies on this
+    default, so changing the literal in a route signature silently changes what the
+    dashboard shows, with nothing failing. Asserted through HTTP (not by reading the
+    signature) so it covers the clamp as well.
+
+    apply_keyset fetches limit+1 to detect a further page, hence 13 for a page of 12.
+    """
+    session = _use([_FakeResult(items=[])])
+    assert TestClient(app).get(path).status_code == 200
+    assert _sql_limit(session.statements[0]) == 13
+
+
+@pytest.mark.parametrize("path", ["/alerts", "/journeys", "/incidents"])
+def test_an_explicit_limit_still_overrides_the_default(path):
+    session = _use([_FakeResult(items=[])])
+    assert TestClient(app).get(path, params={"limit": 3}).status_code == 200
+    assert _sql_limit(session.statements[0]) == 4
+
+
+@pytest.mark.parametrize("path", ["/alerts", "/journeys", "/incidents"])
+@pytest.mark.parametrize("limit, expected", [(0, 1), (-5, 1), (1000, 100)])
+def test_the_limit_is_clamped_not_rejected(path, limit, expected):
+    """max(1, min(limit, 100)) survives the default change: a caller can pass
+    anything and still get a sane page rather than a 422."""
+    session = _use([_FakeResult(items=[])])
+    assert TestClient(app).get(path, params={"limit": limit}).status_code == 200
+    assert _sql_limit(session.statements[0]) == expected + 1
 
 
 # --- GET/PATCH /incidents -----------------------------------------------------

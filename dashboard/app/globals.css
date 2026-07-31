@@ -197,6 +197,44 @@ body {
   border-radius: 8px;
 }
 
+/* Side-nav header: stack the collapse caret UNDER the logo.
+
+   The style-guide SideNav renders its header as one flex ROW containing the
+   logo and the caret button, and exposes no className/style hook for it — so
+   this is done here, structurally (nav's first child), rather than by forking
+   the vendored component or hacking it from inside `logoMark` (a child cannot
+   restyle its parent). Two rows instead of one, hence the taller min-height:
+   the component hardcodes 64px for a single row.
+
+   Kept as one rule for both nav states so the header cannot drift between
+   them; the caret centres itself in the expanded nav too, directly below the
+   logo + app name. */
+nav[aria-label="Sidebar navigation"] > div:first-child {
+  flex-direction: column;
+  /* Overrides the component's `space-between` (expanded), which would push the
+     logo and caret to opposite ends of the column. */
+  justify-content: center;
+  gap: 4px;
+  /* Two stacked rows no longer fit the component's 64px single-row header. */
+  min-height: auto;
+  padding: 12px;
+}
+
+/* The caret is the header's last child; the logo wrapper precedes it. Centre it
+   under the logo in both states. */
+nav[aria-label="Sidebar navigation"] > div:first-child > button:last-child {
+  align-self: center;
+}
+
+/* The collapsed logoMark overlaps the caret with a negative right margin to win
+   back the width the caret used to steal from the same row (see AppShell). Once
+   the caret moves to its own row there is nothing to overlap, so that offset
+   would push the mark off-centre — neutralise it here, where the row/column
+   change is made. */
+nav[aria-label="Sidebar navigation"] > div:first-child > div > span {
+  margin-right: 0 !important;
+}
+
 /* The pan/zoom transform is applied directly, never animated, so there is no
    zoom easing to disable. What remains are the hover transitions above; reduced
    motion removes them so hover state changes instantly. */

@@ -11,6 +11,14 @@ export function levelLabel(level: LogLevel): string {
   return LEVEL_LABEL[level];
 }
 
+/** Live "N new …" pills (alerts, incidents) must never show an unbounded
+ *  number — a stretch during a burst reads worse than a stale-feeling cap. */
+const NOTIFICATION_COUNT_CAP = 20;
+
+export function formatNotificationCount(count: number): string {
+  return count > NOTIFICATION_COUNT_CAP ? `${NOTIFICATION_COUNT_CAP}+` : String(count);
+}
+
 /**
  * Turn a session identity into a person's name for display:
  * `"larisa.muntean@computacenter.com"` -> `"Larisa Muntean"`.

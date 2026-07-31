@@ -760,7 +760,17 @@ GET  /alerts/facets                     # 🔒 per-value counts for the 3 multi-
                                         # one value never collapses that facet's list;
                                         # the other filters still scope it. NULLs are
                                         # skipped (no filter option to count them on).
-GET  /journeys?status=                  # 🔒 requires session
+GET  /journeys?status=&outcome=&search= # 🔒 requires session. status/outcome are
+                                        # exact-match FREE STRINGS (not Literals —
+                                        # the 10 outcomes are module constants in
+                                        # backend/journeys.py and a second list
+                                        # would drift), so an unknown value is an
+                                        # empty list, not a 422. search is an ILIKE
+                                        # substring over event_id/order_id/
+                                        # cart_header_id, OR'd as ONE group so it
+                                        # ANDs with the other two. Blank = no
+                                        # filter. No NULL bucket for outcome —
+                                        # status=IN_PROGRESS already selects those.
 GET  /journeys/{id}                     # 🔒 journey + its events + summary
 GET  /stats/insights                    # 🔒 aggregate counters for the insights page
                                         # journeys: total, by_status, by_outcome,
@@ -774,7 +784,7 @@ POST  /auth/logout                       # clears the cookie
 GET   /auth/me                           # current user (401 if no valid session) — the frontend guard
 GET   /alerts?since=&department=&source=&level=&app_name=&severity=&resolved=  # 🔒 requires session
 PATCH /alerts/{alert_id}/resolve         # 🔒 manual triage — sets is_resolved=True, resolved_at=now()
-GET   /journeys?status=                  # 🔒 requires session
+GET   /journeys?status=&outcome=&search= # 🔒 requires session (see above)
 GET   /journeys/{id}                     # 🔒 journey + its events + summary
 WS    /ws                                # 🔒 alert.new | journey.updated | journey.completed
 ```

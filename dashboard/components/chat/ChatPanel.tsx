@@ -208,7 +208,6 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
-<<<<<<< HEAD
  * Documentation sources are collapsed into ONE chip, never listed individually.
  *
  * A doc citation is `jam-ws#blind-spots-and-traps--role-matching-is-exact` — a
@@ -242,9 +241,7 @@ function DocumentationChip({ count }: { count: number }) {
   );
 }
 
-/** One cited record: a pill linking to the journey view when a link exists. */
-function SourceChip({ source }: { source: ChatSource }) {
-=======
+/**
  * One cited record.
  *
  * Three shapes, in priority order. An ALERT citation opens the alert in this
@@ -252,6 +249,9 @@ function SourceChip({ source }: { source: ChatSource }) {
  * and sending the reader to another page would abandon the conversation that
  * cited it. Anything else with a link is an ordinary anchor to the journey view.
  * A citation with neither stays plain text.
+ *
+ * Documentation citations never reach this component — they are collapsed into a
+ * single badge by the caller (see DocumentationChip above).
  */
 function SourceChip({
   source,
@@ -260,7 +260,6 @@ function SourceChip({
   source: ChatSource;
   onOpen?: (source: ChatSource) => void;
 }) {
->>>>>>> origin/prep-for-prod
   const label = `${source.kind} · ${source.id.slice(0, 8)}`;
   const title = `${source.snippet}\n\nrelevance ${source.score.toFixed(2)}`;
   const opensInPanel = source.kind === "alert" && onOpen !== undefined;
@@ -385,11 +384,10 @@ function TurnBubble({
           <>
             <SectionLabel>{turn.sourcesLabel ?? "Sources"}</SectionLabel>
             <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-<<<<<<< HEAD
               {turn.sources
                 .filter((s) => s.kind !== DOC_KIND)
                 .map((s) => (
-                  <SourceChip key={s.id} source={s} />
+                  <SourceChip key={s.id} source={s} onOpen={onOpenSource} />
                 ))}
               {/* All documentation chunks collapse to one chip — see DocumentationChip. */}
               {turn.sources.some((s) => s.kind === DOC_KIND) && (
@@ -397,11 +395,6 @@ function TurnBubble({
                   count={turn.sources.filter((s) => s.kind === DOC_KIND).length}
                 />
               )}
-=======
-              {turn.sources.map((s) => (
-                <SourceChip key={s.id} source={s} onOpen={onOpenSource} />
-              ))}
->>>>>>> origin/prep-for-prod
             </div>
           </>
         )}

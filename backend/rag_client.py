@@ -212,6 +212,7 @@ async def ask(
     filters: dict | None = None,
     boosts: dict[str, float] | None = None,
     *,
+    self_grounded: bool = False,
     client: httpx.AsyncClient | None = None,
 ) -> dict:
     """POST a question to the AI service's ``/chat``; return its response body.
@@ -225,7 +226,17 @@ async def ask(
     url = f"{AI_SERVICE_URL}/chat"
     # boosts travel with the request: the backend owns the votes, the AI service
     # owns the index and stays DB-free.
-    body = {"query": query, "k": k, "filters": filters, "boosts": boosts or {}}
+    # self_grounded says "the query already carries the record's own text", so the
+    # AI service composes even when retrieval finds nothing similar. Without it a
+    # scoped question about a NOVEL failure — the case most worth asking about —
+    # comes back as "no related incidents found, run the backfill".
+    body = {
+        "query": query,
+        "k": k,
+        "filters": filters,
+        "boosts": boosts or {},
+        "self_grounded": self_grounded,
+    }
     try:
         if client is not None:
             resp = await client.post(url, json=body, timeout=RAG_CHAT_TIMEOUT)

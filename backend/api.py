@@ -1047,6 +1047,11 @@ async def chat(
         k=body.k,
         filters=body.filters,
         boosts=boosts,
+        # The scoped record's text IS grounding material, and a better source than
+        # anything indexed (read live from this DB, which is the source of truth).
+        # Telling the AI service so is what stops a scoped question about a novel
+        # failure being refused for want of a SIMILAR past incident.
+        self_grounded=context_text is not None,
     )
     return ChatResponse(
         answer=result["answer"],

@@ -208,6 +208,40 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
+ * Documentation sources are collapsed into ONE chip, never listed individually.
+ *
+ * A doc citation is `jam-ws#blind-spots-and-traps--role-matching-is-exact` — a
+ * chunk id inside a repository the support agent cannot open. Listing four of
+ * them offers no way to verify anything and pushes the incident citations, which
+ * DO link to the dashboard, out of sight. What matters to the reader is only that
+ * the answer came from the official documentation rather than from log evidence,
+ * so that is the single fact shown.
+ *
+ * They still travel in `sources` — the API is unchanged, and the ids stay
+ * available for the evaluation set and for debugging in the network tab.
+ */
+const DOC_KIND = "doc";
+
+function DocumentationChip({ count }: { count: number }) {
+  // The shared Badge, not a hand-rolled pill: badge bg/border/text are three
+  // accessibility-tested values per status and must never be re-derived locally.
+  // `info` rather than the grey of a SourceChip, because this is a different KIND
+  // of citation — reference material, not log evidence — and the greys are for
+  // functional metadata.
+  return (
+    <span
+      title={
+        `${count} section(s) of the service documentation informed this answer. ` +
+        `Documentation describes how a service works — it is not evidence that ` +
+        `anything happened.`
+      }
+    >
+      <Badge status="info">Official documentation</Badge>
+    </span>
+  );
+}
+
+/**
  * One cited record.
  *
  * Three shapes, in priority order. An ALERT citation opens the alert in this
@@ -215,6 +249,9 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
  * and sending the reader to another page would abandon the conversation that
  * cited it. Anything else with a link is an ordinary anchor to the journey view.
  * A citation with neither stays plain text.
+ *
+ * Documentation citations never reach this component — they are collapsed into a
+ * single badge by the caller (see DocumentationChip above).
  */
 function SourceChip({
   source,
@@ -347,9 +384,17 @@ function TurnBubble({
           <>
             <SectionLabel>{turn.sourcesLabel ?? "Sources"}</SectionLabel>
             <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-              {turn.sources.map((s) => (
-                <SourceChip key={s.id} source={s} onOpen={onOpenSource} />
-              ))}
+              {turn.sources
+                .filter((s) => s.kind !== DOC_KIND)
+                .map((s) => (
+                  <SourceChip key={s.id} source={s} onOpen={onOpenSource} />
+                ))}
+              {/* All documentation chunks collapse to one chip — see DocumentationChip. */}
+              {turn.sources.some((s) => s.kind === DOC_KIND) && (
+                <DocumentationChip
+                  count={turn.sources.filter((s) => s.kind === DOC_KIND).length}
+                />
+              )}
             </div>
           </>
         )}
@@ -430,7 +475,12 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
       query: turn.query ?? "",
       // In the ORDER SHOWN — the backend attributes credit by citation rank, so a
       // reordered list would mis-credit the sources.
-      record_ids: (turn.sources ?? []).map((s) => s.id),
+      //
+      // Documentation chunks are excluded: the boost they would earn is never
+      // read (the docs index ranks without feedback, so a downvote on a badly
+      // worded answer cannot demote a correct reference page). Including them
+      // would only dilute the vote across records that can never spend it.
+      record_ids: (turn.sources ?? []).filter((s) => s.kind !== DOC_KIND).map((s) => s.id),
       answer_mode: turn.mode,
       scoped_kind: context?.kind ?? null,
       scoped_id: context?.id ?? null,

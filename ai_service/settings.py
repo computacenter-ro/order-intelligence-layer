@@ -15,6 +15,7 @@ are unaffected. Missing ``.env`` is a no-op.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -137,6 +138,37 @@ RAGINDEX_KEY = os.getenv("RAGINDEX_KEY", "ai:ragindex")
 # neighbours. Feedback that cannot reorder anything is not a feature. Raise or
 # lower it if the score spread changes; check with the numbers, not by feel.
 RAGINDEX_FEEDBACK_WEIGHT = float(os.getenv("RAGINDEX_FEEDBACK_WEIGHT", "0.30"))
+
+# --- Documentation index (docs RAG) -------------------------------------------
+# The SECOND grounding channel: per-service documentation ("how things work"),
+# alongside the incident index ("what happened"). Separate from RAGINDEX on
+# purpose — see ai_service/docsindex.py, reason 1 is that ragindex evicts
+# oldest-first and docs, loaded once at startup, are permanently the oldest.
+DOCSINDEX_ENABLED = os.getenv("DOCSINDEX_ENABLED", "1") not in ("0", "false", "False", "")
+# The corpus lives INSIDE the subsystem that reads it (the pipeline/data/
+# precedent). Two build properties depend on that location: build-images.yml
+# filters on ai_service/**, so a docs-only edit rebuilds the image; and
+# .dockerignore excludes only docs/ and ways-of-working/, so nothing here is
+# stripped from the build context. Moving it into either of those names silently
+# stops the corpus reaching the image.
+DOCSINDEX_DIR = os.getenv("DOCSINDEX_DIR", str(Path(__file__).resolve().parent / "knowledge"))
+# Shares RAGINDEX_MODEL, which itself defaults to SEMCACHE_MODEL — one encoder
+# load serves the cache, the incident index and this. A different value here
+# loads a SECOND model.
+DOCSINDEX_MODEL = os.getenv("DOCSINDEX_MODEL", RAGINDEX_MODEL)
+# Cosine floor. Lower than RAGINDEX_MIN_SCORE because the narrowing step already
+# did the coarse work: by the time cosine runs, candidates are restricted to one
+# service and one section kind, so a low-scoring survivor is far more likely to be
+# relevant than a low-scoring record drawn from all of incident history.
+DOCSINDEX_MIN_SCORE = float(os.getenv("DOCSINDEX_MIN_SCORE", "0.20"))
+# Doc chunks per answer. Its own number, NOT shared with the incident index —
+# guaranteeing a mix (docs + incidents) is the whole point of a second index.
+DOCSINDEX_K = int(os.getenv("DOCSINDEX_K", "4"))
+# How the question-kind filter is applied: "soft" ranks kind-matched chunks first
+# but still fills leftover slots (a mis-detected kind costs ranking, never the
+# answer), "hard" returns only kind matches, "off" filters by service alone.
+# Measured on tests/data/knowledge_eval.yaml: service-only top-3 53%, +kind 82%.
+DOCSINDEX_KIND_MODE = os.getenv("DOCSINDEX_KIND_MODE", "soft")
 
 # --- Suppression list ---------------------------------------------------------
 # Benign WARNs that must never become alerts (CLAUDE.md [3] "Suppression list").

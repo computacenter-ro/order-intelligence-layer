@@ -124,17 +124,30 @@ _ROUTE_SYSTEM = (
 # so when the context is silent, cite the record ids used.
 _CHAT_SYSTEM = (
     "You answer questions from an IT-support engineer about an order-management "
-    "pipeline, using ONLY the incident records provided as context.\n"
+    "pipeline, using ONLY the context provided below.\n"
     "Rules:\n"
     "1. Answer strictly from the provided context. It is the only thing you know "
-    "about this system's history.\n"
+    "about this system.\n"
     "2. If the context does not contain the answer, say so plainly and stop. Do "
     "NOT fall back on general knowledge about order systems.\n"
     "3. Never invent an order id, event id, outcome, timestamp, department or "
     "resolution. Every concrete detail must appear in the context verbatim.\n"
-    "4. Cite the record ids you used, in square brackets, e.g. [alert-123].\n"
-    "5. Be concise: 2-5 sentences for an IT-support engineer who wants the cause "
-    "and where it stopped.\n"
+    "4. Do NOT write any record ids in your answer — no alert ids, no journey "
+    "ids, no documentation ids, and no square-bracket citations of any kind. The "
+    "interface lists the sources beside your answer, so repeating their ids adds "
+    "nothing a reader can use: they are internal identifiers of records the "
+    "reader cannot look up by id. Refer to documentation in prose as 'the "
+    "official documentation'. Business identifiers that an agent actually works "
+    "with — order numbers like ORD-6426, event ids, cart header ids — are NOT "
+    "record ids and SHOULD still appear where they matter.\n"
+    "4b. The context comes in two clearly labelled kinds and they mean different "
+    "things. 'incident history' is what HAPPENED in this system — real orders, "
+    "real failures. 'system documentation' describes how a service WORKS in "
+    "general; it is reference material, NOT evidence that anything happened. "
+    "Never count documentation as incidents, and never say a documented rule or "
+    "message was observed unless an incident record shows it.\n"
+    "5. Be concise: 2-5 sentences. For a failure, give the cause and where it "
+    "stopped; for a question about how the system works, just answer it.\n"
     "6. The context is the top semantic matches for the question, not the complete "
     "history — so never assert a total as if it were the whole picture, and never "
     "say something happened 'only once'. Do NOT discuss how many records you were "
@@ -297,17 +310,7 @@ def _parse_summary_with_label(text: str) -> SummaryResult:
     return SummaryResult(summary=raw, suggested_label=None)
 
 
-def build_chat_prompt(query: str, sources: list[dict]) -> str:
-    """The human-message block for :func:`compose_chat_answer` (pure, testable).
-
-    Contains the question and the retrieved records — and NOTHING else. Kept
-    separate from the I/O so a test can assert exactly what context the model was
-    shown: with a grounding prompt, "no unrelated record leaked in" is a
-    correctness property, not a style preference.
-
-    Deliberately carries NO coverage/limit information: that is computed by the
-    server and returned as a structured field (see the note above ``_CHAT_SYSTEM``).
-    """
+def _incident_block(sources: list[dict]) -> str:
     blocks = []
     for record in sources:
         meta = record.get("metadata") or {}
@@ -321,12 +324,74 @@ def build_chat_prompt(query: str, sources: list[dict]) -> str:
         header = f"[{record['id']}] ({record.get('kind', 'record')}"
         header += f"; {facts})" if facts else ")"
         blocks.append(f"{header}\n{record.get('text', '')}")
-    context = "\n\n".join(blocks) if blocks else "(no records retrieved)"
-    return f"question: {query}\n\nincident records:\n{context}"
+    return "\n\n".join(blocks)
+
+
+def _docs_block(docs: list[dict]) -> str:
+    blocks = []
+    for chunk in docs:
+        meta = chunk.get("metadata") or {}
+        where = " · ".join(str(meta[k]) for k in ("service", "heading") if meta.get(k))
+        text = chunk.get("text", "")
+        # The chunk text already opens with its own "[service · heading]" line
+        # (knowledge_loader adds it so a fragment carries its identity anywhere).
+        # Drop it here — the header below says the same thing, and paying twice
+        # for it in every prompt is pure token waste.
+        first, _, rest = text.partition("\n")
+        if first.startswith("[") and first.endswith("]"):
+            text = rest
+        blocks.append(f"[{chunk['id']}] ({where})\n{text.strip()}")
+    return "\n\n".join(blocks)
+
+
+def build_chat_prompt(
+    query: str, sources: list[dict], docs: list[dict] | None = None
+) -> str:
+    """The human-message block for :func:`compose_chat_answer` (pure, testable).
+
+    Contains the question and the retrieved context — and NOTHING else. Kept
+    separate from the I/O so a test can assert exactly what context the model was
+    shown: with a grounding prompt, "no unrelated record leaked in" is a
+    correctness property, not a style preference.
+
+    **Two context channels, labelled separately and never merged.** Incident
+    history says what HAPPENED; documentation says how things WORK. Earlier every
+    block sat under one "incident records:" heading, and the model duly counted
+    documentation chunks and reported them as incidents. The labels are what stop
+    "the docs describe five validation strategies" turning into "five validations
+    failed".
+
+    Deliberately carries NO coverage/limit information: that is computed by the
+    server and returned as a structured field (see the note above ``_CHAT_SYSTEM``).
+    """
+    parts = [f"question: {query}"]
+
+    incidents = _incident_block(sources)
+    if incidents:
+        parts.append(f"related incident history (things that happened):\n{incidents}")
+
+    documentation = _docs_block(docs or [])
+    if documentation:
+        parts.append(f"system documentation (how the system works):\n{documentation}")
+
+    if not incidents and not documentation:
+        # The model must be told to use the context carried in the question itself
+        # (a scoped record's text), NOT that it has nothing — the latter reads as
+        # "refuse", which is the behaviour this path exists to avoid.
+        parts.append(
+            "context: (nothing retrieved — answer from the context given in the "
+            "question above)"
+        )
+    return "\n\n".join(parts)
 
 
 async def compose_chat_answer(
-    query: str, sources: list[dict], model: BaseChatModel | None
+    query: str,
+    sources: list[dict],
+    model: BaseChatModel | None,
+    *,
+    docs: list[dict] | None = None,
+    allow_empty_sources: bool = False,
 ) -> str:
     """LLM chat composition grounded in ``sources``. Raises LLMError otherwise.
 
@@ -338,12 +403,17 @@ async def compose_chat_answer(
     """
     if model is None:
         raise LLMError("no chat model configured")
-    if not sources:
+    if not sources and not docs and not allow_empty_sources:
         # Refuse to compose with nothing to ground in — that is precisely the
         # situation where a model invents an answer. The caller already returns
         # the "nothing found" template for this case.
+        #
+        # ``allow_empty_sources`` is the caller asserting that grounding material
+        # is in ``query`` itself (a scoped record's text, read live from the DB).
+        # The rule is unchanged — compose only when grounded — but "grounded" is
+        # no longer a synonym for "retrieval returned rows".
         raise LLMError("no sources to ground the answer in")
-    prompt = build_chat_prompt(query, sources)
+    prompt = build_chat_prompt(query, sources, docs)
     try:
         resp = await model.ainvoke(
             [SystemMessage(content=_CHAT_SYSTEM), HumanMessage(content=prompt)]

@@ -64,9 +64,17 @@ def channel_for(event: dict) -> str | None:
 
 
 def _dashboard_link(data: dict) -> str | None:
-    """Link to the journey view: ``DASHBOARD_URL`` + journey_id (or order_id)."""
+    """Link to the journey view: ``DASHBOARD_URL`` + **journey_id**.
+
+    ``order_id`` is deliberately NOT a fallback, though it used to be. The route
+    is ``/journeys/{journey_id}``, so ``/journeys/ORD-8944`` renders "Journey not
+    found" — and since an alert's ``journey_id`` is nullable (one not yet stitched
+    has none), that fallback fired routinely and shipped a dead "View journey"
+    button in the Teams card. Omitting the action is better than offering a 404.
+    Same rule as ``backend/api.py::_dashboard_link``; change them together.
+    """
     base = os.getenv("DASHBOARD_URL", "").rstrip("/")
-    ref = data.get("journey_id") or data.get("order_id")
+    ref = data.get("journey_id")
     if not base or not ref:
         return None
     return f"{base}/journeys/{ref}"

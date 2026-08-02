@@ -157,9 +157,13 @@ async def test_compose_system_prompt_states_the_grounding_rules():
     model = CountingChatModel()
     await nodes.compose_chat_answer("why", _sources(), model)
     system = model.prompts[0]
-    assert "ONLY the incident records provided" in system
+    assert "ONLY the context provided" in system
     assert "Never invent" in system
-    assert "Cite the record ids" in system
+    # No citations at all: record ids identify rows the agent cannot look up by
+    # id, and the interface lists the sources beside the answer. Business ids
+    # (ORD-…) are explicitly still allowed — removing those would gut the answer.
+    assert "no square-bracket citations of any kind" in system
+    assert "ORD-6426" in system
 
 
 async def test_compose_raises_without_a_model():
@@ -195,7 +199,10 @@ def test_healthy_model_yields_mode_ai(wired):
         "/chat", json={"query": "why was the order blocked by margin", "k": 3}
     ).json()
     assert body["mode"] == "ai"
-    assert body["answer"] == "The margin check blocked order ORD-1. [a1]"
+    # The record id is stripped from the prose — it is an internal identifier of a
+    # row the reader cannot look up, and the UI lists the sources beside the
+    # answer anyway. The ORDER number stays: that is what the agent works with.
+    assert body["answer"] == "The margin check blocked order ORD-1."
     assert body["sources"], "sources are returned in AI mode too"
     assert model.calls == 1
 
@@ -351,7 +358,7 @@ def _backend_client(monkeypatch, *, reply=None, capture=None):
 
     app.dependency_overrides[get_session] = _session_override
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         if capture is not None:
             capture.append({"query": query, "k": k, "filters": filters})
         return reply or {
@@ -430,6 +437,59 @@ def test_backend_chat_attaches_dashboard_links(monkeypatch):
     try:
         body = client.post("/chat", json={"query": "q"}).json()
         assert body["sources"][0]["link"] == "http://dash.local/journeys/J1"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_backend_chat_link_is_none_for_an_alert_with_only_an_order_id(monkeypatch):
+    """An order id is not a journey id, so it cannot become a journey link.
+
+    It used to be the fallback, producing ``/journeys/ORD-8944`` against a route
+    that resolves a journey id — the citation chip led straight to "Journey not
+    found". An alert's journey_id is nullable, so this was the common case, not an
+    edge one. No link is correct: the UI renders an unlinked citation as plain
+    text, and an alert chip opens the alert in the assistant panel anyway.
+    """
+    monkeypatch.setenv("DASHBOARD_URL", "http://dash.local")
+    client, app = _backend_client(
+        monkeypatch,
+        reply={
+            "answer": "a",
+            "sources": [
+                {
+                    "id": "A1",
+                    "kind": "alert",
+                    "score": 0.9,
+                    "snippet": "ERROR ...",
+                    "metadata": {"order_id": "ORD-8944"},
+                }
+            ],
+            "mode": "ai",
+        },
+    )
+    try:
+        assert client.post("/chat", json={"query": "q"}).json()["sources"][0]["link"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_backend_chat_links_a_journey_record_by_its_own_id(monkeypatch):
+    """A journey record's id IS the journey id — the last-resort branch, kept so
+    the most link-worthy citation kind never renders unlinked."""
+    monkeypatch.setenv("DASHBOARD_URL", "http://dash.local")
+    client, app = _backend_client(
+        monkeypatch,
+        reply={
+            "answer": "a",
+            "sources": [
+                {"id": "J9", "kind": "journey", "score": 0.9, "snippet": "s", "metadata": {}}
+            ],
+            "mode": "ai",
+        },
+    )
+    try:
+        body = client.post("/chat", json={"query": "q"}).json()
+        assert body["sources"][0]["link"] == "http://dash.local/journeys/J9"
     finally:
         app.dependency_overrides.clear()
 
@@ -587,7 +647,7 @@ def test_backend_chat_context_fetches_and_prepends_the_record(monkeypatch):
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -642,7 +702,7 @@ def test_backend_chat_journey_context_includes_log_lines(monkeypatch):
 
     seen: list[str] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append(query)
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -676,7 +736,7 @@ def test_backend_chat_missing_context_record_degrades_to_the_bare_question(monke
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append({"query": query})
         return {"answer": "a", "sources": [], "mode": "retrieval-only"}
 
@@ -1003,7 +1063,7 @@ def _incident_chat(monkeypatch, results, query="how bad is this", incident_id="I
 
     seen: list[dict] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append({"query": query, "filters": filters})
         return {"answer": "a", "sources": [], "mode": "ai"}
 
@@ -1075,7 +1135,7 @@ def test_backend_chat_unknown_kind_degrades_to_the_bare_question(monkeypatch):
 
     seen: list[str] = []
 
-    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None):
+    async def _fake_ask(query, k=5, filters=None, boosts=None, client=None, **_kw):
         seen.append(query)
         return {"answer": "a", "sources": [], "mode": "ai"}
 

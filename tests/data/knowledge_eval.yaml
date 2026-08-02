@@ -1,0 +1,107 @@
+# Evaluation set for the documentation retrieval index (docs RAG).
+#
+# A fixed list of support questions with the chunk that SHOULD answer each one.
+# This is the only way to tell whether a change to the corpus, the chunking rules
+# or the retrieval settings actually improved retrieval or merely moved it
+# (rag-plan.md §10 open question 4, §11 step 9).
+#
+# Run it:   python -m ai_service.scripts.eval_knowledge
+# Compare chunk sizes:
+#           python -m ai_service.scripts.eval_knowledge --budget 1000 --budget 400
+#
+# Rules for adding an entry:
+#   * `expect` is a chunk id, and chunk ids are CONTENT-derived. If you reword the
+#     opening line of a chunk, its id changes and this file must change with it.
+#     The runner fails loudly on an unknown id rather than scoring it as a miss —
+#     a typo must not look like a retrieval regression.
+#   * Write the question the way an IT-support agent would actually type it,
+#     including the vocabulary mismatch. "the user lost the admin button" is a
+#     better test than "is role matching case-sensitive", because the second one
+#     quotes the document back at itself.
+#   * `kind` records which section type SHOULD win. It is not asserted yet; it is
+#     what the routing step (rag-plan.md §11 step 8) will be measured against.
+
+questions:
+  # --- what the service is -----------------------------------------------------
+  - q: "what does JAM do?"
+    expect: "jam-ws#what-this-service-does"
+    kind: what_it_does
+
+  - q: "does jam-ws authenticate the end user, or just tell you their permissions?"
+    expect: "jam-ws#what-jam-ws-is-not-responsible-for--authenticating-the-end-user-jam-ws-never"
+    kind: what_it_does
+
+  - q: "what does jam-ws write to the database?"
+    expect: "jam-ws#statuses-and-who-writes-them"
+    kind: statuses
+
+  - q: "does JAM read from a queue?"
+    expect: "jam-ws#queue-topology-reference"
+    kind: topology
+
+  - q: "what endpoints does jam-ws expose and how do they differ?"
+    expect: "jam-ws#how-work-flows-through-this-service--two-endpoints-both-get-both-under"
+    kind: flow
+
+  # --- concepts ----------------------------------------------------------------
+  - q: "what is a per-user override and when does it apply?"
+    expect: "jam-ws#key-concepts--authorities"
+    kind: concept
+
+  # --- rules and outcomes ------------------------------------------------------
+  - q: "jam returned 404 for a username, what does that mean?"
+    expect: "jam-ws#the-rules-that-stop-something--user-not-found-in-azure-ad-returns"
+    kind: rule
+
+  - q: "why would jam skip the azure ad lookup completely?"
+    expect: "jam-ws#why-a-step-gets-skipped"
+    kind: why_skipped
+
+  # --- traps (vocabulary deliberately does NOT match the doc) ------------------
+  - q: "the user lost all their permissions after we renamed an AD group"
+    expect: "jam-ws#blind-spots-and-traps--role-matching-is-exact-and-case-sensitive"
+    kind: trap
+
+  - q: "can I find out who gave this user the admin privilege?"
+    expect: "jam-ws#blind-spots-and-traps--no-correlation-id-on-any-path-8"
+    kind: trap
+
+  - q: "user says they have no access but I can't find anything in the logs"
+    expect: "jam-ws#blind-spots-and-traps--no-correlation-id-on-any-path-8"
+    kind: trap
+
+  # --- reading the logs --------------------------------------------------------
+  - q: "what can I search on to find this user's jam requests?"
+    expect: "jam-ws#identifiers-in-the-logs--there-is-no-correlation-id-grep"
+    kind: identifiers
+
+  - q: "I see an ERROR about azure AD, is that a real problem?"
+    expect: "jam-ws#lines-that-look-like-errors-but-are-not"
+    kind: not_an_error
+
+  - q: "which log lines does jam-ws produce when a profile is requested?"
+    expect: "jam-ws#journey-stages-and-their-log-evidence--aad-membership-call-issued"
+    kind: journey_stage
+
+  - q: "the jam log file shows nothing at all, where else can I look?"
+    expect: "jam-ws#evidence-that-is-not-in-the-log-file--no-error-or-dead-letter-queues-see"
+    kind: evidence_outside_logs
+
+  # --- what to do next ---------------------------------------------------------
+  - q: "jam is returning 401 Not authorized, whose problem is it?"
+    expect: "jam-ws#escalation--user-not-found-with-account-name"
+    kind: escalation
+
+  - q: "the Search button in the JAM admin page does nothing when I click it"
+    expect: "jam-ws#what-users-can-do--there-are-no-end-user-actions-in-jam-ws"
+    kind: user_actions
+
+# Pasted log lines. These must be answered by EXACT matching against the message
+# catalogue (rag-plan.md §11 step 8), not by similarity — embeddings are poor at
+# exact strings and this is the highest-value support action. Not yet asserted;
+# recorded now so the catalogue is built against real input.
+pasted_lines:
+  - line: "User not found on azure AD for sam account name : jsmith"
+    expect: "jam-ws#journey-stages-and-their-log-evidence--aad-membership-call-issued"
+  - line: "Calling graph api for user with id 8f2c-441a to get all roles/groups in azure AD"
+    expect: "jam-ws#journey-stages-and-their-log-evidence--aad-membership-call-issued"

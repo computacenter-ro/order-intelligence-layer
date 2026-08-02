@@ -172,10 +172,24 @@ def test_build_card_no_action_without_dashboard_url(monkeypatch):
     assert "actions" not in _content(build_card(_alert_event()))
 
 
-def test_build_card_link_falls_back_to_order_id(monkeypatch):
+def test_build_card_has_no_action_with_only_an_order_id(monkeypatch):
+    """An order id must NOT become a journey link.
+
+    It used to: the link was ``journey_id or order_id``, which produced
+    ``/journeys/ORD-9`` against a route that resolves a *journey* id — so the
+    "View journey" button always landed on "Journey not found". And because an
+    alert's journey_id is nullable, that fired routinely rather than rarely.
+    Omitting the action is the honest outcome; this pins that it stays omitted.
+    """
     monkeypatch.setenv("DASHBOARD_URL", "https://d")
     card = build_card(_journey_completed_event(journey_id=None, order_id="ORD-9"))
-    assert _content(card)["actions"][0]["url"].endswith("ORD-9")
+    assert "actions" not in _content(card)
+
+
+def test_build_card_link_uses_the_journey_id_when_both_are_present(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_URL", "https://d")
+    card = build_card(_journey_completed_event(journey_id="J7", order_id="ORD-9"))
+    assert _content(card)["actions"][0]["url"] == "https://d/journeys/J7"
 
 
 # --- notify (I/O, faked) -----------------------------------------------------

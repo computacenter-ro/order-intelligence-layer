@@ -192,8 +192,21 @@ export function fetchFacets(filter: AlertsFilter = {}): Promise<AlertFacets> {
   return getJson<AlertFacets>(`/alerts/facets${query ? `?${query}` : ""}`);
 }
 
+/**
+ * One alert by id (backend GET /alerts/{alert_id}).
+ *
+ * For callers holding an id and nothing else — the assistant's citation chips.
+ * The list endpoint cannot serve that: it has no alert_id filter.
+ */
+export function fetchAlert(alertId: string): Promise<ProcessedAlert> {
+  return getJson<ProcessedAlert>(`/alerts/${encodeURIComponent(alertId)}`);
+}
+
 export interface JourneysFilter {
   status?: string;
+  outcome?: string;
+  /** Substring match over event_id / order_id / cart_header_id (server-side ILIKE). */
+  search?: string;
   limit?: number;
   cursor?: string;
 }
@@ -201,6 +214,10 @@ export interface JourneysFilter {
 export function fetchJourneys(filter: JourneysFilter = {}): Promise<Page<Journey>> {
   const params = new URLSearchParams();
   if (filter.status) params.set("status", filter.status);
+  if (filter.outcome) params.set("outcome", filter.outcome);
+  // Only when non-empty, matching alertFilterParams: an empty `search=` would be
+  // sent as a param the server then has to treat as absent anyway.
+  if (filter.search) params.set("search", filter.search);
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.cursor) params.set("cursor", filter.cursor);
   const query = params.toString();

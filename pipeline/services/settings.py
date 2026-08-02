@@ -1,12 +1,22 @@
 """cc-settings-service emitter block (CLAUDE.md [1]) — margin threshold settings.
 
+Settings is the FIRST stop on **Inbound's pre-creation enrichment leg**
+(documented: Inbound calls Settings between the order engine's two turns).
+Its logs are therefore phase 1 — eventId only, no order ids, because the order
+does not exist yet.
+
 The reference dataset shows a single Hibernate SQL log for the settings lookup
 (logger ``org.hibernate.SQL``), SQL-Server bracket-quoted style.
 
 Two failure variants, both novel/embedding-path clustering test cases (see
-``shared/scenarios.py``), both expressed entirely from the *order engine*
-side (a SettingsClient GET, then an ERROR) — the satellite itself emits
-nothing, same pattern as SPT's ``_spt_down`` in ``spt.py``:
+``shared/scenarios.py``), both expressed entirely from the *caller's* side —
+an Inbound-identity SettingsClient ERROR (the satellite itself emits nothing,
+same pattern as SPT's ``_spt_down`` in ``spt.py``). Both are PRE-CREATION
+failures now: the journey dies eventId-only, which is CLAUDE.md invariant #3
+at work, not a data gap. The ``SettingsClient`` logger stem is kept so
+backend/incidents.py's failing-service derivation is unchanged in shape; the
+app_name behind it is ``cc-inbound-service`` for all three scenarios
+(15/16/17), preserving their identical-failing-service clustering semantics.
 
 * ``fail_at=settings`` (scenarios 15/16): the Settings web service is
   unreachable (connection-reset). Deliberately absent from
@@ -26,16 +36,17 @@ nothing, same pattern as SPT's ``_spt_down`` in ``spt.py``:
 """
 from __future__ import annotations
 
-from pipeline.services.blocklib import emit_line, phase2_ids
-from pipeline.services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
+from pipeline.services.blocklib import emit_line, phase1_ids
+from pipeline.services.inbound import CLIENT_LOGGER, ENRICH_THREAD
+from pipeline.services.profiles import profile
 from pipeline.services.registry import EmitFn, register
 from shared.models import Baton
 
 _PROF = profile("settings")
 _LOG = "org.hibernate.SQL"
 
-_OE_PROF = profile("order_engine")
-_OE_CLIENT = "c.c.orderengine.client.SettingsClient"
+_CALLER_PROF = profile("inbound")
+_CALLER_CLIENT = CLIENT_LOGGER["settings"]
 
 _SETTINGS_SQL = (
     "select ssv1_0.[organisation_identifier], ssv1_0.[settings_identifier], "
@@ -43,10 +54,6 @@ _SETTINGS_SQL = (
     "ssv1_0.[organisation_identifier] in (?, ?, ?, ?) and "
     "ssv1_0.[settings_identifier] in (?, ?)"
 )
-
-
-def _oe_thread(baton: Baton) -> str:
-    return ORDER_ENGINE_WORKER_THREADS[abs(hash(baton.flow_id)) % len(ORDER_ENGINE_WORKER_THREADS)]
 
 
 @register("settings", "serve")
@@ -61,7 +68,7 @@ async def serve(baton: Baton, emit: EmitFn) -> bool:
     await emit_line(
         emit, _PROF, logger=_LOG, level="DEBUG",
         message=_SETTINGS_SQL,
-        ids=phase2_ids(ctx),
+        ids=phase1_ids(ctx),
     )
     return True
 
@@ -69,7 +76,7 @@ async def serve(baton: Baton, emit: EmitFn) -> bool:
 async def _settings_down(baton: Baton, emit: EmitFn) -> bool:
     """Settings service unreachable.
 
-    The GET request line was already emitted by order_engine's
+    The GET request line was already emitted by inbound's
     ``enrich_settings_call`` block before the baton reached here (same as the
     happy path) — this block only needs to emit the connection-reset ERROR the
     backend has never been taught to recognize, in place of the usual
@@ -77,15 +84,13 @@ async def _settings_down(baton: Baton, emit: EmitFn) -> bool:
     reaches).
     """
     ctx = baton.ctx
-    ids = phase2_ids(ctx)
-    thread = _oe_thread(baton)
     await emit_line(
-        emit, _OE_PROF, logger=_OE_CLIENT, level="ERROR", thread=thread,
+        emit, _CALLER_PROF, logger=_CALLER_CLIENT, level="ERROR", thread=ENRICH_THREAD,
         message=(
             "[SettingsClient#getAccountSettingByOrganizationHierarchy] <--- ERROR: "
             "settings service unavailable — connection reset while fetching "
             "account settings (8000ms)"
-        ), ids=ids,
+        ), ids=phase1_ids(ctx),
     )
     return False  # fatal — chain stops here; journey never resolves to a known FAILED subtype
 
@@ -97,14 +102,12 @@ async def _settings_rejected(baton: Baton, emit: EmitFn) -> bool:
     tokens with ``_settings_down``'s message.
     """
     ctx = baton.ctx
-    ids = phase2_ids(ctx)
-    thread = _oe_thread(baton)
     await emit_line(
-        emit, _OE_PROF, logger=_OE_CLIENT, level="ERROR", thread=thread,
+        emit, _CALLER_PROF, logger=_CALLER_CLIENT, level="ERROR", thread=ENRICH_THREAD,
         message=(
             "[SettingsClient#getAccountSettingByOrganizationHierarchy] <--- ERROR: "
             "settings request rejected — organisation hierarchy lookup failed "
             "with HTTP 503 from settings gateway"
-        ), ids=ids,
+        ), ids=phase1_ids(ctx),
     )
     return False  # fatal — chain stops here; journey never resolves to a known FAILED subtype

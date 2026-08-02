@@ -1,13 +1,16 @@
 """cc-validator-service emitter block (CLAUDE.md [1]) — validation strategies.
 
-The validator runs a sequence of strategy validators. Several are benign
-"Not implemented" WARNs (which the AI service must suppress, not alert on) —
-including the ship-to strategy, for every country.
+The validator is auto-approval RULE 1 on the order engine's post-creation
+leg — it runs FIRST among the checks, before Avalara (US only) and the
+Checker (rule 3), and processing stops at the first rule that fails. It runs
+a sequence of strategy validators; several are benign "Not implemented" WARNs
+(which the AI service must suppress, not alert on) — including the ship-to
+strategy, for every country.
 
-It no longer emits the **Avalara** ship-to verification: Avalara is now a
-standalone satellite (``cc-avalara-service``, US-only, the last enrichment step
-before dispatch — see ``services/avalara.py``). Those lines were removed here so
-the verification is emitted exactly once.
+It does not emit the **Avalara** ship-to verification: Avalara is a standalone
+satellite (``cc-avalara-service``, US-only, between this service and the
+Checker — see ``services/avalara.py``), so the verification is emitted exactly
+once.
 
 Failure variant (``fail_at=udf``, scenario 7): a mandatory line UDF
 (``costCenter``) is missing → the UDF strategy errors, the access log records a

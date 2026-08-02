@@ -5,12 +5,14 @@ collector) by calling the registered block handlers directly, exactly as
 ``pipeline/services/runner.py`` would, and assert:
 
   * the correlation-model invariants hold on the emitted LogLines
-    (phase-1 = eventId only; the bridge ack = eventId ONLY; phase-2 = both
-    order ids, never eventId; and NO single line links both id families as
-    structured fields — the eventId->order-id join lives only in the
-    order-engine creation logs' message text);
+    (phase-1 = eventId only — including Inbound's whole Settings/JAM/SOLR leg
+    and the order_data_ready ack; phase-2 = both order ids, never eventId; and
+    NO single line links both id families as structured fields — the
+    eventId->order-id join lives only in the order-engine creation logs'
+    message text);
   * each scenario ends on its canonical terminal message (the load-bearing text
-    the backend's journey assembler matches on);
+    the backend's journey assembler matches on) — the SUCCESS terminal being
+    Inbound's order_created close, NOT Track & Trace (which registers mid-flow);
   * emitted lines carry the authentic "big project" identity (app_name / logger
     / host) that appears in the reference dataset.
 
@@ -30,7 +32,7 @@ from pipeline.services.registry import BLOCKS
 from shared.models import Baton, BatonContext, LogLine
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v6.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v7.json"
 
 # Importing the service modules registers their blocks (import side-effect).
 _SERVICE_MODULES = [
@@ -39,6 +41,15 @@ _SERVICE_MODULES = [
 ]
 for _m in _SERVICE_MODULES:
     importlib.import_module(f"pipeline.services.{_m}")
+
+ALL_IDS = sorted(SCENARIOS)
+
+# Scenarios that die before the order exists — eventId-only journeys.
+PRE_CREATION_FAILURES = [4, 5, 9, 15, 16, 17]
+# Scenarios whose flows actually create an order (mint the ids).
+CREATING = [sid for sid in ALL_IDS if SCENARIOS[sid].reaches_creation]
+# Scenarios that reach Inbound's enrichment leg (everything but transform).
+REACHES_INBOUND_LEG = [sid for sid in ALL_IDS if sid != 4]
 
 
 # --- in-process driver -------------------------------------------------------
@@ -65,44 +76,56 @@ async def _drive(sid: int) -> tuple[list[LogLine], BatonContext]:
     return captured, baton.ctx
 
 
-def _bridge_lines(logs: list[LogLine]) -> list[LogLine]:
-    """THE bridge line(s): the inbound ResponseListener 'Received ... response'."""
+def _ack_lines(logs: list[LogLine]) -> list[LogLine]:
+    """The order_data_ready consumption ack — the phase-1 return-leg line."""
     return [
         l for l in logs
-        if l.logger == "c.c.inbound.listener.ResponseListener"
-        and l.message.startswith("Received order creation response for event")
+        if l.logger == "c.c.inbound.listener.OrderDataReadyListener"
+        and l.message.startswith("Received order_data_ready for event")
+    ]
+
+
+def _creation_lines(logs: list[LogLine]) -> list[LogLine]:
+    return [
+        l for l in logs
+        if l.logger == "c.c.orderengine.service.OrderCreationService"
+        and l.eventId is not None
     ]
 
 
 # --- terminal messages (load-bearing for the backend) ------------------------
-# Substring each scenario's LAST emitted line must contain.
+# Substring each scenario's LAST emitted line must contain. SUCCESS flows end
+# on Inbound's order_created close; "for tracking" is deliberately NOT a
+# terminal of anything anymore.
 TERMINAL_CONTAINS = {
-    1: "for tracking",
-    2: "for tracking",
-    3: "for tracking",
-    4: "order.inbound.dlq",
-    5: "no order was created",
+    1: "processing complete",
+    2: "processing complete",
+    3: "processing complete",
+    4: "order.init_error",
+    5: "creation failed for event",
     6: "blocked by margin check",
     7: "submission aborted",
     8: "processing aborted",
     9: "submission aborted",
-    10: "order.outbound.dlq",
-    # 11-15: clustering test scenarios (shared/scenarios.py) — 11/12 and 6/13
+    10: "order.create.sap_error",
+    # 11-14: clustering test scenarios (shared/scenarios.py) — 11/12 and 6/13
     # reuse the SPT-down/margin-check fail paths verbatim, so their terminal
     # substrings match scenarios 8/6; 14 reuses the SAP-down path (matches 10).
     11: "processing aborted",
     12: "processing aborted",
     13: "blocked by margin check",
-    14: "order.outbound.dlq",
-    # 15 is the novel/embedding-path case: it never reaches a recognized
-    # terminal at all, it TIMES OUT — its "terminal" is just the last emitted
-    # line, the unrecognized SettingsClient connection-reset ERROR.
+    14: "order.create.sap_error",
+    # 15-17 are the novel/embedding-path cases: they never reach a recognized
+    # terminal at all — their "terminal" is just the last emitted line, the
+    # unrecognized Inbound-identity SettingsClient ERROR.
     15: "settings service unavailable",
+    16: "settings service unavailable",
+    17: "rejected",
 }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", range(1, 16))
+@pytest.mark.parametrize("sid", ALL_IDS)
 async def test_scenario_ends_on_canonical_terminal(sid):
     logs, _ctx = await _drive(sid)
     assert logs, f"S{sid}: emitted no logs"
@@ -112,11 +135,28 @@ async def test_scenario_ends_on_canonical_terminal(sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", range(1, 16))
+@pytest.mark.parametrize("sid", [1, 2, 3])
+async def test_success_terminal_is_the_inbound_close(sid):
+    """The SUCCESS terminal is Inbound's order_created close: inbound identity,
+    phase-2 ids, and the load-bearing marker pair backend/journeys.py matches
+    ("order_created" + "processing complete"). Track & Trace's registration
+    line exists mid-flow but is NOT last."""
+    logs, ctx = await _drive(sid)
+    last = logs[-1]
+    assert last.app_name == "cc-inbound-service"
+    assert "order_created" in last.message and "processing complete" in last.message
+    assert last.orderId == ctx.orderId and last.cartHeaderId == ctx.cartHeaderId
+    assert last.eventId is None
+    # Track & Trace registered earlier — mid-flow, before the checks.
+    tt = [i for i, l in enumerate(logs) if "for tracking" in l.message]
+    assert tt and tt[-1] < len(logs) - 1, f"S{sid}: tracking line missing or last"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", ALL_IDS)
 async def test_no_single_line_links_both_id_families_as_fields(sid):
-    """The honest-bridge invariant: NO emitted line carries an eventId FIELD
-    together with an order-id FIELD. The bridge is no longer an exception — it
-    now carries eventId only. (The eventId->order-id join lives solely in the
+    """The core invariant: NO emitted line carries an eventId FIELD together
+    with an order-id FIELD. (The eventId->order-id join lives solely in the
     order-engine creation logs' message *text*, asserted separately.)"""
     logs, _ctx = await _drive(sid)
     for l in logs:
@@ -128,9 +168,11 @@ async def test_no_single_line_links_both_id_families_as_fields(sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [4, 5])
+@pytest.mark.parametrize("sid", PRE_CREATION_FAILURES)
 async def test_pre_creation_failures_are_event_id_only(sid):
-    """Scenarios 4 & 5 never create an order → no order ids ever appear."""
+    """Journeys that die before creation — transform (4), creation (5), and the
+    Inbound-leg failures JAM (9) and Settings (15/16/17) — never see an order
+    id anywhere. That is invariant #3, not a data gap."""
     logs, ctx = await _drive(sid)
     assert ctx.orderId is None and ctx.cartHeaderId is None
     for l in logs:
@@ -142,43 +184,34 @@ async def test_pre_creation_failures_are_event_id_only(sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
-async def test_bridge_carries_only_event_id(sid):
-    """The honest bridge: eventId ONLY — no order ids as fields, and none in its
-    text (the message ends ``: status=CREATED``). It no longer links the id
-    families; ``bridge_ids`` is inert."""
+@pytest.mark.parametrize("sid", REACHES_INBOUND_LEG)
+async def test_order_data_ready_ack_carries_only_event_id(sid):
+    """The order_data_ready ack (the phase-1 return-leg line, replacing the old
+    creation-response bridge): eventId ONLY — no order ids as fields, and none
+    in its text. It links nothing, by design."""
     logs, _ctx = await _drive(sid)
-    bridges = _bridge_lines(logs)
-    assert len(bridges) == 1, f"S{sid}: expected exactly one bridge line, got {len(bridges)}"
-    b = bridges[0]
-    assert b.eventId is not None
-    assert b.orderId is None and b.cartHeaderId is None, (
-        f"S{sid}: bridge still carries an order-id field: {b.message!r}"
-    )
-    assert b.message.endswith(": status=CREATED"), (
-        f"S{sid}: bridge message is not the honest form: {b.message!r}"
-    )
+    acks = _ack_lines(logs)
+    assert len(acks) == 1, f"S{sid}: expected exactly one order_data_ready ack, got {len(acks)}"
+    a = acks[0]
+    assert a.eventId is not None
+    assert a.orderId is None and a.cartHeaderId is None
     # No order id in the TEXT either (word-boundary — the same shapes the
-    # stitcher mines): the bridge must not be a de-facto family link.
-    assert not re.search(r"\bORD-\d+\b", b.message)
-    assert not re.search(r"\b\d{19}\b", b.message)
+    # stitcher mines): the ack must not be a de-facto family link.
+    assert not re.search(r"\bORD-\d+\b", a.message)
+    assert not re.search(r"\b\d{19}\b", a.message)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+@pytest.mark.parametrize("sid", CREATING)
 async def test_creation_logs_carry_order_ids_in_text_contract(sid):
     """CONTRACT (load-bearing, like the terminal messages): for every flow that
     creates an order, the order-engine creation logs must expose BOTH order ids
     in their message TEXT while carrying eventId as a field. This is the only
-    thing that ties the two id families together now that the bridge is honest —
-    the stitcher's mining depends on it. Fail loudly if that text ever changes.
+    thing that ties the two id families together — the stitcher's mining
+    depends on it. Fail loudly if that text ever changes.
     """
     logs, ctx = await _drive(sid)
-    creation = [
-        l for l in logs
-        if l.logger == "c.c.orderengine.service.OrderCreationService"
-        and l.eventId is not None
-    ]
+    creation = _creation_lines(logs)
     # The orderId must appear as ORD-<n> in some creation line's text...
     assert any(re.search(r"\bORD-\d+\b", l.message) for l in creation), (
         f"S{sid}: no creation log exposes an ORD- id in its text"
@@ -195,17 +228,25 @@ async def test_creation_logs_carry_order_ids_in_text_contract(sid):
 
 
 @pytest.mark.asyncio
-async def test_phase1_lines_never_carry_order_ids():
-    """Every line emitted before the bridge carries only eventId (no order ids)."""
-    logs, _ctx = await _drive(1)
-    bridges = _bridge_lines(logs)
-    assert bridges
-    bridge_idx = logs.index(bridges[0])
-    for l in logs[:bridge_idx]:
+@pytest.mark.parametrize("sid", CREATING)
+async def test_phase_boundary_at_creation(sid):
+    """Everything up to and including the creation logs is phase 1 (eventId
+    only) — Inbound's whole enrichment leg included; everything after carries
+    both order ids and never eventId."""
+    logs, _ctx = await _drive(sid)
+    creation = _creation_lines(logs)
+    assert creation, f"S{sid}: no creation logs"
+    boundary = logs.index(creation[-1])
+    for l in logs[: boundary + 1]:
         assert l.orderId is None and l.cartHeaderId is None, (
-            f"phase-1 line carries an order id: {l.message!r}"
+            f"S{sid}: phase-1 line carries an order id: {l.message!r}"
         )
         assert l.eventId is not None
+    for l in logs[boundary + 1:]:
+        assert l.orderId is not None and l.cartHeaderId is not None, (
+            f"S{sid}: phase-2 line missing order ids: {l.message!r}"
+        )
+        assert l.eventId is None, f"S{sid}: phase-2 line carries eventId: {l.message!r}"
 
 
 # --- authenticity: identity matches the reference dataset --------------------
@@ -221,13 +262,21 @@ def _fixture_identity() -> dict[str, dict[str, set[str]]]:
     return ident
 
 
+# The v7 fixture is captured from these very emitters, so every real logger is
+# in it and no allowance is needed. If a NEW logger is ever added ahead of a
+# recapture, list it here temporarily — and empty this again once the next
+# fixture version lands.
+_REALIGNMENT_NEW_LOGGERS: dict[str, set[str]] = {}
+
+
 @pytest.mark.asyncio
 async def test_emitted_identity_matches_fixture():
     """Every emitted (app_name, host) and most loggers exist in the reference dataset.
 
     This is the 'looks like the big project' check: hosts must match exactly,
     and each emitted logger must be one the real service actually uses (guards
-    against typos / drift in logger names).
+    against typos / drift in logger names). Loggers newly introduced by the
+    realignment are allow-listed until the v7 recapture supersedes v6.
     """
     ident = _fixture_identity()
     # Collect emitted identity across ALL scenarios.
@@ -246,13 +295,17 @@ async def test_emitted_identity_matches_fixture():
             f"{app_name}: emitted host(s) {slot['hosts'] - ident[app_name]['hosts']} "
             f"not in reference {ident[app_name]['hosts']}"
         )
-        # Loggers: every emitted logger must be a real one for that service.
-        unknown = slot["loggers"] - ident[app_name]["loggers"]
+        # Loggers: every emitted logger must be a real one for that service,
+        # or a declared realignment addition.
+        allowed = ident[app_name]["loggers"] | _REALIGNMENT_NEW_LOGGERS.get(app_name, set())
+        unknown = slot["loggers"] - allowed
         assert not unknown, f"{app_name}: emitted logger(s) not in reference dataset: {unknown}"
 
 
 # =============================================================================
-# SOLR + Avalara as first-class standalone services, and Settings-first ordering.
+# The two enrichment legs on the emitted stream: Inbound's pre-creation leg
+# (Settings → JAM → SOLR) and the order engine's post-creation leg
+# (SPT → RSM → Validator → [Avalara] → Checker).
 #
 # These assert on the EMITTED lines (what live journeys actually contain), not
 # just on the compiled chain — that is the difference between "the chain says so"
@@ -266,7 +319,16 @@ _SAT_APP = {
     "cc-jam-service": "jam",
     "cc-checker-service": "checker",
     "cc-avalara-service": "avalara",
+    "cc-validator-service": "validator",
 }
+
+# Flows in which Settings serves happily (i.e. the Inbound leg starts) — every
+# flow except transform (4) and the three Settings failures (15/16/17, whose
+# failure variant is an Inbound-identity line, not a cc-settings-service one).
+_SETTINGS_SERVES = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+# Flows that reach SOLR: everything past JAM — including ones that die later
+# at create (5) or SPT (8/11/12).
+_REACHES_SOLR = [1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 14]
 
 
 def _satellite_sequence(logs: list[LogLine]) -> list[str]:
@@ -280,46 +342,51 @@ def _satellite_sequence(logs: list[LogLine]) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_settings_is_the_first_enrichment_service_emitted():
-    """SETTINGS IS FIRST — asserted on the emitted stream, for every flow that
-    enriches at all."""
-    for sid in (1, 2, 3, 6, 7, 9, 10, 13, 14):
-        logs, _ctx = await _drive(sid)
-        seq = _satellite_sequence(logs)
-        assert seq and seq[0] == "settings", f"S{sid}: satellites start with {seq[:2]}"
+@pytest.mark.parametrize("sid", _SETTINGS_SERVES)
+async def test_settings_is_the_first_satellite_emitted(sid):
+    """Settings opens Inbound's leg — asserted on the emitted stream, for every
+    flow that enriches at all."""
+    logs, _ctx = await _drive(sid)
+    seq = _satellite_sequence(logs)
+    assert seq and seq[0] == "settings", f"S{sid}: satellites start with {seq[:2]}"
 
 
 @pytest.mark.asyncio
-async def test_emitted_enrichment_order_is_canonical():
-    """Settings -> SPT -> RSM -> SOLR -> JAM -> Checker (+ Avalara, US only)."""
+async def test_emitted_satellite_order_is_canonical():
+    """Settings -> JAM -> SOLR (Inbound's leg) then SPT -> RSM -> Validator ->
+    Checker (the engine's leg), with Avalara between Validator and Checker for
+    the US flow only."""
     logs, _ = await _drive(1)
-    assert _satellite_sequence(logs) == ["settings", "spt", "rsm", "solr", "jam", "checker"]
+    assert _satellite_sequence(logs) == [
+        "settings", "jam", "solr", "spt", "rsm", "validator", "checker",
+    ]
     us, _ = await _drive(3)
     assert _satellite_sequence(us) == [
-        "settings", "spt", "rsm", "solr", "jam", "checker", "avalara",
+        "settings", "jam", "solr", "spt", "rsm", "validator", "avalara", "checker",
     ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [1, 2, 3, 6, 7, 9, 10, 13, 14])
+@pytest.mark.parametrize("sid", _REACHES_SOLR)
 async def test_solr_emits_in_every_flow_that_reaches_it(sid):
-    """SOLR appears in successes AND in journeys that fail LATER (margin check 6/13,
-    validation 7, auth 9, SAP 10/14) — this is the live-journey guarantee."""
+    """SOLR appears in every flow that survives JAM — successes AND journeys
+    that fail later (create 5, SPT 8/11/12, margin 6/13, validation 7, SAP
+    10/14). Its lines are PHASE 1 now: eventId only, no order ids."""
     logs, _ctx = await _drive(sid)
     solr = [l for l in logs if l.app_name == "cc-solr-service"]
     assert solr, f"S{sid}: no cc-solr-service lines emitted"
-    # And they are real phase-2 lines (order ids, never eventId).
     for l in solr:
-        assert l.orderId is not None and l.cartHeaderId is not None
-        assert l.eventId is None
+        assert l.eventId is not None, f"S{sid}: SOLR line lost its eventId"
+        assert l.orderId is None and l.cartHeaderId is None, (
+            f"S{sid}: SOLR is pre-creation now — it must not carry order ids"
+        )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sid", [4, 5, 8, 11, 12, 15, 16, 17])
+@pytest.mark.parametrize("sid", [4, 9, 15, 16, 17])
 async def test_solr_absent_from_flows_that_die_before_it(sid):
-    """Absent from transform (4), create (5), SPT-down (8/11/12) and the Settings
-    failures (15/16/17) — Settings now fails at the FIRST enrichment step, so
-    those journeys contain no other satellite at all."""
+    """Absent from transform (4), the Settings failures (15/16/17) and the JAM
+    failure (9) — all of which die earlier on Inbound's leg."""
     logs, _ctx = await _drive(sid)
     assert not [l for l in logs if l.app_name == "cc-solr-service"]
 
@@ -340,11 +407,12 @@ async def test_avalara_emits_only_for_the_us_flow():
 
 
 @pytest.mark.asyncio
-async def test_avalara_is_the_last_enrichment_service_before_dispatch():
-    """Avalara runs after Checker, as the last enrichment step."""
+async def test_avalara_sits_between_validator_and_checker():
+    """The documented auto-approval order: Validator (rule 1) → Avalara (still
+    rule 1, US only) → Checker (rule 3)."""
     logs, _ = await _drive(3)
     seq = _satellite_sequence(logs)
-    assert seq[-1] == "avalara" and seq[-2] == "checker"
+    assert seq[-3:] == ["validator", "avalara", "checker"]
 
 
 @pytest.mark.asyncio
@@ -352,7 +420,7 @@ async def test_validator_no_longer_emits_avalara_verification_lines():
     """Ownership moved to cc-avalara-service, so the validator must NOT emit the
     verification (or its AvalaraClient request) — otherwise a US journey would
     show the address verified twice."""
-    for sid in range(1, 18):
+    for sid in ALL_IDS:
         logs, _ctx = await _drive(sid)
         validator = [l for l in logs if l.app_name == "cc-validator-service"]
         assert not [l for l in validator if l.logger.endswith("client.AvalaraClient")], (
@@ -372,8 +440,8 @@ async def test_validator_no_longer_emits_avalara_verification_lines():
 
 @pytest.mark.asyncio
 async def test_us_verification_is_emitted_exactly_once():
-    """The whole point of moving Avalara out of the validator: exactly one
-    ship-to verification line in a US journey."""
+    """The whole point of a standalone Avalara: exactly one ship-to
+    verification line in a US journey."""
     logs, _ = await _drive(3)
     verified = [l for l in logs if "Ship-to address verified" in l.message]
     assert len(verified) == 1, f"expected 1 verification line, got {len(verified)}"

@@ -28,12 +28,36 @@ from shared.models import Department, LogLine, Severity
 _DEPARTMENTS = ", ".join(d.value for d in Department)
 _SEVERITIES = ", ".join(s.value for s in Severity)
 
+# The explainer sees ONE log line with no journey context, so without a sketch of
+# the pipeline it invents plausible-but-wrong causes — naming services that were
+# never involved, or describing a business rejection as a system error (which then
+# contradicts the 'general' route the router gives the same log). The sketch below
+# is deliberately short: enough to place a service and read an id, not a spec.
 _EXPLAIN_SYSTEM = (
     "You are an assistant for an IT-support engineer triaging logs from an "
     "order-management pipeline. Given one WARN or ERROR log line, explain in "
     "plain English, in 1-3 sentences: what happened, which service it came "
-    "from, and the most likely cause. Do not speculate beyond the log. Reply "
-    "with the explanation only."
+    "from, and the most likely cause.\n"
+    "The pipeline, for context: Inbound receives an order event, transforms it "
+    "and maps SKUs, then checks Settings, JAM (authorization) and SOLR before "
+    "asking the Order Engine to create the order. The Order Engine persists it to "
+    "the BM DB, registers it with Track & Trace, then enriches via SPT (prices) "
+    "and RSM (rebates) and runs the auto-approval rules — Validator, Avalara (US "
+    "only), then Checker (margin) — before Outbound OSW submits it to SAP. "
+    "Services talk over RabbitMQ; failed deliveries are retried and then parked on "
+    "an <queue>_error dead-letter queue.\n"
+    "Rules:\n"
+    "1. Explain only what THIS line says. Do not invent a cause it does not "
+    "support, and do not name services it does not mention.\n"
+    "2. An order stopping is not always a malfunction. When the pipeline "
+    "correctly rejected an order on business grounds — margin below threshold, "
+    "missing user input, a disabled account, an unmapped product — say so plainly "
+    "instead of describing it as a system error or suggesting a fix to the code.\n"
+    "3. Prefer the concrete detail already in the line (the id, the threshold, the "
+    "attempt count, the exception) over generic phrasing.\n"
+    "4. If the line is a retry that is still in progress, say that it may still "
+    "succeed rather than reporting it as a completed failure.\n"
+    "Reply with the explanation only."
 )
 
 # Hand-written department semantics. The ALLOWED list above is generated from the
@@ -60,39 +84,102 @@ _DEPARTMENT_GUIDE = (
     "and says FAILED or aborted.\n"
 )
 
-# Examples are taken verbatim from the emitters' real message shapes so they match
-# at inference. Deliberately paired: each business-rule 'general' case sits next to a
-# genuine technical failure that looks similar on the surface, because the contrast
-# is what teaches the boundary — a list of general-only examples would just bias the
-# model toward general.
+# Examples are taken VERBATIM from the emitters' real message shapes (captured in
+# pipeline/data/mock-order-flows-v7.json) so they match at inference. Deliberately
+# paired: each business-rule 'general' case sits next to a genuine technical failure
+# that looks similar on the surface, because the contrast is what teaches the
+# boundary — a list of general-only examples would just bias the model toward
+# general.
+#
+# Grounded in v7, which is captured from the emitters. If a message shape changes
+# there, the matching example here goes stale silently — the model keeps being
+# taught a line the pipeline no longer emits. Two such staleness bugs were fixed
+# when v7 landed: the DLQ example still said "order.inbound.dlq" (the realignment
+# renamed these to "<queue>_error"), and the creation-failure example invented a
+# fused "DB_TIMEOUT — no order was created" line that the emitter never produced.
+# test_route_prompt_examples_match_the_fixture_corpus pins these to the fixture.
 _ROUTE_EXAMPLES = (
     "Examples:\n"
-    'message=Margin check FAILED for order ORD-6042: overall margin 8.10% below '
-    'threshold 12.00% -> {"department": "general", "severity": "medium"}  '
+    # ── business-rule rejections (general) ────────────────────────────────────
+    'message=Margin check FAILED for order ORD-6042: overall margin 10.86% below '
+    'threshold 15.00% -> {"department": "general", "severity": "medium"}  '
     "(the checker worked; the order is simply unprofitable)\n"
-    "message=Validation failed: mandatory UDF 'costCenter' missing on line 2 -> "
+    "message=Validation failed: mandatory UDF 'costCenter' missing on line 1 -> "
     '{"department": "general", "severity": "medium"}  '
     "(user-supplied data is incomplete; no defect)\n"
-    "message=Authentication failed for user RFLORIA: account disabled in JAM -> "
+    "message=Authentication failed for user XDISABLED: account disabled in JAM -> "
     '{"department": "general", "severity": "medium"}  '
     "(access administration, not code)\n"
+    # Reference data, not a defect: the transform did its job and correctly found
+    # no mapping. Reads like a backend bug ("TransformService", ERROR, a bare id)
+    # and is the pre-creation failure the model most often misroutes to backend.
+    "message=No internal SKU mapping found for product 9999999 -> "
+    '{"department": "general", "severity": "medium"}  '
+    "(missing reference data for an unknown product — nobody changes code)\n"
+    # ── the aborts these rejections cause (still general) ─────────────────────
+    # The order-engine/orchestration abort is a CONSEQUENCE line: it restates a
+    # rejection decided elsewhere. Without these two the model sees "aborted"/
+    # "halted" on an ERROR from the engine and escalates to backend, splitting one
+    # business rejection across two teams.
+    "message=Order ORD-6042 validation failed with 1 error(s); submission aborted "
+    '-> {"department": "general", "severity": "medium"}  '
+    "(the abort merely restates the validator's business rejection)\n"
+    "message=Order ORD-6042 blocked by margin check; submission halted -> "
+    '{"department": "general", "severity": "medium"}  '
+    "(same rejection as the margin ERROR above, seen from the engine)\n"
+    # ── genuine technical failures ────────────────────────────────────────────
     "message=Order processing aborted for order ORD-6108: SPT price list service "
     'unavailable after 3 attempt(s) -> {"department": "networking", "severity": '
     '"high"}  (a real dependency outage)\n'
-    # Paired against the timeout above: both are raw HTTP client lines, so the
+    # The single most common ERROR in the corpus, and the raw client line behind
+    # the abort above. Named exceptions (SocketTimeoutException, connection reset)
+    # are transport faults regardless of which client logged them.
+    "message=[SptClient#getSptPriceListCode] <--- ERROR "
+    "java.net.SocketTimeoutException: connect timed out (10014ms) -> "
+    '{"department": "networking", "severity": "high"}  '
+    "(a connect timeout is a connectivity fault, not a defect in SptClient)\n"
+    # SAP RFC: 'partner not reached' is a host-unreachable fault. The SAP/RFC
+    # framing otherwise pulls the model toward backend or devops.
+    "message=[SapRfcClient#submitOrder] RFC_COMMUNICATION_FAILURE: partner "
+    "'sapecc-prod.computacenter.com:3300' not reached -> "
+    '{"department": "networking", "severity": "high"}  '
+    "(the remote host was never reached — connectivity, not integration logic)\n"
+    # Paired against the timeouts above: both are raw client lines, so the
     # transport framing is identical and only the STATUS separates them. A 403 means
     # the call reached the server and was refused — an authorization decision, not a
     # connectivity fault. Without this pair the model routes 403s to networking on
     # the strength of "HTTP/1.1" alone.
     "message=[JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- "
-    'HTTP/1.1 403 (250ms) -> {"department": "general", "severity": "medium"}  '
+    'HTTP/1.1 403 (209ms) -> {"department": "general", "severity": "medium"}  '
     "(the call SUCCEEDED and was refused — an access "
     "decision; a 4xx authorization refusal is never a networking fault, whereas a "
     "timeout or connection error is)\n"
-    "message=Order creation failed for event evt-1a2b: DB_TIMEOUT — no order was "
-    'created -> {"department": "database", "severity": "critical"}\n'
-    "message=Max redelivery attempts reached for event evt-1a2b; routing message "
-    'to order.inbound.dlq -> {"department": "devops", "severity": "high"}\n'
+    # Database: the message names the STORE and a SQL exception. Kept next to the
+    # abort it causes (below), which names neither — that pair is what stops the
+    # model reading every "Order creation failed" as a database fault.
+    "message=Failed to persist cart header: java.sql.SQLTimeoutException: timeout "
+    "after 30000ms acquiring connection to BM DB -> "
+    '{"department": "database", "severity": "critical"}\n'
+    "message=Order creation failed for event evt-372656a7-9f41-4c8e-b0d3-5a1e77c2b4d9 after 3 attempt(s) -> "
+    '{"department": "database", "severity": "critical"}  '
+    "(the abort for the BM DB failure above; creation persistence is a DB concern)\n"
+    # ── queue plumbing (devops) ───────────────────────────────────────────────
+    # Both DLQ lines, because the second says "submission failed" first and is
+    # otherwise read as a SAP/networking fault. Once a message is parked in an
+    # _error queue the actionable work is queue plumbing: someone must replay it.
+    "message=Max redelivery attempts reached for event evt-372656a7-9f41-4c8e-b0d3-5a1e77c2b4d9; routing message "
+    'to order.init_error -> {"department": "devops", "severity": "high"}\n'
+    "message=Order ORD-6108 submission failed after 3 attempt(s); message moved to "
+    "order.create.sap_error for manual intervention -> "
+    '{"department": "devops", "severity": "high"}  '
+    "(dead-lettered for manual replay — the queue is now the actionable part)\n"
+    # ── retry WARNs: same fault, lower urgency ────────────────────────────────
+    # The retry is still in flight and may yet succeed, so it must NOT inherit the
+    # severity of the abort it precedes. These are frequent, so mis-rating them
+    # floods the feed with false criticals.
+    "message=Retrying SPT price list call for account 81036533 (attempt 2/3) -> "
+    '{"department": "networking", "severity": "low"}  '
+    "(a retry in progress — same cause as the timeout, far less urgent)\n"
 )
 
 _ROUTE_SYSTEM = (
@@ -111,6 +198,23 @@ _ROUTE_SYSTEM = (
     "THIS log is on its own (an ERROR that aborts or dead-letters an order is "
     "more severe than a benign/retryable WARN). Base it on the log only; do not "
     "consider business impact you cannot see.\n"
+    # The corpus is dominated by multi-line failures: a retry WARN (attempt 2/3,
+    # 3/3), then the abort ERROR, then sometimes a DLQ line. Each is alerted
+    # separately, so without an explicit ladder the retries inherit the abort's
+    # urgency and a single fault reports as three criticals.
+    "   Severity ladder, in order: a retry still in flight (attempt N/M) is low — "
+    "it may yet succeed; a business-rule rejection that stopped one order is "
+    "medium; a technical failure that aborted an order or dead-lettered a message "
+    "is high; loss or corruption of persisted state, or a failure that stops "
+    "orders being created at all, is critical.\n"
+    # The Settings failures (scenarios 15/16/17) are deliberately novel — no
+    # example can name them without defeating their purpose as the anomaly path.
+    # A rule generalizes where a few-shot cannot.
+    "   For a log no example resembles, classify by the FAULT it names, not by the "
+    "service that logged it: a named transport fault (timeout, connection reset, "
+    "host/partner not reached, 5xx from a gateway) is networking; a SQL or "
+    "persistence fault is database; a queue redelivery or _error/DLQ routing is "
+    "devops; a rejection on business grounds is general.\n"
     f"{_ROUTE_EXAMPLES}"
     'Reply with a single JSON object: {"department": "<one of the list>", '
     '"severity": "<one of the list>"}. '

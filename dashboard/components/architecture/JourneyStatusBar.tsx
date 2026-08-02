@@ -28,8 +28,9 @@ const PHASE_ACCENT: Record<JourneyPhase, string> = {
   phase1: "var(--cc-horizon-blue)",
   // The ids are minted — the one genuinely creative moment.
   creation: "var(--cc-circuit-green)",
-  // The return leg. Amber because it is the trap: it LOOKS like the hinge that
-  // links the two id families, and it deliberately does not.
+  // The order_data_ready return leg. Amber because it is the trap: a return
+  // hop LOOKS like it should carry new ids, and it carries eventId only — the
+  // order (and both its ids) still does not exist at this point.
   bridge: "var(--cc-fibre-orange)",
   phase2: "var(--cc-heritage-blue)",
 };

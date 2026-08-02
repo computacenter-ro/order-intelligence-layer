@@ -1,33 +1,40 @@
-"""cc-jam-service emitter block (CLAUDE.md [1]) — user auth + privileges + JWT.
+"""cc-jam-service emitter block (CLAUDE.md [1]) — user auth + privileges.
+
+JAM sits on **Inbound's pre-creation enrichment leg** (documented: Inbound
+calls JAM between the order engine's two turns), so its logs are phase 1 —
+eventId only. The JWT the caller mints from the returned privileges is logged
+by inbound's ``enrich_jam_resp`` block.
 
 Failure variant (``fail_at=jam``, scenario 9): the account is disabled in JAM.
-The satellite emits an auth-failure WARN; the order engine then logs the 403
-response and aborts (OE-identity lines), and the chain stops.
+The satellite emits an auth-failure WARN; INBOUND then logs the 403 response
+and aborts the flow (Inbound-identity lines — Inbound is the caller now), and
+the chain stops. This is a PRE-CREATION failure: no order ids ever exist, so
+the abort message is worded around the event, not an order number. The
+``"not authorized"`` / ``"403 from JAM"`` / ``"submission aborted"`` markers
+are load-bearing (backend/journeys.py classifies AUTH_FAILED on them) — change
+them only together with the failure rules and their tests.
 """
 from __future__ import annotations
 
 import random
 
-from pipeline.services.blocklib import emit_line, phase2_ids
-from pipeline.services.profiles import ORDER_ENGINE_WORKER_THREADS, profile
+from pipeline.services.blocklib import emit_line, phase1_ids
+from pipeline.services.inbound import CLIENT_LOGGER, ENRICH_THREAD
+from pipeline.services.profiles import profile
 from pipeline.services.registry import EmitFn, register
 from shared.models import Baton
 
 _PROF = profile("jam")
-_OE_PROF = profile("order_engine")
+_CALLER_PROF = profile("inbound")
 _LOG = "c.c.jam.service.UserProfileService"
-_OE_CLIENT = "c.c.orderengine.client.JamClient"
-_OE_PROCESSING = "c.c.orderengine.service.OrderProcessingService"
-
-
-def _oe_thread(baton: Baton) -> str:
-    return ORDER_ENGINE_WORKER_THREADS[abs(hash(baton.flow_id)) % len(ORDER_ENGINE_WORKER_THREADS)]
+_CALLER_CLIENT = CLIENT_LOGGER["jam"]
+_CALLER_ORCHESTRATION = "c.c.inbound.service.OrderOrchestrationService"
 
 
 @register("jam", "serve")
 async def serve(baton: Baton, emit: EmitFn) -> bool:
     ctx = baton.ctx
-    ids = phase2_ids(ctx)
+    ids = phase1_ids(ctx)
 
     await emit_line(emit, _PROF, logger=_LOG, level="INFO",
                     message=f"Authenticating user {ctx.user}", ids=ids)
@@ -42,21 +49,22 @@ async def serve(baton: Baton, emit: EmitFn) -> bool:
 
 
 async def _auth_failed(baton: Baton, emit: EmitFn) -> bool:
-    """403 account-disabled: JAM WARN + OE 403 response + OE abort."""
+    """403 account-disabled: JAM WARN + Inbound 403 response + Inbound abort."""
     ctx = baton.ctx
-    ids = phase2_ids(ctx)
+    ids = phase1_ids(ctx)
     await emit_line(emit, _PROF, logger=_LOG, level="WARN",
                     message=f"Authentication failed for user {ctx.user}: account disabled in JAM",
                     ids=ids)
-    thread = _oe_thread(baton)
-    await emit_line(emit, _OE_PROF, logger=_OE_CLIENT, level="ERROR", thread=thread,
+    await emit_line(emit, _CALLER_PROF, logger=_CALLER_CLIENT, level="ERROR",
+                    thread=ENRICH_THREAD,
                     message=(
                         f"[JamClient#getUserProfileWithPrivilegesBySamAccountName] "
                         f"<--- HTTP/1.1 403 ({random.randint(200, 300)}ms)"
                     ), ids=ids)
-    await emit_line(emit, _OE_PROF, logger=_OE_PROCESSING, level="ERROR", thread=thread,
+    await emit_line(emit, _CALLER_PROF, logger=_CALLER_ORCHESTRATION, level="ERROR",
+                    thread=ENRICH_THREAD,
                     message=(
-                        f"Cannot process order {ctx.orderId}: user {ctx.user} not "
-                        f"authorized (403 from JAM); submission aborted"
+                        f"Cannot process order request for event {ctx.eventId}: user "
+                        f"{ctx.user} not authorized (403 from JAM); submission aborted"
                     ), ids=ids)
-    return False  # fatal
+    return False  # fatal, pre-creation — eventId-only journey

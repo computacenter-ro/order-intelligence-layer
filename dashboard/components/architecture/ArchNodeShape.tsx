@@ -72,8 +72,9 @@ export function ArchNodeShape({
   // is following the token, not the cursor.
   const strokeWidth = active ? 3 : hovered ? 2.5 : visited ? 2 : 1.5;
 
-  // The tooltip is a DOM layer, so the accessible text lives here: `<title>` is
-  // what a screen reader announces, and it doubles as the native title tooltip.
+  // The tooltip is a DOM layer, so the accessible text lives on `aria-label`.
+  // Deliberately NOT an SVG `<title>`: the browser renders that as a native OS
+  // tooltip, which duplicates our own styled tooltip with an unstyled one.
   const accessibleText = `${node.label}. ${node.description}`;
 
   let shape: React.ReactNode;
@@ -283,8 +284,6 @@ export function ArchNodeShape({
       onBlur={onHide}
       style={{ cursor: "pointer", opacity: dimmed ? 0.42 : 1 }}
     >
-      <title>{accessibleText}</title>
-
       {/* Hover/focus lift: a soft halo behind the shape rather than a filter
           (an SVG drop-shadow filter on every node is expensive to re-rasterize
           while panning). */}

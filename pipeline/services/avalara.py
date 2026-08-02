@@ -1,9 +1,11 @@
 """cc-avalara-service emitter block (CLAUDE.md [1]) — US ship-to verification.
 
-Avalara is a first-class enrichment satellite, and the LAST enrichment step
-before dispatch. It runs for **US orders only** (``ctx.country == "US"``), which
-is why ``shared/scenarios.py`` appends its call/serve/resp trio conditionally
-instead of listing it in ``ENRICH_SATELLITES``.
+Avalara is a first-class enrichment satellite on the order engine's
+post-creation leg, at its DOCUMENTED position between the Validator and the
+Checker (auto-approval rules 1 → 1 → 3). It runs for **US orders only**
+(``ctx.country == "US"``), which is why ``shared/scenarios.py`` inserts its
+call/serve/resp trio conditionally instead of listing it in
+``ENRICH_SATELLITES``.
 
 These lines used to be emitted by ``cc-validator-service`` (its ``AvalaraClient``
 + ``ValidateShipToWithAvalara`` strategy). They were removed from

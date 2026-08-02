@@ -19,20 +19,27 @@ Two cleanly separated layers:
 
 Journey-over rules (CLAUDE.md — exactly three; message texts are load-bearing):
 
-* **SUCCESS** — the last event is the track-trace terminal
-  ("Registered order ... for tracking").
-* **FAILED** — a log carries a dead-letter routing marker
-  (``order.inbound.queue_error`` / ``order.outbound.queue_error`` — the mock
-  services actually emit the ``.dlq`` spelling, which we also match) or a fatal
-  abort ("Order creation failed for event", "Order processing aborted",
+* **SUCCESS** — the last event is Inbound's ``order_created`` close
+  ("Received order_created for order ... : order processing complete").
+  **NOT Track & Trace**: "Registered order ... for tracking" happens MID-FLOW
+  now (right after creation, before the checks), so treating it as a terminal
+  would complete every journey before SPT/validation/margin/SAP even ran.
+* **FAILED** — a log carries a dead-letter routing marker (the current
+  ``order.init_error`` / ``order.create.sap_error`` DLQ names, plus the legacy
+  ``order.inbound.queue_error``/``.dlq`` and ``order.outbound.queue_error``/
+  ``.dlq`` spellings still matched for old data) or a fatal abort
+  ("Order creation failed for event", "Order processing aborted",
   "submission aborted", "blocked by margin check", JAM "not authorized" 403,
   "Max redelivery attempts reached"). The subtype is derived from the message.
 * **TIMED_OUT** — no new event for the journey's ids for ``STALLED_TIMEOUT``
   seconds (default 90; env-configurable). All clock arithmetic is UTC and
   timezone-aware — never ``utcnow()``.
 
-Pre-creation failures (transform / creation) never acquire order ids: their
-journeys carry only ``event_id``. That is correct and complete, not a data gap.
+Pre-creation failures never acquire order ids: their journeys carry only
+``event_id``. Under the five-hop pipeline that is transform and creation
+failures AND the Inbound-leg failures (Settings 15/16/17, JAM 9) — Settings
+and JAM are consulted before the order exists. Correct and complete, not a
+data gap.
 """
 
 from __future__ import annotations
@@ -110,12 +117,14 @@ _FAILURE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("order creation failed for event",), ORDER_CREATION_FAILED),
     (
         ("max redelivery attempts reached",
-         "order.inbound.queue_error",
+         "order.init_error",             # current DLQ name (<queue>_error)
+         "order.inbound.queue_error",    # legacy spellings, kept for old data
          "order.inbound.dlq"),
         INBOUND_TRANSFORM_FAILED,
     ),
     (
-        ("order.outbound.queue_error",
+        ("order.create.sap_error",       # current DLQ name (<queue>_error)
+         "order.outbound.queue_error",   # legacy spellings, kept for old data
          "order.outbound.dlq",
          "submission failed after"),
         SAP_SUBMISSION_FAILED,
@@ -123,7 +132,11 @@ _FAILURE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("validation failed", "submission aborted"), VALIDATION_FAILED),
 ]
 
-_SUCCESS_MARKERS = ("registered order", "for tracking")
+# Inbound's order_created close (pipeline/services/inbound.py `close`). BOTH
+# markers must appear on the journey's LAST line. Deliberately not Track &
+# Trace's "for tracking" — that line is mid-flow under the five-hop pipeline
+# and a journey carrying it can still fail at SPT/validation/margin/SAP.
+_SUCCESS_MARKERS = ("order_created", "processing complete")
 
 
 def classify_failure(message: str) -> str | None:

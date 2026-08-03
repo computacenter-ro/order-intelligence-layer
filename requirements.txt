@@ -9,11 +9,32 @@ uvicorn[standard]>=0.30          # includes websockets support for backend /ws
 pydantic>=2.7                    # LogLine, Baton, ProcessedAlert
 pydantic-settings>=2.3           # env-based config (ES_URL, RABBITMQ_URL, ...)
 python-dotenv>=1.0               # load a gitignored .env into the environment
+# zoneinfo needs a zone database. Linux images have one; WINDOWS DOES NOT, so
+# without this ZoneInfo("Europe/Bucharest") raises and /chat silently falls back
+# to UTC in local dev while working in the container. Pure-Python, ~half a MB.
+tzdata>=2024.1                   # IANA zones for zoneinfo (required on Windows)
 
 # --- AI service (LangGraph pipeline) ---
 langgraph>=0.2
 langchain-core>=0.3
 langchain-azure-ai>=0.1          # Claude via Azure AI Foundry chat models
+# Tracing/observability. langchain-core already emits traces when LANGSMITH_*
+# env vars are set; this is the client the /llm-stats endpoint queries to read
+# them back (per-node run counts, latency, cost). Optional at runtime — with no
+# creds the endpoint returns nulls (deferred import in langsmith_stats.py).
+langsmith>=0.3
+# Semantic-cache embeddings (sentence-transformers + CPU torch) are heavy and
+# need PyTorch's CPU wheel index, so they live in a separate, fully-pinned file:
+#   pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+# The AI service runs WITHOUT them — the cache just disables itself (deferred
+# import in ai_service/semcache.py). Install them only to enable the cache.
+
+# --- Documentation corpus (docs RAG) ---
+# The per-service docs in ai_service/knowledge/ open with a ```yaml frontmatter
+# block, and service-map.yaml maps mock app_names to doc files. Both are read by
+# ai_service/knowledge_loader.py. Pure-Python fallback, no compiler, ~250 KB —
+# this is NOT part of the optional ML stack; the loader must work without it.
+pyyaml>=6.0
 
 # --- Messaging / caching / storage ---
 aio-pika>=9.4                    # RabbitMQ (async): baton queues, raw.events, processed.alerts
@@ -24,6 +45,12 @@ alembic>=1.13                    # DB migrations
 
 # --- HTTP client ---
 httpx>=0.27                      # log_client (services → collector), poller, Slack webhooks
+
+# --- Auth (backend) ---
+pyjwt>=2.8                       # sign/verify the session JWT (login → cookie → get_current_user)
+passlib[bcrypt]>=1.7             # bcrypt password hashing for the hardcoded admin user
+bcrypt<4.1                       # pinned: passlib 1.7.x is incompatible with bcrypt 4.1+/5.x
+msal>=1.31                       # Entra ID: authorization-code exchange + id_token validation
 
 # --- Testing ---
 pytest>=8.2

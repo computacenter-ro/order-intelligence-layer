@@ -37,3 +37,7 @@ docs/
 .playwright-mcp/
 
 run.sh
+
+chatbot_build_prompts.md
+# Database dumps from scripts/backup_db.sh — never commit data.
+backups/

@@ -1,23 +1,27 @@
 import { Card } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
+import { AlertActionsMenu } from "@/components/alerts/AlertActionsMenu";
 import { Badge } from "@/components/ui/Badge";
-import { ConfidenceBar } from "@/components/ui/ConfidenceBar";
-import { levelLabel, formatTime, capitalize } from "@/lib/format";
+import { SeverityPill } from "@/components/ui/SeverityPill";
+import { formatTime, formatTimestampFull, capitalize } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
-import type { BadgeStatus, ProcessedAlert } from "@/lib/types";
+import type { ProcessedAlert } from "@/lib/types";
 
 interface AlertCardProps {
   alert: ProcessedAlert;
   onOpen: (alert: ProcessedAlert) => void;
+  onResolve: (alert: ProcessedAlert) => void;
   isSelected?: boolean;
+  /** Active search term, highlighted in the explanation. Omitted = no highlight. */
+  search?: string;
 }
 
 const FALLBACK_EXPLANATION =
   "Unprocessed — LLM unavailable. Raw log passed straight through; no explanation or routing.";
 
-export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps) {
+export function AlertCard({ alert, onOpen, onResolve, isSelected = false, search }: AlertCardProps) {
   const isFallback = alert.source === "fallback";
-  const levelStatus: BadgeStatus = alert.level === "ERROR" ? "error" : "warning";
+
   const accentColor = isFallback
     ? "var(--cc-grey-four)"
     : alert.level === "ERROR"
@@ -45,13 +49,22 @@ export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps)
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
-          <Badge status={levelStatus}>{levelLabel(alert.level)}</Badge>
+          <SeverityPill level={alert.level} severity={alert.severity} />
           <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: "12px", color: "var(--cc-grey-two)" }}>
             {alert.app_name}
           </span>
-          <span style={{ marginLeft: "auto", fontSize: "12px", color: "var(--cc-grey-three)" }}>
+          {/* The compact time abbreviates (no seconds once it isn't today), so the
+              exact value is one hover away rather than lost. */}
+          <span
+            style={{ marginLeft: "auto", fontSize: "12px", color: "var(--cc-grey-three)" }}
+            title={formatTimestampFull(alert.emitted_at)}
+          >
             {formatTime(alert.emitted_at)}
           </span>
+          <AlertActionsMenu
+            isResolved={alert.is_resolved}
+            onResolve={() => onResolve(alert)}
+          />
         </div>
         <p
           style={{
@@ -62,14 +75,20 @@ export function AlertCard({ alert, onOpen, isSelected = false }: AlertCardProps)
             margin: "0 0 12px",
           }}
         >
-          {alert.explanation ? renderInlineMarkdown(alert.explanation) : FALLBACK_EXPLANATION}
+          {alert.explanation ? renderInlineMarkdown(alert.explanation, search) : FALLBACK_EXPLANATION}
         </p>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           {alert.source === "ai" ? (
             <>
               <Badge status="other">AI-analyzed</Badge>
+              {/* Modifier on AI-analyzed, never a replacement: a cache hit is the
+                  same AI answer reused, so both badges show together. */}
+              {alert.cached && (
+                <span title="Reused from a previous identical alert — no new LLM call">
+                  <Badge status="primary">Cached</Badge>
+                </span>
+              )}
               {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
-              {alert.confidence != null && <ConfidenceBar confidence={alert.confidence} />}
             </>
           ) : (
             <>

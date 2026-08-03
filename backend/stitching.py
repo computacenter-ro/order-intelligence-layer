@@ -8,23 +8,33 @@ See CLAUDE.md "THE CORRELATION MODEL" for the invariants this relies on. The
 short version: a journey has **no single id present on every log**. The
 identifier changes over the journey's lifetime —
 
-* **phase 1** logs carry only ``eventId``;
-* the **bridge** log carries ``eventId`` *and* >=1 order id;
-* **phase 2** logs carry both order ids and never ``eventId``.
+* **phase 1** logs carry only ``eventId`` (as a field);
+* the **bridge** log (order-creation-response ack) carries only ``eventId`` —
+  it no longer links the id families;
+* **phase 2** logs carry both order ids (as fields) and never ``eventId``.
 
-Crucially, every log that introduces a *new* id also carries an
-*already-known* id (the bridge shares ``eventId``; the first phase-2 log shares
-an order id the bridge exposed). So a single pass over the logs **in timestamp
-order**, maintaining an ``id -> journey_id`` alias map, correlates every log
-correctly for all three bridge variants (both / order-only / cart-only) — no
-second pass and no back-patching required.
+The eventId->order-id join is closed by **id mining**: the order-engine
+creation logs carry ``eventId`` as a field AND the freshly minted order ids in
+their *message text* (e.g. "Created cart header 1840927365018240001",
+"Generated order number ORD-6001 for cart header 1840927365018240001"). We
+extract ids from ``log.message`` with strict, word-boundary patterns and treat
+them EXACTLY like structured-field ids — registering them in the same alias map.
+So a single pass over the logs **in timestamp order** correlates every log:
+those creation logs (which sit before the bridge) tie eventId to the order ids,
+and every later phase-2 log shares an order id already known. No second pass and
+no back-patching. Because the creation-log *text* now carries correlation
+information, that text is **load-bearing** (like the terminal messages the
+journey-over rules match on): changing it requires updating these patterns.
 
-``accountNumber`` is NEVER consulted: it is not unique per journey (see the
-schema table in CLAUDE.md) and using it would merge unrelated orders.
+``accountNumber`` is NEVER consulted — neither as a field nor mined from text:
+it is not unique per journey (see the schema table in CLAUDE.md) and using it
+would merge unrelated orders. Mining is likewise scoped to the three id families
+only.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 
@@ -33,6 +43,41 @@ from shared.models import LogLine
 # The correlation id fields, in the priority order used to pick a journey_id.
 # accountNumber is intentionally absent — see module docstring.
 _ID_FIELDS = ("eventId", "orderId", "cartHeaderId")
+
+# Strict, word-boundary patterns for mining ids from a log's MESSAGE TEXT. They
+# mirror the id shapes in CLAUDE.md's log schema exactly:
+#   eventId       evt-<hex/dashes>      orderId  ORD-<digits>   cartHeaderId  19 digits
+# The 19-digit cart pattern uses \b on both sides so an unrelated longer/shorter
+# run of digits (or a number embedded in a larger token) never matches — a stray
+# 19-digit number in prose is the only false-positive risk and is vanishingly
+# unlikely, whereas a 12- or 20-digit number is rejected outright.
+_MINE = {
+    "eventId": re.compile(r"evt-[0-9a-f-]{8,}"),
+    "orderId": re.compile(r"\bORD-\d+\b"),
+    "cartHeaderId": re.compile(r"\b\d{19}\b"),
+}
+
+
+def _collect_ids(log: LogLine) -> dict[str, str]:
+    """All correlation ids on a log: structured fields first, then mined from
+    ``message`` text. Returns ``{family: id}`` (one per family; a field value
+    wins over a mined one if both are present, though they agree in practice).
+
+    Mined ids are treated identically to field ids by the caller — they become
+    journey aliases and populate the journey's event_id/order_id/cart_header_id.
+    """
+    ids: dict[str, str] = {}
+    for family in _ID_FIELDS:
+        value = getattr(log, family)
+        if value is not None:
+            ids[family] = value
+    message = log.message or ""
+    for family, pattern in _MINE.items():
+        if family not in ids:  # a structured field takes precedence
+            match = pattern.search(message)
+            if match:
+                ids[family] = match.group(0)
+    return ids
 
 
 @dataclass
@@ -93,7 +138,10 @@ class Stitcher:
             return None
         self._seen_log_ids.add(log.log_id)
 
-        ids = [getattr(log, f) for f in _ID_FIELDS if getattr(log, f) is not None]
+        # Ids come from BOTH structured fields and mined message text, treated
+        # identically (see _collect_ids / module docstring).
+        id_map = _collect_ids(log)
+        ids = list(id_map.values())
 
         # Pick the journey: first known alias wins; otherwise start a new one.
         journey_id = next((self._aliases[i] for i in ids if i in self._aliases), None)
@@ -108,7 +156,7 @@ class Stitcher:
         # extends the journey's alias set — it never links two existing ones.
         for i in ids:
             self._aliases[i] = journey_id
-        self._absorb_ids(journey, log)
+        self._absorb_ids(journey, id_map)
 
         self._insert_in_ts_order(journey, log)
         return journey
@@ -139,14 +187,20 @@ class Stitcher:
     # --- internals -----------------------------------------------------------
 
     @staticmethod
-    def _absorb_ids(journey: StitchedJourney, log: LogLine) -> None:
-        """Copy any ids present on ``log`` onto the journey's alias fields."""
-        if log.eventId is not None:
-            journey.event_id = log.eventId
-        if log.orderId is not None:
-            journey.order_id = log.orderId
-        if log.cartHeaderId is not None:
-            journey.cart_header_id = log.cartHeaderId
+    def _absorb_ids(journey: StitchedJourney, id_map: dict[str, str]) -> None:
+        """Copy this log's ids (fields + mined) onto the journey's alias fields.
+
+        ``id_map`` is the {family: id} from :func:`_collect_ids`, so mined ids
+        land in ``event_id`` / ``order_id`` / ``cart_header_id`` exactly like
+        structured-field ids — the DB columns, WS payloads and Teams links that
+        read these journey fields therefore see mined ids transparently.
+        """
+        if "eventId" in id_map:
+            journey.event_id = id_map["eventId"]
+        if "orderId" in id_map:
+            journey.order_id = id_map["orderId"]
+        if "cartHeaderId" in id_map:
+            journey.cart_header_id = id_map["cartHeaderId"]
 
     @staticmethod
     def _insert_in_ts_order(journey: StitchedJourney, log: LogLine) -> None:

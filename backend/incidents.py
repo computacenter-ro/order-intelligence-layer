@@ -1,0 +1,757 @@
+"""[5] Core Backend — incident clustering (repo-root
+incident-clustering-implementation-plan.md is the design source; read it for
+the "why" behind every rule here).
+
+Collapses one order's many alerts into a single incident, and — for
+infrastructure-class failures only — groups the same failure across different
+orders into one systemic incident. Two layers, mirroring backend/journeys.py's
+own split:
+
+* **Pure decision functions** — causal-line selection, signature building,
+  INFRA-vs-order-specific classification, the cosine + salient-token veto.
+  No DB, fully unit-testable with plain objects.
+* **DB-touching orchestration** (:func:`assign_incident`,
+  :func:`process_completion`) — a thin layer over the pure decisions above.
+  Incidents close ONLY via the manual REST resolve endpoint
+  (``PATCH /incidents/{id}/resolve``, ``backend/api.py``) — there is no
+  automatic closing mechanism here.
+
+``backend/journeys.py`` is NOT re-run for classification here. The failure
+``subtype`` comes from the journey's OWN completion outcome
+(``Completion.status``/``outcome``), passed in by ``backend/consumers.py`` —
+never re-derived. ``_FAILURE_RULES`` stays exactly as-is; an unrecognized
+failure (a ``TIMED_OUT`` journey) just routes to this module's novel/embedding
+path instead of being excluded. (``JourneyStatus`` is still imported where the
+status enum is needed.)
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import re
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+# --- config -------------------------------------------------------------------
+
+# Cosine-similarity floor for the novel (unrecognized) path's incident match.
+INCIDENT_COSINE_THRESHOLD = float(os.getenv("INCIDENT_COSINE_THRESHOLD", "0.95"))
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# --- causal-line selection (pure) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class CausalCandidate:
+    """The minimal shape :func:`pick_causal_line` needs from an alert.
+
+    Decouples the pure selection logic from the ORM ``Alert`` class so it's
+    unit-testable without a database (mirrors backend/journeys.py's
+    ``LogLine``-based pure functions).
+    """
+
+    alert_id: str
+    level: str
+    message: str
+    logger: str
+    app_name: str
+    department: str | None
+    embedding: list[float] | None
+
+
+def pick_causal_line(candidates: list[CausalCandidate]) -> CausalCandidate | None:
+    """The journey's causal line: first ERROR among its alerts, else first WARN.
+
+    ``candidates`` must already be ordered (by ``emitted_at`` — see
+    :func:`_fetch_causal_candidates`) and already suppression-filtered (a
+    suppressed WARN/ERROR never became an alert in the first place, so there's
+    no separate suppression check to do here). Every one of the 10 canonical
+    scenarios has a real ERROR from the specific failing component logged
+    BEFORE the shared generic orchestrator abort line — so "first ERROR"
+    naturally lands on the real cause, never the generic wrapper, even though
+    that wrapper is also ERROR-level in several scenarios.
+    """
+    for candidate in candidates:
+        if candidate.level == "ERROR":
+            return candidate
+    for candidate in candidates:
+        if candidate.level == "WARN":
+            return candidate
+    return None
+
+
+# --- signature building (pure) -------------------------------------------------
+
+# Maps a substring of the causal line's logger to the failing component name
+# (source spec §5's causal-line table, verified against the actual mock
+# service code — pipeline/services/{spt,jam,outbound_osw,checker,validator}.py).
+_SERVICE_LOGGER_MARKERS: tuple[tuple[str, str], ...] = (
+    ("SptClient", "SPT"),
+    ("JamClient", "JAM"),
+    ("SapRfcClient", "SAP"),
+    ("MarginCheckService", "checker"),
+    ("ValidateOrderLineUdfFields", "validator"),
+    ("TransformService", "inbound-transform"),
+    ("OrderCreationService", "BM-DB/creation"),
+)
+
+
+def failing_service_from(logger: str, app_name: str) -> str:
+    """The failing component, from the causal alert's logger.
+
+    Falls back to ``app_name`` for a logger this table doesn't recognize —
+    the novel-path case, where the specific component is unknown but the
+    service that emitted the log is still a useful label.
+    """
+    for marker, service in _SERVICE_LOGGER_MARKERS:
+        if marker in logger:
+            return service
+    return app_name
+
+
+# Specific error tokens mined from the causal message (source spec §4 step 3).
+# Order matters only in that the first match wins; these are mutually
+# exclusive substrings in practice.
+_ERROR_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"SocketTimeoutException"),
+    re.compile(r"RFC_COMMUNICATION_FAILURE"),
+    re.compile(r"SQLTimeoutException"),
+)
+
+
+def mine_error_token(message: str) -> str | None:
+    """The specific error token in ``message``, or ``None``.
+
+    Mined for DISPLAY on the incident card only — NOT part of the signature
+    hash, and NOT used for classification (that is subtype-based now; see
+    :func:`classify_infra_or_order_specific`). See this plan's Global
+    Constraints and the source spec's open question #5.
+    """
+    for pattern in _ERROR_TOKEN_PATTERNS:
+        match = pattern.search(message)
+        if match:
+            return match.group(0)
+    return None
+
+
+@dataclass(frozen=True)
+class Signature:
+    """A cause fingerprint for a journey's failure.
+
+    ``failure_subtype`` is the journey's OWN completion outcome (passed in),
+    never re-derived here. ``digest`` is ``None`` when ``failure_subtype`` is
+    ``None`` — a genuinely novel FAILED cause or any TIMED_OUT journey (the
+    journey never resolved to a recognized subtype). ``digest is None`` is
+    exactly the novel/embedding-path trigger.
+    """
+
+    failure_subtype: str | None
+    failing_service: str
+    error_token: str | None
+    digest: str | None
+
+
+def build_signature(
+    failure_subtype: str | None, logger: str, app_name: str, message: str
+) -> Signature:
+    """Build a :class:`Signature`.
+
+    ``failure_subtype`` is the journey's OWN classification result, passed in by
+    the caller (:func:`process_completion`) — ``completion.outcome`` when
+    ``status is FAILED``, else ``None`` (TIMED_OUT / unrecognized). We do NOT
+    re-run ``classify_failure``: the journey mechanism already matched the
+    terminal line, and re-classifying the *upstream* causal line would just
+    return ``None`` and misroute recognized failures to the novel path.
+    ``failing_service`` is read from the causal line's ``logger``; ``message``
+    is used only to mine the display ``error_token``.
+    """
+    failing_service = failing_service_from(logger, app_name)
+    error_token = mine_error_token(message)
+    digest = None
+    if failure_subtype is not None:
+        raw = f"{failure_subtype}:{failing_service}"
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+    return Signature(
+        failure_subtype=failure_subtype,
+        failing_service=failing_service,
+        error_token=error_token,
+        digest=digest,
+    )
+
+
+# --- INFRA vs order-specific classification (pure) -----------------------------
+
+# The failure's OWN subtype decides its class — semantic and correct even when
+# the causal line's LOGGER is misleading. AUTH_FAILED is order-specific (one
+# user's account is disabled) even though its causal line is JamClient, a
+# dependency-CLIENT logger that a naive "client logger => infra" rule would
+# wrongly call infrastructure. So we classify on the subtype, not the raw logger.
+_INFRA_SUBTYPES = frozenset({
+    "ENRICHMENT_FAILED",        # a dependency (SPT/RSM/...) never responded
+    "ORDER_CREATION_FAILED",    # BM-DB connection timeout
+    "SAP_SUBMISSION_FAILED",    # SAP RFC not reached
+    # A dependency that flapped and recovered is infrastructure BY DEFINITION —
+    # the order itself was fine (it succeeded). INFRA is also what makes several
+    # flapping orders merge into ONE incident rather than one per order, which is
+    # the entire point: a service blipping on 30 orders is one story.
+    "TRANSIENT_FAILURE",
+})
+_ORDER_SPECIFIC_SUBTYPES = frozenset({
+    "MARGIN_CHECK_FAILED",      # this order's margin
+    "VALIDATION_FAILED",        # this order's UDF/data
+    "AUTH_FAILED",              # this user's account (dependency responded 403)
+    "INBOUND_TRANSFORM_FAILED", # this order's unknown product/SKU
+})
+
+# Fallback ONLY for the novel path (subtype is None): the message SHAPE.
+_INFRA_MESSAGE_MARKERS = (
+    "sockettimeoutexception", "rfc_communication_failure", "sqltimeoutexception",
+    "service unavailable", "connection refused", "circuit",
+)
+
+
+def classify_infra_or_order_specific(failure_subtype: str | None, message: str) -> str:
+    """INFRA (spans orders) vs order-specific (stays per-order).
+
+    Primary signal is the journey's OWN ``failure_subtype`` — semantic and
+    correct even when the causal logger is misleading (``AUTH_FAILED`` is
+    order-specific though its logger, ``JamClient``, looks like an infra client).
+
+    For the novel path (``failure_subtype is None``) there is no subtype to map,
+    so fall back to the message SHAPE: timeout/connection/5xx-shaped -> INFRA,
+    everything else -> order-specific. A message matching neither shape DEFAULTS
+    to order-specific, never INFRA: at worst a genuine cross-order outage with an
+    unrecognized shape fragments into several per-order incidents (noisy, not
+    misleading); the reverse default risks an immediate false merge of unrelated
+    orders, implying a shared root cause that doesn't exist.
+    """
+    if failure_subtype in _INFRA_SUBTYPES:
+        return "infra"
+    if failure_subtype in _ORDER_SPECIFIC_SUBTYPES:
+        return "order_specific"
+    text = message.lower()
+    if any(m in text for m in _INFRA_MESSAGE_MARKERS):
+        return "infra"
+    if re.search(r"\btimeout\b|\bconnect(ion)?\b", text) or re.search(r"\b5\d\d\b", text):
+        return "infra"
+    return "order_specific"
+
+
+# --- cosine + salient-token veto (pure) -----------------------------------------
+# Small, self-contained duplicates of ai_service/semcache.py's cosine/diverges
+# logic — see this plan's Global Constraints for why these aren't imported
+# from ai_service instead.
+
+_WORD = re.compile(r"[A-Za-z]+|\S*\d\S*")
+
+_SALIENT_WORDS = frozenset({
+    "failed", "failure", "succeeded", "success", "passed", "pass", "aborted",
+    "abort", "blocked", "denied", "deny", "rejected", "reject", "timeout",
+    "timed", "unavailable", "unauthorized", "forbidden", "retry", "retrying",
+    "final", "not", "no", "none", "unable", "cannot", "missing", "invalid",
+    "disabled", "enabled", "up", "down",
+})
+
+# Mirrors ai_service/semcache.py's own id-masking (`_MASKS`/`normalize()`) —
+# duplicated for the same cross-process reason as cosine/diverges themselves
+# (see this plan's Global Constraints). Without masking first, two causal
+# lines that differ ONLY by which order/account/cart they belong to would
+# register as "diverged" purely because their order/account digits differ —
+# defeating cross-order matching for exactly the case it exists to serve.
+_ID_MASKS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("<EVT>", re.compile(r"evt-[0-9a-f-]{8,}")),
+    ("<ORD>", re.compile(r"\bORD-\d+\b")),
+    ("<CART>", re.compile(r"\b\d{19}\b")),
+    ("<ACC>", re.compile(r"\b\d{6,}\b")),
+)
+
+
+def _mask_ids(message: str) -> str:
+    """Mask volatile order/event/cart/account ids so two causal lines from
+    different orders compare on CAUSE, not identity."""
+    text = message or ""
+    for token, pattern in _ID_MASKS:
+        text = pattern.sub(token, text)
+    return text
+
+
+def _salient_tokens(text: str) -> frozenset[str]:
+    """Meaning-bearing tokens: any token containing a digit (counters,
+    percentages, status codes), plus any configured outcome/polarity word.
+
+    ``text`` must already be id-masked (see :func:`_mask_ids`) — otherwise a
+    differing order/account/cart id would itself count as a salient token.
+    """
+    tokens: set[str] = set()
+    for match in _WORD.finditer(text):
+        tok = match.group(0).lower()
+        if any(ch.isdigit() for ch in tok):
+            tokens.add(tok)
+        elif tok in _SALIENT_WORDS:
+            tokens.add(tok)
+    return frozenset(tokens)
+
+
+def diverges(message_a: str, message_b: str) -> bool:
+    """True if the two causal messages disagree on any salient token — the
+    veto that rejects a cosine match a general-purpose embedding scored high
+    despite a meaning flip (e.g. "succeeded" vs "failed"). Masks ids first
+    (:func:`_mask_ids`) so two messages differing only by order/account/cart
+    id are never treated as diverged."""
+    return _salient_tokens(_mask_ids(message_a)) != _salient_tokens(_mask_ids(message_b))
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two equal-length vectors (0 if either is zero)."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+# --- incident title (pure) ------------------------------------------------------
+
+
+def _sanitize_suggested_label(label: str) -> str:
+    """Strip volatile ids out of an LLM-suggested title (reuses _mask_ids'
+    patterns, then drops the mask tokens rather than showing them literally).
+
+    An infra-class incident can absorb many different orders over its open
+    lifetime, so a title that baked in the *first* order's id would read as
+    misleading once other orders join it.
+    """
+    cleaned = _mask_ids(label)
+    for token in ("<EVT>", "<ORD>", "<CART>", "<ACC>"):
+        cleaned = cleaned.replace(token, "")
+    return " ".join(cleaned.split())  # collapse whitespace left behind
+
+
+def build_title(signature: Signature, suggested_label: str | None = None) -> str:
+    """A deterministic incident title — reads correctly even with the Azure
+    LLM breaker open. ``suggested_label`` (an LLM-derived phrase, only ever
+    passed for the UNRECOGNIZED_FAILURE case) is used only when the signature
+    has no recognized subtype AND sanitizes to something non-empty; every
+    other case — including LLM-down/absent-label — uses exactly the static
+    fallback text.
+    """
+    if signature.failure_subtype is None and suggested_label:
+        cleaned = _sanitize_suggested_label(suggested_label)
+        if cleaned:
+            return f"{cleaned} — {signature.failing_service}"
+    subtype = signature.failure_subtype or "Unrecognized failure"
+    return f"{subtype} — {signature.failing_service}"
+
+
+def incident_subtype_for(status, outcome: str, has_recovered_error: bool) -> str | None:
+    """The ``failure_subtype`` an incident should carry, or ``None`` for the
+    novel/embedding path. Returns ``False``-y only via ``None``; ineligibility
+    is decided by :func:`is_eligible_for_clustering`, not here.
+
+    Three cases, and the third is the one that is NOT the journey's outcome:
+
+    * ``FAILED`` with a recognized subtype -> that subtype (unchanged).
+    * ``FAILED``/``UNRECOGNIZED_FAILURE`` or ``TIMED_OUT`` -> ``None``, the
+      novel path (unchanged).
+    * ``SUCCESS`` carrying a RECOVERED error -> ``TRANSIENT_FAILURE``.
+
+    That last case deliberately breaks the "subtype is the journey's OWN
+    outcome, never re-derived" rule stated in :func:`build_signature`, and the
+    exception is principled rather than convenient: for a failure the journey's
+    outcome IS the cause, but a recovered journey's outcome (``SUCCESS``)
+    describes the ORDER while the incident describes the DEPENDENCY. They are
+    different facts about the same flow. Passing ``SUCCESS`` through would hash
+    a meaningless ``SUCCESS:<service>`` signature and title an incident
+    "SUCCESS — SPT"; forcing it to ``ENRICHMENT_FAILED`` would be worse still,
+    merging a shipped order into the outage incident and inflating that
+    incident's ``journey_count`` beyond the orders that actually broke.
+    ``TRANSIENT_FAILURE`` hashes distinctly from every failure subtype, so the
+    two can never collide.
+    """
+    from backend.journeys import JourneyStatus, TRANSIENT_FAILURE, UNRECOGNIZED_FAILURE
+
+    if status is JourneyStatus.SUCCESS and has_recovered_error:
+        return TRANSIENT_FAILURE
+    if status is JourneyStatus.FAILED and outcome != UNRECOGNIZED_FAILURE:
+        return outcome
+    return None
+
+
+async def _has_recovered_error(session, completion) -> bool:
+    """Did this journey carry an ERROR that later recovered?
+
+    Reads the journey's LOGS when the completion carries them (the live
+    ``raw.events`` path, where the stitched journey is in memory) and falls back
+    to the persisted ``journey_events`` rows when it does not — which is the
+    case on the ``retry_unclustered_completions`` sweep, where the completion is
+    rebuilt from the ``journeys`` table with an EMPTY log list. Without that
+    fallback a recovered journey whose completion outran its alerts would be
+    permanently skipped: the sweep would see no logs, conclude "no recovered
+    error", and never cluster it — exactly the silent-skip class of bug the
+    sweep itself exists to fix.
+    """
+    from sqlalchemy import select
+    from backend.db import JourneyEvent
+    from backend.journeys import unrecovered_errors
+    from shared.models import LogLine
+
+    logs = list(completion.journey.logs)
+    if logs:
+        # Live path: the stitched journey is in memory, so decide without a query.
+        # The overwhelmingly common case here is a CLEAN success — no ERROR at
+        # all — and it must cost nothing, since every healthy order reaches this.
+        if not any(log.level == "ERROR" for log in logs):
+            return False
+        return not unrecovered_errors(logs)
+
+    # Sweep path only: the completion was rebuilt from the ``journeys`` table
+    # with an EMPTY log list, so the logs must come from ``journey_events``.
+    # Without this a recovered journey whose completion outran its alerts would
+    # be skipped forever — the silent-skip class of bug the sweep exists to fix.
+    result = await session.execute(
+        select(JourneyEvent.raw)
+        .where(JourneyEvent.journey_id == completion.journey_id)
+        .order_by(JourneyEvent.ts)
+    )
+    for (raw,) in result.all():
+        try:
+            logs.append(LogLine.model_validate(raw))
+        except Exception:  # noqa: BLE001 — a corrupt row must not break clustering
+            continue
+    if not any(log.level == "ERROR" for log in logs):
+        return False
+    return not unrecovered_errors(logs)
+
+
+def is_eligible_for_clustering(status, has_recovered_error: bool) -> bool:
+    """Whether a completed journey may form/join an incident at all.
+
+    ``FAILED`` and ``TIMED_OUT`` are eligible as they always were. ``SUCCESS`` is
+    eligible ONLY when the journey carried an error that recovered — i.e. a
+    dependency flapped mid-flow (scenario 18). A clean success has no causal line
+    to anchor on and must never cluster, which is why this is gated on the
+    recovered-error flag rather than on ``SUCCESS`` alone: without that gate every
+    healthy order would attempt to cluster on every run.
+    """
+    from backend.journeys import JourneyStatus
+
+    if status in (JourneyStatus.FAILED, JourneyStatus.TIMED_OUT):
+        return True
+    return status is JourneyStatus.SUCCESS and has_recovered_error
+
+
+# --- assign_incident: match-or-create (DB) --------------------------------------
+
+
+async def _find_open_incident_by_signature(session, digest: str):
+    from sqlalchemy import select
+    from backend.db import Incident
+
+    result = await session.execute(
+        select(Incident).where(Incident.status == "open", Incident.signature == digest)
+    )
+    return result.scalars().first()
+
+
+async def _find_open_incident_by_cosine(session, *, failing_service: str, causal: CausalCandidate):
+    """The novel path (source spec §4 step 5): among OPEN incidents with no
+    exact signature (novel-path incidents only) that share the same
+    failing_service, find the closest cosine match above the threshold — and
+    veto it if the two causal messages disagree on a salient token."""
+    from sqlalchemy import select
+    from backend.db import Alert, Incident
+
+    if causal.embedding is None:
+        return None
+    result = await session.execute(
+        select(Incident, Alert)
+        .join(Alert, Alert.alert_id == Incident.primary_alert_id)
+        .where(
+            Incident.status == "open",
+            Incident.signature.is_(None),
+            Incident.failing_service == failing_service,
+        )
+    )
+    best_incident, best_primary_message, best_sim = None, None, -1.0
+    for incident, primary_alert in result.all():
+        if primary_alert.embedding is None:
+            continue
+        sim = _cosine(causal.embedding, primary_alert.embedding)
+        if sim > best_sim:
+            best_incident, best_primary_message, best_sim = incident, primary_alert.message, sim
+    if best_incident is None or best_sim < INCIDENT_COSINE_THRESHOLD:
+        return None
+    if diverges(causal.message, best_primary_message):
+        return None
+    return best_incident
+
+
+async def assign_incident(session, *, signature: Signature, infra_class: str,
+                           causal: CausalCandidate, now: datetime,
+                           suggested_label: str | None = None):
+    """Find an OPEN incident to join, or create a new one.
+
+    Order-specific causal lines NEVER search — they always create their own
+    incident, permanently scoped to this one journey this iteration (no
+    escalation path yet — see the source spec's §12 Future Improvements).
+
+    Does NOT link alerts/journeys or bump alert_count/journey_count —
+    :func:`process_completion` does that once, uniformly, for both the match
+    and create cases, so a count is never bumped twice.
+    """
+    from backend.db import Incident
+
+    incident = None
+    if infra_class == "infra":
+        if signature.digest is not None:
+            incident = await _find_open_incident_by_signature(session, signature.digest)
+        else:
+            incident = await _find_open_incident_by_cosine(
+                session, failing_service=signature.failing_service, causal=causal
+            )
+
+    if incident is not None:
+        return incident
+
+    incident = Incident(
+        incident_id=str(uuid.uuid4()),
+        signature=signature.digest,
+        failure_subtype=signature.failure_subtype,
+        failing_service=signature.failing_service,
+        error_token=signature.error_token,
+        title=build_title(signature, suggested_label),
+        department=causal.department,
+        status="open",
+        first_ts=now,
+        last_ts=now,
+        primary_alert_id=causal.alert_id,
+        alert_count=0,
+        journey_count=0,
+    )
+    session.add(incident)
+    await session.flush()  # so incident.incident_id is set before the caller FKs to it
+    return incident
+
+
+# --- process_completion: the main entry point (DB) ------------------------------
+
+
+async def _fetch_causal_candidates(session, journey_id: str) -> list[CausalCandidate]:
+    """This journey's alerts, ordered by ``emitted_at`` — the only per-alert
+    timestamp the ``alerts`` table stores (the original log's own timestamp
+    isn't persisted on ``alerts``, only on the ``journey_events`` it produced).
+    """
+    from sqlalchemy import select
+    from backend.db import Alert
+
+    result = await session.execute(
+        select(Alert).where(Alert.journey_id == journey_id).order_by(Alert.emitted_at.asc())
+    )
+    return [
+        CausalCandidate(
+            alert_id=a.alert_id, level=a.level, message=a.message,
+            logger=a.logger, app_name=a.app_name, department=a.department,
+            embedding=a.embedding,
+        )
+        for a in result.scalars().all()
+    ]
+
+
+# --- WebSocket event builders --------------------------------------------------
+# Mirrors backend/journeys.py's builders: the "data" payload uses the API
+# response schema (backend/schemas.py) so the dashboard sees exactly the REST
+# shape. Import lazily to keep this module's import path free of the web layer.
+
+
+def _incident_new_event(incident) -> dict:
+    """An ``incident.new`` envelope for a freshly created incident."""
+    from backend.schemas import IncidentOut
+    from backend.ws import EVENT_INCIDENT_NEW, make_event
+
+    data = IncidentOut.model_validate(incident).model_dump(mode="json")
+    return make_event(EVENT_INCIDENT_NEW, data)
+
+
+def _incident_updated_event(incident) -> dict:
+    """An ``incident.updated`` envelope for an existing incident that just
+    absorbed another journey (counts/last_ts changed, same row)."""
+    from backend.schemas import IncidentOut
+    from backend.ws import EVENT_INCIDENT_UPDATED, make_event
+
+    data = IncidentOut.model_validate(incident).model_dump(mode="json")
+    return make_event(EVENT_INCIDENT_UPDATED, data)
+
+
+async def process_completion(session, completion, *, now: datetime | None = None, on_event=None):
+    """Cluster one journey's completion into an incident, or return ``None``
+    if ineligible (source spec §4 Eligibility):
+
+    * only ``FAILED`` and ``TIMED_OUT`` journeys are eligible at all;
+    * a ``TIMED_OUT`` journey additionally needs a real linked ERROR alert
+      (its causal line can't be a WARN-only fallback — there's no recognized
+      terminal marker to anchor a "this timed out because X" story on).
+
+    Idempotent on ``journey_id``: a journey whose ``incident_id`` is already
+    set is a no-op (handles at-least-once redelivery / a re-evaluated
+    completion safely).
+
+    When ``on_event`` is given (e.g. the WebSocket hub's ``broadcast``, same as
+    ``backend/journeys.py``'s ``on_event`` wiring), emits ``incident.new`` when
+    this call created a fresh incident, or ``incident.updated`` when it joined
+    an already-open one — so ``journey_count``/``alert_count``/``last_ts`` stay
+    live on screen as an incident's blast radius grows, not just at creation.
+    """
+    from sqlalchemy import select, update
+    from backend.db import Alert, Journey
+    from backend.journeys import JourneyStatus, unrecovered_errors
+
+    now = now or _utcnow()
+
+    # A SUCCESS journey is eligible only when a dependency flapped and recovered
+    # mid-flow: it has ERROR logs, but every one of them was followed by healthy
+    # activity from the same source. A CLEAN success (no errors at all) is
+    # therefore still ineligible and never clusters.
+    has_recovered_error = False
+    if completion.status is JourneyStatus.SUCCESS:
+        has_recovered_error = await _has_recovered_error(session, completion)
+
+    if not is_eligible_for_clustering(completion.status, has_recovered_error):
+        return None
+
+    result = await session.execute(
+        select(Journey.incident_id, Journey.suggested_failure_label)
+        .where(Journey.journey_id == completion.journey_id)
+    )
+    row = result.first()
+    if row is None or row[0] is not None:
+        return None  # journey row missing, or already clustered — no-op
+    suggested_label = row[1]
+
+    candidates = await _fetch_causal_candidates(session, completion.journey_id)
+    causal = pick_causal_line(candidates)
+    if causal is None:
+        return None  # no WARN/ERROR alert at all — nothing to anchor on
+    if completion.status is JourneyStatus.TIMED_OUT and causal.level != "ERROR":
+        return None  # TIMED_OUT needs a real ERROR (Eligibility, above)
+
+    # Subtype from the journey's OWN classification — recognized only when
+    # FAILED with a NAMED subtype. UNRECOGNIZED_FAILURE is a real FAILED
+    # status but not a specific cause, so it's normalized to None — otherwise
+    # every unrelated unrecognized failure from the same service would
+    # hash-merge by service name alone, losing the cosine path's
+    # message-content precision. A RECOVERED journey is the one case where the
+    # subtype is not the outcome; see incident_subtype_for.
+    failure_subtype = incident_subtype_for(
+        completion.status, completion.outcome, has_recovered_error
+    )
+    signature = build_signature(
+        failure_subtype, causal.logger, causal.app_name, causal.message
+    )
+    infra_class = classify_infra_or_order_specific(failure_subtype, causal.message)
+
+    incident = await assign_incident(
+        session, signature=signature, infra_class=infra_class, causal=causal, now=now,
+        suggested_label=suggested_label,
+    )
+    # A freshly created incident starts at alert_count=0 (see assign_incident);
+    # a matched existing one is already >0. Capture this BEFORE the bump below,
+    # since that's the only way to tell "created" from "joined" apart afterward.
+    is_new = incident.alert_count == 0
+
+    result = await session.execute(
+        select(Alert).where(Alert.journey_id == completion.journey_id)
+    )
+    journey_alerts = result.scalars().all()
+    for alert in journey_alerts:
+        alert.incident_id = incident.incident_id
+    incident.alert_count += len(journey_alerts)
+    incident.journey_count += 1
+    incident.last_ts = now
+
+    await session.execute(
+        update(Journey)
+        .where(Journey.journey_id == completion.journey_id)
+        .values(incident_id=incident.incident_id)
+    )
+    await session.commit()
+
+    if on_event is not None:
+        if is_new:
+            await on_event(_incident_new_event(incident))
+        else:
+            await on_event(_incident_updated_event(incident))
+    return incident
+
+
+# --- lifecycle: retry journeys whose completion outran their alerts (DB) --------
+
+
+async def retry_unclustered_completions(session, now: datetime | None = None, on_event=None) -> list:
+    """Re-attempt clustering for terminal journeys still missing an incident.
+
+    ``process_completion`` runs exactly once, synchronously, the instant
+    ``backend/journeys.py`` detects a journey's completion via ``raw.events`` —
+    a path that never waits on the LLM. A journey's own alerts, by contrast,
+    only land in ``alerts`` after ``processed.alerts`` — which DOES wait on the
+    LLM (or the breaker's fallback) and is bounded by ``ALERT_CONCURRENCY``.
+    Under load, raw-event completion detection routinely outruns alert
+    persistence, so ``process_completion``'s one shot can find zero causal
+    candidates and permanently skip the journey (discovered via live testing,
+    not by the unit tests, which always hand-fed already-linked alerts).
+
+    This is the catch-up: on the same periodic cadence as the other sweeps,
+    find every completed journey with no ``incident_id`` yet and call
+    ``process_completion`` again. Safe to call repeatedly —
+    ``process_completion`` re-checks ``Journey.incident_id`` itself, and a
+    journey that still has no causal alert simply no-ops again until a later
+    sweep catches it.
+
+    ``SUCCESS`` is in the candidate set alongside ``FAILED``/``TIMED_OUT``
+    because a RECOVERED journey (scenario 18) clusters as ``TRANSIENT_FAILURE``
+    and is just as vulnerable to completion outrunning its alerts. The vast
+    majority of those rows are clean successes, which ``process_completion``
+    rejects immediately via :func:`_has_recovered_error` — a cheap no-op, and
+    the honest place for the check, since only it can see whether the errors
+    recovered.
+    """
+    from sqlalchemy import select
+    from backend.db import Journey
+    from backend.journeys import Completion, JourneyStatus
+    from backend.stitching import StitchedJourney
+
+    result = await session.execute(
+        select(Journey).where(
+            Journey.status.in_([
+                JourneyStatus.FAILED.value,
+                JourneyStatus.TIMED_OUT.value,
+                JourneyStatus.SUCCESS.value,
+            ]),
+            Journey.incident_id.is_(None),
+        )
+    )
+    journeys = result.scalars().all()
+
+    incidents = []
+    for journey in journeys:
+        completion = Completion(
+            journey_id=journey.journey_id,
+            journey=StitchedJourney(
+                journey_id=journey.journey_id,
+                event_id=journey.event_id,
+                order_id=journey.order_id,
+                cart_header_id=journey.cart_header_id,
+            ),
+            status=JourneyStatus(journey.status),
+            outcome=journey.outcome,
+        )
+        incident = await process_completion(session, completion, now=now, on_event=on_event)
+        if incident is not None:
+            incidents.append(incident)
+    return incidents

@@ -1,5 +1,7 @@
+import { useEffect, useState } from "react";
+import { Button } from "@computacenter-ro/style-guide/components";
 import { badgeColors } from "@computacenter-ro/style-guide/tokens";
-import { formatTime } from "@/lib/format";
+import { formatTime, formatTimestampFull } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { Journey, LogLevel, ProcessedAlert } from "@/lib/types";
 
@@ -15,12 +17,27 @@ const DOT_COLOR: Record<LogLevel, string> = {
   ERROR: "var(--cc-united-red)",
 };
 
+// How many events (newest first) are shown before "Load more" is needed.
+const PAGE_SIZE = 12;
+
 export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
   const events = [...(journey.events ?? [])].reverse();
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+
+  // Back to the first page when the timeline switches to a different journey
+  // — the component isn't remounted, so local pagination state would
+  // otherwise carry over from the previous journey.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setVisibleCount(PAGE_SIZE);
+  }, [journey.journey_id]);
+
+  const visibleEvents = events.slice(0, visibleCount);
+  const hasMore = events.length > visibleCount;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-      {events.map((event) => {
+      {visibleEvents.map((event) => {
         const alert = alerts.find((a) => a.log_id === event.raw.log_id);
         const tone = alert ? (alert.source === "ai" ? badgeColors.other : badgeColors.inactive) : null;
 
@@ -39,7 +56,7 @@ export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: "12px", color: "var(--cc-grey-three)", display: "flex", gap: "8px" }}>
                 <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{event.raw.app_name}</span>
-                <span>{formatTime(event.ts)}</span>
+                <span title={formatTimestampFull(event.ts)}>{formatTime(event.ts)}</span>
               </div>
               <div
                 style={{
@@ -70,6 +87,16 @@ export function JourneyTimeline({ journey, alerts }: JourneyTimelineProps) {
           </div>
         );
       })}
+      {hasMore && (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: "8px" }}>
+          <Button
+            variant="secondary"
+            onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}
+          >
+            Load More
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

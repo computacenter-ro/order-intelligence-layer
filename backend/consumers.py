@@ -5,7 +5,7 @@ Two idempotent consumers for the AI service's durable output queues:
 * ``processed.alerts`` — one ``ProcessedAlert`` per non-suppressed WARN/ERROR
   (AI-explained or a fallback pass-through). Each is persisted as an ``Alert``
   row (the original ``LogLine`` fields + ``explanation`` / ``department`` /
-  ``confidence`` / ``source``; the enrichment columns are null for
+  ``severity`` / ``source``; the enrichment columns are null for
   ``source="fallback"``).
 * ``raw.events`` — every deduped log line. Each is handed to the
   :class:`~backend.journeys.JourneyAssembler` for incremental journey assembly.
@@ -40,6 +40,7 @@ import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractIncomingMessage
 
 from shared.models import LogLine, ProcessedAlert
+from backend.incidents import process_completion, retry_unclustered_completions
 from backend.journeys import JourneyAssembler, OnEvent
 
 # --- Config (env-driven, matching ai_service/settings.py conventions) --------
@@ -61,7 +62,7 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
     """Flatten a ``ProcessedAlert`` into the ``alerts`` table's columns.
 
     The full original log line's fields are hoisted onto the row; the AI
-    enrichment columns (``explanation`` / ``department`` / ``confidence``) are
+    enrichment columns (``explanation`` / ``department`` / ``severity``) are
     ``None`` for a fallback pass-through. ``journey_id`` is intentionally left
     unset — an alert may arrive before its journey is assembled from
     ``raw.events`` (CLAUDE.md: the FK is nullable and fills in later).
@@ -81,8 +82,16 @@ def alert_row_values(alert: ProcessedAlert) -> dict:
         "account_number": log.accountNumber,
         "explanation": alert.explanation,
         "department": alert.department.value if alert.department is not None else None,
-        "confidence": alert.confidence,
+        "severity": alert.severity.value if alert.severity is not None else None,
         "source": alert.source,
+        # Semantic-cache hit: the explanation/department were reused rather than
+        # recomputed. Kept distinct from ``source`` on purpose — a hit is still
+        # source="ai", so Teams routing is unchanged and only this flag differs.
+        "cached": alert.cached,
+        # backend/incidents.py's novel/embedding clustering path compares this
+        # across alerts (_find_open_incident_by_cosine) — without it, every
+        # unrecognized failure would silently fail to cluster with any other.
+        "embedding": alert.embedding,
     }
 
 
@@ -223,12 +232,18 @@ class AlertsConsumer(_QueueConsumer):
             .values(**alert_row_values(alert))
             .on_conflict_do_nothing()  # dedup on unique alert_id / log_id
         )
+        updated_incident = None
         async with self._factory()() as session:
             result = await session.execute(stmt)
             # Link to its journey if one already exists (else it stays null and
             # the raw consumer back-fills it once the journey is assembled).
+            # If that journey already has an incident, link_alert also backfills
+            # this alert's incident_id and returns the bumped Incident row — a
+            # late-arriving alert on an already-clustered journey would
+            # otherwise sit forever with incident_id=NULL, invisible to that
+            # incident's view (live-testing discovery).
             if result.rowcount != 0:
-                await link_alert(session, alert)
+                updated_incident = await link_alert(session, alert)
             await session.commit()
 
         # Broadcast only a genuinely new alert: a redelivered duplicate inserts
@@ -236,6 +251,37 @@ class AlertsConsumer(_QueueConsumer):
         # at-least-once delivery idempotent end-to-end.
         if self._on_event is not None and result.rowcount != 0:
             await self._on_event(_alert_new_event(alert))
+
+        # Same idempotency guard as above, but keyed on whether an incident
+        # actually got bumped — broadcast AFTER commit, never before.
+        if self._on_event is not None and updated_incident is not None:
+            from backend.incidents import _incident_updated_event
+
+            await self._on_event(_incident_updated_event(updated_incident))
+
+        # Feed the retrieval index. Gated on the same rowcount as the broadcast so
+        # a redelivered duplicate does no extra work (the index upserts by id, so
+        # a re-push would be harmless — just wasted). AFTER the commit and outside
+        # the session: search being stale is never a reason to fail persistence.
+        if result.rowcount != 0:
+            await _index_alert_safely(alert)
+
+
+async def _index_alert_safely(alert: ProcessedAlert) -> None:
+    """Push an alert to the retrieval index, swallowing everything.
+
+    ``rag_client.push`` already catches its own I/O failures; this second layer
+    covers anything it cannot — an import error, a malformed alert, a bug in the
+    text builders. The alert is already committed by the time we get here, so an
+    exception escaping would nack a message whose row is durably written and
+    trigger a pointless redelivery. Belt and braces on a best-effort side channel.
+    """
+    try:
+        from backend.rag_client import index_alert
+
+        await index_alert(alert)
+    except Exception as exc:  # noqa: BLE001 — indexing must never break consumption
+        print(f"[alerts] retrieval indexing skipped: {type(exc).__name__}: {exc}", flush=True)
 
 
 # --- raw.events --------------------------------------------------------------
@@ -265,7 +311,12 @@ class RawEventsConsumer(_QueueConsumer):
         # journeys, and commits — so raw-event consumption is idempotent too. It
         # also emits journey.updated / journey.completed via on_event (if set).
         async with self._factory()() as session:
-            await self._assembler.ingest(session, [log], on_event=self._on_event)
+            completions = await self._assembler.ingest(session, [log], on_event=self._on_event)
+            for completion in completions:
+                try:
+                    await process_completion(session, completion, on_event=self._on_event)
+                except Exception as exc:  # noqa: BLE001 — a clustering blip must not drop this log/journey completion
+                    print(f"[incident-clustering] ERROR (continuing): {exc}", flush=True)
 
 
 # --- run both ----------------------------------------------------------------
@@ -281,7 +332,9 @@ async def _sweep_stalled_loop(
     fills that gap: every ``STALLED_SWEEP_INTERVAL`` seconds it opens a session
     and runs ``assembler.sweep_stalled`` on the **same** assembler instance the
     raw consumer uses, so the in-memory journeys are visible. Finalized journeys
-    are broadcast as ``journey.completed`` via ``on_event`` (if set).
+    are broadcast as ``journey.completed`` via ``on_event`` (if set), and handed
+    to ``backend.incidents.process_completion`` (a TIMED_OUT journey with a real
+    linked ERROR alert is incident-eligible via the novel path).
     """
     import asyncio
 
@@ -292,12 +345,50 @@ async def _sweep_stalled_loop(
             await asyncio.sleep(STALLED_SWEEP_INTERVAL)
             try:
                 async with SessionLocal() as session:
-                    await assembler.sweep_stalled(session, on_event=on_event)
+                    completions = await assembler.sweep_stalled(session, on_event=on_event)
+                    for completion in completions:
+                        await process_completion(session, completion, on_event=on_event)
             except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
                 print(f"[stalled-sweep] ERROR (continuing): {exc}", flush=True)
     except asyncio.CancelledError:
         # Clean shutdown: stop looping, let the cancellation propagate.
         print("[stalled-sweep] cancelled — stopping", flush=True)
+        raise
+
+
+async def _retry_unclustered_incidents_loop(on_event: OnEvent | None = None) -> None:
+    """Periodically retry clustering for any terminal journey still missing an
+    incident (a journey's completion, detected via raw.events, can be
+    persisted before its own alerts — bound by the LLM and ALERT_CONCURRENCY
+    via processed.alerts — exist yet; see
+    backend.incidents.retry_unclustered_completions). Runs on the same
+    cadence as the stalled-journey sweep.
+
+    Incidents are closed ONLY via the manual REST resolve endpoint
+    (``PATCH /incidents/{id}/resolve``) — there is deliberately no automatic
+    closing mechanism; an incident stays open until a person resolves it.
+
+    ``on_event`` is threaded into the retry path so a newly-created incident
+    that only clustered on this catch-up pass still gets its ``incident.new``
+    push — the retry exists precisely because the first (synchronous) attempt
+    can miss, and a live incident that never appears on screen because it
+    happened to cluster one sweep late would defeat the point of pushing it
+    live at all.
+    """
+    import asyncio
+
+    from backend.db import SessionLocal
+
+    try:
+        while True:
+            await asyncio.sleep(STALLED_SWEEP_INTERVAL)
+            try:
+                async with SessionLocal() as session:
+                    await retry_unclustered_completions(session, on_event=on_event)
+            except Exception as exc:  # noqa: BLE001 — a sweep blip must not kill the task
+                print(f"[incident-sweep] ERROR (continuing): {exc}", flush=True)
+    except asyncio.CancelledError:
+        print("[incident-sweep] cancelled — stopping", flush=True)
         raise
 
 
@@ -324,9 +415,10 @@ async def run_consumers(
     # is wired to fetch each completed journey's summary from the AI service;
     # an injected assembler (tests) is used as-is.
     if assembler is None:
+        from backend.rag_client import index_journey
         from backend.summarizer import fetch_summary
 
-        assembler = JourneyAssembler(summarizer=fetch_summary)
+        assembler = JourneyAssembler(summarizer=fetch_summary, indexer=index_journey)
 
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     async with connection:
@@ -340,6 +432,7 @@ async def run_consumers(
             alerts.run(),
             raw.run(),
             _sweep_stalled_loop(assembler, on_event=on_event),
+            _retry_unclustered_incidents_loop(on_event=on_event),
         )
 
 

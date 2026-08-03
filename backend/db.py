@@ -23,10 +23,14 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
+import sqlalchemy as sa
 from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
     DateTime,
-    Float,
     ForeignKey,
+    Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -52,7 +56,64 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://oil:oil@localhost:5432/oil",
 )
 
-engine: AsyncEngine = create_async_engine(DATABASE_URL, future=True)
+# TLS to a managed Postgres (Azure Database for PostgreSQL requires it).
+#
+# ``DB_SSL`` values mirror libpq's sslmode vocabulary; anything other than the
+# default "" / "disable" / "prefer" turns TLS on. Unset => no SSL, so local
+# docker-compose is untouched.
+DB_SSL = os.getenv("DB_SSL", "").strip().lower()
+_SSL_OFF = ("", "disable", "prefer", "allow", "false", "0")
+
+
+def _engine_kwargs(url: str, db_ssl: str):
+    """Return the (url, kwargs) to build the async engine with.
+
+    The URL is returned as a SQLAlchemy ``URL`` object, NOT a string:
+    ``str(URL)`` renders the password as ``***`` (deliberate, so URLs are safe to
+    log), so stringifying here would hand the engine a literal ``***`` password
+    and every connection would fail authentication. ``create_async_engine``
+    accepts the object directly.
+
+    Two separate problems, both specific to the **asyncpg** driver:
+
+    1. ``?sslmode=require`` in the URL is a TRAP. SQLAlchemy's asyncpg dialect
+       forwards unknown query params straight to ``asyncpg.connect()``, and
+       asyncpg has no ``sslmode`` parameter (only ``ssl``) — so the URL Azure
+       hands you in its connection-string blade raises
+       ``TypeError: connect() got an unexpected keyword argument 'sslmode'`` on
+       the FIRST connection, long after startup looked fine. psycopg2 accepts
+       ``sslmode``, which is why this is easy to copy across and be surprised by.
+       So a ``sslmode`` param is translated to asyncpg's ``ssl`` here.
+
+    2. ``DB_SSL=require`` enables TLS without touching the URL at all, for
+       deployments that inject a plain URL and configure TLS separately.
+
+    An explicit ``ssl=`` already in the URL is left alone — it is already the
+    form asyncpg wants, and the caller clearly meant it.
+    """
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(url)
+    query = dict(parsed.query)
+
+    # (1) sslmode -> ssl, only for asyncpg (psycopg2 handles sslmode natively).
+    is_asyncpg = parsed.get_driver_name() == "asyncpg"
+    sslmode = query.pop("sslmode", None) if is_asyncpg else None
+    if sslmode is not None and "ssl" not in query:
+        # libpq's "verify-ca"/"verify-full" have no direct asyncpg string form;
+        # "require" is the closest safe equivalent (encrypt, and asyncpg still
+        # verifies against the system trust store).
+        query["ssl"] = "require" if sslmode in ("verify-ca", "verify-full") else sslmode
+
+    # (2) the env flag, when the URL says nothing about TLS.
+    if is_asyncpg and db_ssl not in _SSL_OFF and "ssl" not in query:
+        query["ssl"] = db_ssl
+
+    return parsed.set(query=query), {"future": True}
+
+
+_url, _kwargs = _engine_kwargs(DATABASE_URL, DB_SSL)
+engine: AsyncEngine = create_async_engine(_url, **_kwargs)
 
 SessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
     bind=engine,
@@ -103,6 +164,20 @@ class Journey(Base):
 
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Set only for a FAILED journey whose outcome is UNRECOGNIZED_FAILURE
+    # (backend/journeys.py) — an LLM-suggested short phrase for the incident
+    # title, persisted by backend/journeys.py's _finalize_journey and read by
+    # backend/incidents.py's process_completion. Null for every other outcome,
+    # and null when the AI service had nothing to suggest (LLM down, etc.).
+    suggested_failure_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Set by backend/incidents.py on journey completion; null until then, and
+    # for a journey that never forms/joins an incident (SUCCESS journeys, or a
+    # TIMED_OUT journey with no linked ERROR alert).
+    incident_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incidents.incident_id"), nullable=True, index=True
+    )
+
     events: Mapped[list["JourneyEvent"]] = relationship(
         back_populates="journey",
         cascade="all, delete-orphan",
@@ -114,7 +189,7 @@ class Alert(Base):
     """A processed WARN/ERROR alert (``processed.alerts`` payload persisted).
 
     ``source`` is ``"ai"`` or ``"fallback"``; for fallback pass-throughs
-    ``explanation`` / ``department`` / ``confidence`` are null.
+    ``explanation`` / ``department`` / ``severity`` are null.
     """
 
     __tablename__ = "alerts"
@@ -142,12 +217,42 @@ class Alert(Base):
     # AI enrichment — null for source="fallback".
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     department: Mapped[str | None] = mapped_column(String, nullable=True)
-    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    severity: Mapped[str | None] = mapped_column(String, nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Semantic-cache provenance: True when the AI service reused a stored answer
+    # instead of calling the LLM. A MODIFIER on source="ai" (a hit is still an AI
+    # answer), never an alternative to it — Teams routing keys off source alone.
+    # Non-null with a false default, mirroring ProcessedAlert.cached.
+    # ``default`` (Python-side) as well as ``server_default`` (DDL): the server
+    # default only applies on INSERT, so an Alert built in memory and serialized
+    # before any flush — exactly what the ``alert.new`` WebSocket envelope does —
+    # would otherwise read None and fail AlertOut's non-optional bool.
+    cached: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.false()
+    )
+
+    # The masked-message vector (ai_service/semcache.py's embed(), shipped on
+    # ProcessedAlert.embedding). None when no encoder was configured.
+    embedding: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # Nullable FK: the alert may precede its journey's incident-clustering
+    # decision (which only happens at journey completion).
+    incident_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incidents.incident_id"), nullable=True, index=True
+    )
 
     # Nullable FK: the alert may precede its assembled journey.
     journey_id: Mapped[str | None] = mapped_column(
         ForeignKey("journeys.journey_id"), nullable=True, index=True
+    )
+
+    # Manual triage — set by IT-support agents working the dashboard.
+    is_resolved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa.false()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     journey: Mapped["Journey | None"] = relationship(back_populates="alerts")
@@ -171,4 +276,85 @@ class JourneyEvent(Base):
 
     __table_args__ = (
         UniqueConstraint("log_id", name="uq_journey_events_log_id"),
+    )
+
+
+class Incident(Base):
+    """A cause-cluster of alerts (see repo-root incident-clustering-implementation-plan.md).
+
+    INFRA-classed incidents may span many journeys/orders (``journey_count``
+    grows as more orders hit the same failure); order-specific incidents
+    always have ``journey_count == 1`` and stay permanently scoped to the one
+    journey that created them this iteration — cross-order matching is never
+    attempted for them (see ``backend/incidents.py``).
+    """
+
+    __tablename__ = "incidents"
+
+    incident_id: Mapped[str] = mapped_column(String, primary_key=True)
+
+    # Exact-match key for the recognized/deterministic path; null for a novel
+    # (unrecognized) cause, which is matched by embedding cosine instead.
+    signature: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    failure_subtype: Mapped[str | None] = mapped_column(String, nullable=True)
+    failing_service: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Mined for display; NOT part of the signature hash (YAGNI — see this
+    # plan's Global Constraints).
+    error_token: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    department: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)  # "open" | "resolved"
+
+    first_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Set once at creation from the founding causal alert; NEVER reassigned —
+    # it's the novel path's cosine-comparison target (backend/incidents.py),
+    # not just a UI click-through.
+    primary_alert_id: Mapped[str | None] = mapped_column(
+        ForeignKey("alerts.alert_id"), nullable=True
+    )
+
+    alert_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    journey_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
+class ChatFeedback(Base):
+    """One thumbs up/down on one assistant answer.
+
+    Feedback is USER DATA, so unlike the retrieval index (in-memory + Redis,
+    rebuildable by ``backfill_rag``) it lives here, durably.
+
+    Keyed by ``answer_id`` — one row per answer, so voting again REPLACES rather
+    than stacks. Stored per ANSWER, never per cited record: a vote rates the reply
+    the agent read, and which sources deserve the credit is a derivation
+    (rank-weighted, see ``backend/feedback.py``). Storing it per record would bake
+    one attribution rule into the data and make it unchangeable later.
+
+    ``record_ids`` is ORDERED — position is the signal, since attribution weights
+    by citation rank.
+    """
+
+    __tablename__ = "chat_feedback"
+
+    answer_id: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    # +1 like / -1 dislike; a CHECK constraint keeps a stray 0 out of the ranking
+    # math, where it would silently skew every boost.
+    vote: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    record_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
+
+    # Context for later analysis; NOT used by the ranking math.
+    answer_mode: Mapped[str | None] = mapped_column(String, nullable=True)
+    scoped_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    scoped_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("vote IN (-1, 1)", name="ck_chat_feedback_vote"),
     )

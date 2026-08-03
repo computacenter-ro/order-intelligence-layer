@@ -32,6 +32,23 @@ from shared.models import Baton
 
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
+# Initial-connect retry (see _connect). Mirrors backend/main.py's
+# CONSUMERS_RETRY_DELAY: a consumer that cannot reach the broker has no reason to
+# be alive, so it waits rather than dying. Backoff grows to a cap so a long
+# broker outage doesn't spin the log.
+CONNECT_RETRY_DELAY = float(os.getenv("CONNECT_RETRY_DELAY", "2"))
+CONNECT_RETRY_MAX_DELAY = float(os.getenv("CONNECT_RETRY_MAX_DELAY", "30"))
+
+# Connect failures that retrying can NEVER fix, so _connect re-raises them at once
+# instead of looping forever on a config mistake (see _connect).
+# BOTH classes are listed deliberately: bad credentials actually raise
+# ``ProbableAuthenticationError``, and it is NOT a subclass of
+# ``AuthenticationError`` — catching either one alone would miss the other.
+PERMANENT_CONNECT_ERRORS = (
+    aio_pika.exceptions.AuthenticationError,
+    aio_pika.exceptions.ProbableAuthenticationError,
+)
+
 # The registry lives in ``pipeline.services.registry`` (a single module object) so
 # that blocks register into the same ``BLOCKS`` the dispatch loop reads, regardless
 # of the ``python -m`` double-import of this module. ``register`` is re-exported so
@@ -143,11 +160,64 @@ def _load_blocks(service_name: str) -> None:
     )
 
 
+async def _connect(service_name: str):
+    """Connect to the broker, retrying until it answers.
+
+    ``aio_pika.connect_robust`` only re-establishes a connection that was already
+    open and then dropped — it does NOT retry the *initial* connect. So a broker
+    that is not yet accepting AMQP connections at startup raises here. That is the
+    docker-compose boot race: ``depends_on: condition: service_healthy`` fires on
+    RabbitMQ's diagnostics ping, a beat before the 5672 listener accepts, and the
+    window is hit on essentially every cold start.
+
+    Without this loop that first failure killed the service task for the life of
+    the process. Worse, it was non-deterministic: if the *other* services' tasks
+    happened to stay in their own retry loops they kept the event loop alive, so
+    the process neither served nor exited — a container that looks healthy to
+    Docker while consuming nothing, which no restart policy can recover.
+
+    Retries indefinitely and by design: a baton consumer that cannot reach the
+    broker has no useful work to do, so waiting beats dying. This mirrors
+    ``backend/main.py::_run_consumers_guarded``, which already solved exactly this
+    for the backend's consumers.
+
+    **Only TRANSIENT failures are retried.** An authentication rejection is
+    permanent — the broker answered and said no, so waiting cannot help. Retrying
+    it would replace one silent failure with another: a mistyped credential would
+    leave a container that Docker reports healthy, consuming nothing, forever.
+    Those raise immediately with the broker's own message instead.
+    """
+    delay = CONNECT_RETRY_DELAY
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await aio_pika.connect_robust(RABBITMQ_URL)
+        except asyncio.CancelledError:
+            raise  # shutdown: propagate cleanly, never swallow
+        except PERMANENT_CONNECT_ERRORS as exc:
+            # Bad credentials: fail loudly and at once. Note the message says
+            # nothing about reachability — the broker WAS reachable.
+            print(
+                f"[{service_name}] FATAL: broker rejected authentication: {exc}",
+                flush=True,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 — any other connect failure is retryable
+            print(
+                f"[{service_name}] broker unreachable (attempt {attempt}): {exc} - "
+                f"retrying in {delay:.0f}s",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, CONNECT_RETRY_MAX_DELAY)
+
+
 async def run_service(service_name: str) -> None:
     """Declare and consume ``sim.step.<service_name>``, dispatching each baton."""
     _load_blocks(service_name)
     queue_name = _queue_name(service_name)
-    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    connection = await _connect(service_name)
     async with connection, LogClient() as log_client:
         # The runner owns one LogClient for the whole service lifetime; every
         # block emits through log_client.emit (connection reuse across lines).

@@ -16,8 +16,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install deps first so the layer caches across code-only changes.
-COPY requirements.txt .
+COPY requirements.txt requirements-ml.txt ./
 RUN pip install --no-cache-dir --default-timeout=120 --retries 10 -r requirements.txt
+# Semantic-cache ML deps (CPU-only torch from PyTorch's wheel index). Kept in a
+# separate layer/file so a code-only change doesn't re-pull ~200 MB, and so a
+# build that doesn't need the cache can drop this one line.
+RUN pip install --no-cache-dir --default-timeout=180 --retries 10 \
+    -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Then the source (everything not excluded by .dockerignore).
 COPY . .

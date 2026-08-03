@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -23,10 +25,11 @@ from langchain_core.messages import AIMessage
 from ai_service import settings
 from ai_service.breaker import CLOSED, HALF_OPEN, OPEN, CircuitBreaker
 from ai_service.graph import PipelineDeps, process
+from ai_service import llm
 from ai_service.llm import LLMError
 from ai_service.nodes import route
 from ai_service.publisher import Publisher
-from shared.models import Department, LogLine, ProcessedAlert
+from shared.models import Department, LogLine, ProcessedAlert, Severity
 
 
 # Manual wide/live test of the whole top-of-stack (real infra, LLM in fallback),
@@ -250,7 +253,7 @@ def _healthy_deps() -> PipelineDeps:
     return PipelineDeps(
         breaker=_breaker(FakeRedis(), FakeClock()),
         explainer=_fake("SPT pricing service was unreachable; the order engine could not price the order."),
-        router=_fake('{"department": "backend", "confidence": 0.82}'),
+        router=_fake('{"department": "backend", "severity": "high"}'),
     )
 
 
@@ -260,7 +263,7 @@ async def test_pipeline_ai_alert_on_healthy_llm():
     assert alert.source == "ai"
     assert alert.explanation and "SPT" in alert.explanation
     assert alert.department == Department.backend
-    assert alert.confidence == 0.82
+    assert alert.severity == Severity.high
     assert alert.log.log_id == "log-1"
     assert alert.emitted_at.tzinfo is not None  # tz-aware UTC
 
@@ -277,26 +280,235 @@ async def test_router_rejects_unknown_department():
     import pytest
 
     with pytest.raises(LLMError):
-        await route(_log(), "explained", _fake('{"department": "frontend", "confidence": 0.9}'))
+        await route(
+            _log(), "explained",
+            _fake('{"department": "frontend", "severity": "high"}'),
+        )
 
 
 async def test_router_accepts_all_five_departments():
     for dept in Department:
-        d, c = await route(_log(), "x", _fake(f'{{"department": "{dept.value}", "confidence": 0.5}}'))
+        d, s = await route(
+            _log(), "x",
+            _fake(f'{{"department": "{dept.value}", "severity": "medium"}}'),
+        )
         assert d == dept
 
 
-async def test_router_tolerates_code_fence_and_prose():
-    d, c = await route(
-        _log(), "x",
-        _fake('Here you go:\n```json\n{"department": "database", "confidence": 0.7}\n```'),
+def test_route_prompt_defines_every_department():
+    """The ALLOWED list is generated from the enum; the definitions are not.
+
+    Adding a Department therefore updates the prompt's list automatically and
+    silently leaves it undefined — the model would then have to guess what the new
+    label means, which is exactly the failure the guide exists to prevent. Fail
+    here so the two stay in sync.
+    """
+    from ai_service.nodes import _DEPARTMENT_GUIDE
+
+    missing = [d.value for d in Department if f"- {d.value}:" not in _DEPARTMENT_GUIDE]
+    assert not missing, f"departments missing a prompt definition: {missing}"
+
+
+def test_route_prompt_draws_the_backend_vs_general_line():
+    # The misroute this prompt fixes: business-rule rejections landing on backend.
+    # Assert the two load-bearing instructions survive future edits.
+    from ai_service.nodes import _ROUTE_SYSTEM
+
+    assert "NOT an engineering fault" in _ROUTE_SYSTEM
+    assert "Reserve backend for an actual defect." in _ROUTE_SYSTEM
+
+
+def test_route_prompt_examples_are_valid_enum_values():
+    """Few-shot answers must be routable — a typo'd example teaches an LLMError."""
+    import json
+    import re
+
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    payloads = re.findall(r'\{"department".*?\}', _ROUTE_EXAMPLES)
+    assert len(payloads) >= 6, f"expected the full example set, found {len(payloads)}"
+    for raw in payloads:
+        obj = json.loads(raw)
+        Department(obj["department"])  # raises if not a real department
+        Severity(obj["severity"])
+        # The router is asked for department + severity ONLY — an example that
+        # still showed a confidence would teach a field the parser now ignores.
+        assert set(obj) == {"department", "severity"}, f"unexpected keys in {raw}"
+
+
+def test_route_prompt_examples_cover_general_and_technical_routes():
+    # Paired by design: general-only examples would bias the model toward general.
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    for dept in ("general", "networking", "database", "devops"):
+        assert f'"department": "{dept}"' in _ROUTE_EXAMPLES
+
+
+# The few-shot examples are only worth anything if they look like what the
+# emitters actually produce. v7 is captured from the emitters, so it is the
+# oracle: an example whose shape has drifted out of the corpus is teaching the
+# model a line the pipeline no longer emits, and it drifts SILENTLY — nothing
+# else in the suite reads the prompt against the fixture. Two real staleness bugs
+# motivated this: a DLQ example still naming "order.inbound.dlq" (renamed to
+# "<queue>_error" by the realignment) and a creation-failure example inventing a
+# fused "DB_TIMEOUT — no order was created" line no emitter ever wrote.
+_FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v8.json"
+
+
+def _alertable_messages() -> list[str]:
+    """Every WARN/ERROR message in the captured corpus.
+
+    The fixture is a list of flow objects, each holding its lines under ``events``.
+    """
+    flows = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    return [
+        log["message"]
+        for flow in flows
+        for log in flow.get("events", [])
+        if log.get("level") in ("WARN", "ERROR")
+    ]
+
+
+def _mask_ids(text: str) -> str:
+    """Mask the volatile values so an example matches the corpus by SHAPE.
+
+    The three id shapes the stitcher mines and semcache normalizes — the examples
+    carry their own illustrative ids (ORD-6042, evt-1a2b), which will never equal
+    a captured one.
+
+    Plus two values the EMITTERS randomize per run: the computed margin
+    percentage (checker.py) and Feign call latencies. They are not ids, so
+    semcache deliberately leaves them alone, but here they would make an example
+    match only the one capture it was copied from — which is why re-capturing the
+    fixture used to "break" a prompt that had not changed. The threshold is NOT
+    masked: it is fixed, and it is the part of the sentence that carries meaning.
+    """
+    for pattern, token in (
+        (r"evt-[0-9a-f-]{8,}", "<EVT>"),
+        (r"\bORD-\d+\b", "<ORD>"),
+        (r"\b\d{19}\b", "<CART>"),
+        (r"\b\d{8}\b", "<ACC>"),
+        (r"margin \d+\.\d+%", "margin <PCT>%"),
+        (r"\(\d+ms\)", "(<MS>)"),
+    ):
+        text = re.sub(pattern, token, text)
+    return text
+
+
+@pytest.mark.skipif(not _FIXTURE.exists(), reason="mock-order-flows-v8.json not captured")
+def test_route_prompt_examples_match_the_fixture_corpus():
+    """Every `message=` in the few-shot must exist in the fixture, up to volatile values.
+
+    Failing here means either the prompt drifted or an emitter's message changed —
+    both need a human, because the examples are what steer the routing.
+    """
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    corpus = {_mask_ids(m) for m in _alertable_messages()}
+    assert corpus, "fixture produced no WARN/ERROR logs"
+
+    # Each example line is `message=<text> -> {json}`; take the text between them.
+    examples = re.findall(r"message=(.*?) -> \{", _ROUTE_EXAMPLES, re.DOTALL)
+    assert len(examples) >= 10, f"expected the full example set, found {len(examples)}"
+
+    stale = [ex for ex in examples if _mask_ids(ex.strip()) not in corpus]
+    assert not stale, (
+        "few-shot examples no longer match any message the emitters produce "
+        f"(update them from {_FIXTURE.name}): {stale}"
     )
-    assert d == Department.database and c == 0.7
 
 
-async def test_router_clamps_out_of_range_confidence():
-    d, c = await route(_log(), "x", _fake('{"department": "devops", "confidence": 5}'))
-    assert c == 1.0
+@pytest.mark.skipif(not _FIXTURE.exists(), reason="mock-order-flows-v8.json not captured")
+def test_route_prompt_covers_the_corpus_frequent_alert_types():
+    """The recurring alert types must each be represented in the few-shot.
+
+    Not every type needs an example — the prompt's fallback rule handles novel
+    logs (the Settings anomalies deliberately have none). But a type that recurs
+    and is genuinely ambiguous should be pinned, or a prompt edit can quietly drop
+    the one example holding a whole class in the right department.
+    """
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    # Distinctive fragments of the classes most often misrouted, and why.
+    required = {
+        "margin": "below threshold",              # business rejection, not a defect
+        "udf": "mandatory UDF",                   # user data, not a defect
+        "sku": "No internal SKU mapping",         # reference data, not a defect
+        "jam-403": "HTTP/1.1 403",                # authorization, not networking
+        "spt-timeout": "SocketTimeoutException",  # transport fault
+        "sap-rfc": "RFC_COMMUNICATION_FAILURE",   # transport, not integration logic
+        "db": "SQLTimeoutException",              # persistence
+        "dlq-init": "order.init_error",           # queue plumbing
+        "dlq-sap": "order.create.sap_error",      # queue plumbing
+        "retry": "(attempt 2/3)",                 # in-flight retry -> low severity
+    }
+    missing = [name for name, frag in required.items() if frag not in _ROUTE_EXAMPLES]
+    assert not missing, f"few-shot lost coverage of: {missing}"
+
+
+def test_route_prompt_states_the_severity_ladder():
+    """Retry WARNs must not inherit the abort's severity.
+
+    A single SPT outage emits two retry WARNs and an abort ERROR as three separate
+    alerts; without the ladder they all rate high and one fault reads as three
+    criticals in the feed.
+    """
+    from ai_service.nodes import _ROUTE_SYSTEM
+
+    assert "Severity ladder" in _ROUTE_SYSTEM
+    assert "retry still in flight" in _ROUTE_SYSTEM
+
+
+def test_explain_prompt_grounds_business_rejections():
+    """The explainer must agree with the router about what a rejection is.
+
+    The router sends margin/UDF/account rejections to `general` ("nobody changes
+    code"); an explainer calling the same log a system error puts a contradiction
+    on one alert card.
+    """
+    from ai_service.nodes import _EXPLAIN_SYSTEM
+
+    assert "correctly rejected" in _EXPLAIN_SYSTEM
+    assert "do not name services it does not mention" in _EXPLAIN_SYSTEM
+
+
+async def test_router_tolerates_code_fence_and_prose():
+    d, s = await route(
+        _log(), "x",
+        _fake('Here you go:\n```json\n{"department": "database", "severity": "low"}\n```'),
+    )
+    assert d == Department.database and s == Severity.low
+
+
+async def test_router_ignores_an_unrequested_confidence_key():
+    """The router is no longer asked for a confidence, but a model may still
+    volunteer one. That extra key must be IGNORED, not treated as bad output —
+    rejecting it would turn a perfectly good route into a fallback."""
+    d, s = await route(
+        _log(), "x",
+        _fake('{"department": "devops", "severity": "high", "confidence": 0.9}'),
+    )
+    assert d == Department.devops and s == Severity.high
+
+
+# --- severity: validated against the enum, threaded onto the alert -----------
+async def test_router_accepts_all_severities():
+    for sev in Severity:
+        d, s = await route(
+            _log(), "x",
+            _fake(f'{{"department": "backend", "severity": "{sev.value}"}}'),
+        )
+        assert s == sev
+
+
+async def test_router_rejects_unknown_severity():
+    import pytest
+
+    with pytest.raises(LLMError):
+        await route(
+            _log(), "x",
+            _fake('{"department": "backend", "severity": "apocalyptic"}'),
+        )
 
 
 # --- fallback paths: source="fallback", all null -----------------------------
@@ -304,7 +516,7 @@ def _assert_fallback(alert):
     assert alert.source == "fallback"
     assert alert.explanation is None
     assert alert.department is None
-    assert alert.confidence is None
+    assert alert.severity is None
 
 
 async def test_pipeline_fallback_when_no_models():
@@ -316,7 +528,7 @@ async def test_pipeline_fallback_when_breaker_open():
     b = _breaker(FakeRedis(), FakeClock())
     for _ in range(3):
         await b.record_failure()  # force open
-    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","confidence":0.5}'))
+    deps = PipelineDeps(breaker=b, explainer=_fake("expl"), router=_fake('{"department":"backend","severity":"low"}'))
     _assert_fallback(await process(_log(), deps))
 
 
@@ -324,7 +536,7 @@ async def test_pipeline_fallback_when_router_returns_bad_department():
     deps = PipelineDeps(
         breaker=_breaker(FakeRedis(), FakeClock()),
         explainer=_fake("a clear explanation"),
-        router=_fake('{"department": "nonsense", "confidence": 0.9}'),
+        router=_fake('{"department": "nonsense"}'),
     )
     # explainer succeeds but router output is invalid → clean fallback, no partial AI alert.
     _assert_fallback(await process(_log(), deps))
@@ -369,7 +581,7 @@ def _alert(source: str = "fallback") -> ProcessedAlert:
         log=_log(),
         explanation=None if source == "fallback" else "explained",
         department=None if source == "fallback" else Department.backend,
-        confidence=None if source == "fallback" else 0.7,
+        severity=None if source == "fallback" else Severity.high,
         source=source,
     )
 
@@ -403,6 +615,7 @@ async def test_publish_alert_routes_processedalertjson_to_processed_alerts():
     assert routing_key == "processed.alerts"
     payload = json.loads(body)
     assert payload["source"] == "ai" and payload["department"] == "backend"
+    assert payload["severity"] == "high"
     # the full original log travels inside the alert
     assert payload["log"]["log_id"] == "log-1"
 
@@ -577,6 +790,144 @@ async def test_log_missing_id_is_skipped():
     assert n == 0 and not pub.raw
 
 
+# --- watermark vs the collector's retention floor ----------------------------
+# The collector's store is IN-MEMORY; this watermark lives in Redis and persists.
+# So a collector restart (now that it has a restart policy) leaves the poller
+# asking for a window whose logs are gone. Silently draining empty windows makes
+# the affected journeys look like a correlation bug — they are swept as TIMED_OUT
+# with no failure logs. These tests pin the loud-and-skip-forward behaviour.
+
+def _ts(seconds: int) -> str:
+    """A collector-format timestamp ``seconds`` BEFORE now.
+
+    Relative to now, not a fixed date: ``window_from_watermark`` clamps a
+    watermark older than MAX_WINDOW_SPAN (120s) forward to ``to - 120s``, so a
+    fixed past date would never reach poll_once as written and these tests would
+    exercise the clamp instead of the retention check.
+    """
+    from datetime import timedelta
+
+    from ai_service.poller import _format_ts
+
+    return _format_ts(datetime.now(timezone.utc) - timedelta(seconds=seconds))
+
+
+def _poller_with_retention(
+    *, oldest: str | None, windows: dict[str, list[dict]] | None = None
+):
+    """A Poller whose /health reports ``oldest`` and whose fetch_logs is per-``from``.
+
+    ``windows`` maps a ``from`` value to the logs returned for it, so a test can
+    show an empty first read and a populated re-read after the skip.
+    """
+    redis = FakeRedis()
+    pub = FakePublisher()
+    deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+    poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
+
+    calls: list[str] = []
+
+    async def fetch_logs(from_iso, to_iso):
+        calls.append(from_iso)
+        return list((windows or {}).get(from_iso, []))
+
+    async def fetch_oldest():
+        return oldest
+
+    poller.fetch_logs = fetch_logs  # type: ignore[method-assign]
+    poller.fetch_oldest_timestamp = fetch_oldest  # type: ignore[method-assign]
+    return poller, pub, calls
+
+
+async def test_stale_watermark_is_skipped_forward_and_rereads(capsys):
+    """Watermark behind the retention floor → warn, then re-read from the floor."""
+    stale, floor = _ts(100), _ts(40)  # watermark 100s ago, floor only 40s ago
+    recovered = _raw_dict("ERROR", "boom", "L1")
+    poller, pub, calls = _poller_with_retention(
+        oldest=floor, windows={floor: [recovered]}
+    )
+    await poller._write_watermark(stale)
+
+    n = await poller.poll_once()
+
+    # Re-read from the retention floor, so the cycle still does useful work.
+    assert calls == [stale, floor]
+    assert n == 1 and [l.log_id for l in pub.raw] == ["L1"]
+    # And the loss is LOUD, not silent.
+    out = capsys.readouterr().out
+    assert "WARNING" in out and floor in out
+
+
+async def test_empty_window_within_retention_is_not_treated_as_loss(capsys):
+    """A genuinely quiet period must not warn or re-read."""
+    watermark, floor = _ts(30), _ts(100)  # floor is OLDER → nothing was lost
+    poller, pub, calls = _poller_with_retention(oldest=floor, windows={})
+    await poller._write_watermark(watermark)
+
+    n = await poller.poll_once()
+
+    assert n == 0
+    assert calls == [watermark]  # no second fetch
+    assert "WARNING" not in capsys.readouterr().out
+
+
+async def test_retention_check_is_skipped_when_the_window_had_logs():
+    """The healthy path must not pay for an extra /health request."""
+    # Bind once: _ts() is relative to now, so recomputing it would not match.
+    watermark = _ts(30)
+    poller, pub, calls = _poller_with_retention(
+        oldest=_ts(100), windows={watermark: [_raw_dict("INFO", "ok", "L1")]}
+    )
+    await poller._write_watermark(watermark)
+
+    checked = []
+
+    async def spy():
+        checked.append(True)
+        return _ts(100)
+
+    poller.fetch_oldest_timestamp = spy  # type: ignore[method-assign]
+
+    await poller.poll_once()
+    assert checked == []          # never consulted
+    assert calls == [watermark]
+
+
+async def test_cold_start_does_not_report_loss(capsys):
+    """No watermark yet → nothing can have been lost."""
+    poller, pub, calls = _poller_with_retention(oldest=_ts(50), windows={})
+    n = await poller.poll_once()   # no watermark written
+    assert n == 0
+    assert "WARNING" not in capsys.readouterr().out
+
+
+async def test_unavailable_retention_floor_degrades_silently(capsys):
+    """An older collector (no oldest_timestamp) must poll exactly as before."""
+    watermark = _ts(30)
+    poller, pub, calls = _poller_with_retention(oldest=None, windows={})
+    await poller._write_watermark(watermark)
+    n = await poller.poll_once()
+    assert n == 0
+    assert calls == [watermark]    # no skip attempted
+    assert "WARNING" not in capsys.readouterr().out
+
+
+async def test_fetch_oldest_timestamp_never_raises():
+    """It is a diagnostic: any transport/shape failure returns None."""
+    redis = FakeRedis()
+    deps = PipelineDeps(breaker=_breaker(redis, FakeClock()), explainer=None, router=None)
+    poller = Poller(
+        redis=redis, publisher=FakePublisher(), pipeline_deps=deps, http=object()
+    )
+
+    class Boom:
+        async def get(self, *a, **k):
+            raise RuntimeError("collector down")
+
+    poller._http = Boom()  # type: ignore[assignment]
+    assert await poller.fetch_oldest_timestamp() is None
+
+
 # --- alert content: fallback when LLM down -----------------------------------
 async def test_alert_is_fallback_when_llm_down():
     poller, pub = _make_poller([_raw_dict("ERROR", "boom", "L1")])  # explainer=None
@@ -720,7 +1071,7 @@ async def test_raw_events_published_before_alert_llm_runs():
     deps = PipelineDeps(
         breaker=_breaker(redis, FakeClock()),
         explainer=_BlockingModel(),
-        router=_fake('{"department": "backend", "confidence": 0.5}'),
+        router=_fake('{"department": "backend", "severity": "medium"}'),
     )
     poller = Poller(redis=redis, publisher=pub, pipeline_deps=deps, http=object())
     poller.fetch_logs = lambda f, t: _async(logs)  # type: ignore[method-assign]
@@ -797,6 +1148,104 @@ def test_summarize_journey_falls_back_to_template_when_no_model():
     assert "cc-spt-service" in body["summary"]  # the app_name from the logs
 
 
+def _summary_request_unrecognized() -> dict:
+    req = _summary_request()
+    req["outcome"] = "UNRECOGNIZED_FAILURE"
+    req["logs"] = [
+        _log(level="INFO", message="Get order by Order Number:ORD-6015").model_dump(mode="json"),
+        _log(level="ERROR", message="ConnectionPoolExhaustedError: settings cache unavailable").model_dump(mode="json"),
+    ]
+    return req
+
+
+def test_summarize_journey_returns_suggested_label_for_unrecognized_failure():
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake('{"summary": "The order stalled at settings enrichment.", '
+                    '"label": "Settings cache connection pool exhausted"}'),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["summary"] == "The order stalled at settings enrichment."
+    assert body["suggested_label"] == "Settings cache connection pool exhausted"
+
+
+def test_summarize_journey_no_label_for_recognized_outcomes():
+    # Every existing outcome (named subtypes, SUCCESS, plain TIMED_OUT) must
+    # never get a label, regardless of what the model would say — the branch
+    # only exists for UNRECOGNIZED_FAILURE.
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("Order ORD-6008 was created then failed at SPT enrichment."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request())  # outcome=ENRICHMENT_FAILED
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("suggested_label") is None
+    assert "SPT" in body["summary"]  # existing behavior, byte-for-byte unchanged
+
+
+def test_summarize_journey_label_falls_back_to_none_when_breaker_open():
+    api.configure(api.SummaryDeps(breaker=_breaker(FakeRedis(), FakeClock()), model=None))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "fallback"
+    assert body.get("suggested_label") is None
+    assert "UNRECOGNIZED_FAILURE" in body["summary"]  # existing template, unchanged
+
+
+def test_summarize_journey_degrades_gracefully_on_malformed_json_label_reply():
+    # The model ignores the JSON instruction and replies with plain prose —
+    # must still produce a usable summary, just no label. Never raises.
+    api.configure(api.SummaryDeps(
+        breaker=_breaker(FakeRedis(), FakeClock()),
+        model=_fake("The settings cache could not be reached."),
+    ))
+    client = TestClient(api.app)
+    resp = client.post("/summarize-journey", json=_summary_request_unrecognized())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "ai"
+    assert body["summary"] == "The settings cache could not be reached."
+    assert body.get("suggested_label") is None
+
+
+from ai_service.nodes import SummaryResult, _parse_summary_with_label  # noqa: E402
+
+
+def test_parse_summary_with_label_happy_path():
+    result = _parse_summary_with_label(
+        '{"summary": "Settings cache was unreachable.", "label": "Settings cache down"}'
+    )
+    assert result == SummaryResult(summary="Settings cache was unreachable.", suggested_label="Settings cache down")
+
+
+def test_parse_summary_with_label_tolerates_surrounding_prose():
+    result = _parse_summary_with_label(
+        'Sure, here you go:\n{"summary": "It failed.", "label": "X"}\nHope that helps!'
+    )
+    assert result.summary == "It failed."
+    assert result.suggested_label == "X"
+
+
+def test_parse_summary_with_label_degrades_when_not_json():
+    result = _parse_summary_with_label("It just failed, no idea why.")
+    assert result.summary == "It just failed, no idea why."
+    assert result.suggested_label is None
+
+
+def test_parse_summary_with_label_degrades_when_label_key_missing():
+    result = _parse_summary_with_label('{"summary": "It failed."}')
+    assert result.summary == "It failed."
+    assert result.suggested_label is None
+
+
 def test_template_summary_is_deterministic_and_llm_free():
     req = api.SummaryRequest(**_summary_request())
     s1 = api.template_summary(req)
@@ -810,3 +1259,93 @@ def test_summary_request_contract_shape():
     req = api.SummaryRequest(**_summary_request())
     assert req.journey_id and req.outcome
     assert isinstance(req.logs[0], LogLine)  # logs deserialize to the model
+
+
+# --- llm.py: per-model LangSmith tags ----------------------------------------
+#
+# Each factory tags its model with the logical role it plays so runs land in
+# LangSmith already labelled, instead of as N indistinguishable calls to the same
+# Azure endpoint. Asserted here because nothing downstream can see the tags —
+# nodes.py only ever awaits `.ainvoke()`.
+
+
+@pytest.fixture
+def _llm_configured(monkeypatch):
+    """Point llm.py at a fake Azure endpoint so _build() actually constructs.
+
+    The provider model builds offline (no network call at construction), so this
+    exercises the real code path without creds or a request.
+    """
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "https://fake.invalid/openai/v1")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "fake-key")
+    for name in (
+        "AZURE_DEPLOYMENT_EXPLAINER",
+        "AZURE_DEPLOYMENT_ROUTER",
+        "AZURE_DEPLOYMENT_SUMMARY",
+        "AZURE_DEPLOYMENT_CHAT",
+    ):
+        monkeypatch.setattr(settings, name, "fake-deployment")
+
+
+def test_explainer_model_is_tagged_explainer(_llm_configured):
+    model = llm.explainer_model()
+    assert model is not None
+    # with_config stores tags on the RunnableBinding's `config` dict — there is no
+    # `.tags` attribute in langchain-core 1.x, so read it the way the API exposes it.
+    assert "explainer" in model.config.get("tags", [])
+
+
+@pytest.mark.parametrize(
+    "factory, tag",
+    [
+        ("explainer_model", "explainer"),
+        ("router_model", "router"),
+        ("summary_model", "summary"),
+        ("chat_model", "chat"),
+    ],
+)
+def test_every_factory_tags_its_logical_role(_llm_configured, factory, tag):
+    model = getattr(llm, factory)()
+    assert model is not None
+    assert model.config.get("tags") == [tag]
+
+
+def test_tagged_model_still_supports_ainvoke(_llm_configured):
+    """The contract nodes.py depends on: a Runnable you can await, whose result
+    carries `.content`. with_config wraps the model in a RunnableBinding, so this
+    pins that the wrapper stays duck-type compatible."""
+    model = llm.explainer_model()
+    assert hasattr(model, "ainvoke")
+
+
+def test_chat_falls_back_to_summary_deployment_but_keeps_the_chat_tag(monkeypatch):
+    """The tag names the JOB, not the deployment — which is the whole point when
+    chat and summary share one deployment."""
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "https://fake.invalid/openai/v1")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "fake-key")
+    monkeypatch.setattr(settings, "AZURE_DEPLOYMENT_CHAT", "")
+    monkeypatch.setattr(settings, "AZURE_DEPLOYMENT_SUMMARY", "summary-deployment")
+
+    model = llm.chat_model()
+    assert model is not None
+    assert model.config.get("tags") == ["chat"]
+
+
+def test_factories_still_return_none_without_creds(monkeypatch):
+    """Tagging must not disturb the creds-free path — None means "take the
+    fallback", and every factory has to keep saying it."""
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_ENDPOINT", "")
+    monkeypatch.setattr(settings, "AZURE_AI_FOUNDRY_API_KEY", "")
+    assert llm.explainer_model() is None
+    assert llm.router_model() is None
+    assert llm.summary_model() is None
+    assert llm.chat_model() is None
+
+
+def test_build_without_tags_returns_the_bare_model(_llm_configured):
+    """`with_config(tags=None)` is a pydantic ValidationError, so an untagged
+    build must not go through it. Guards the optional-parameter default."""
+    model = llm._build("fake-deployment")
+    assert model is not None
+    assert not hasattr(model, "config")  # not wrapped in a RunnableBinding
+    assert hasattr(model, "ainvoke")

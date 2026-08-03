@@ -7,7 +7,9 @@ lifecycle is driven through fastapi's TestClient (in-process, no real network).
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
+from backend.auth import COOKIE_NAME, issue_token
 from backend.main import app
 from backend.ws import (
     ConnectionManager,
@@ -17,6 +19,14 @@ from backend.ws import (
     EVENT_JOURNEY_UPDATED,
     EVENT_JOURNEY_COMPLETED,
 )
+
+
+def _authed_client(target_app) -> TestClient:
+    """A TestClient carrying a valid session cookie, so the /ws handshake (which
+    authenticates the same as the REST API) is accepted."""
+    client = TestClient(target_app)
+    client.cookies.set(COOKIE_NAME, issue_token("test-user"))
+    return client
 
 
 class _FakeWS:
@@ -101,9 +111,20 @@ async def test_broadcast_with_no_clients_is_noop():
 
 def test_ws_endpoint_registers_and_deregisters():
     assert len(app_manager) == 0
-    with TestClient(app).websocket_connect("/ws"):
+    with _authed_client(app).websocket_connect("/ws"):
         assert len(app_manager) == 1
     # after the client disconnects the hub drops it
+    assert len(app_manager) == 0
+
+
+def test_ws_rejects_unauthenticated_handshake():
+    """No session cookie/token -> the handshake is closed and the client is
+    never registered (the WS carries the same data as the authed REST API)."""
+    assert len(app_manager) == 0
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(app).websocket_connect("/ws"):
+            pass  # server closes with 1008 during the handshake, before accept
+    assert exc.value.code == 1008
     assert len(app_manager) == 0
 
 
@@ -137,7 +158,7 @@ def _emit_app() -> FastAPI:
 
 
 def test_broadcast_reaches_connected_ws_client_in_envelope_format():
-    client = TestClient(_emit_app())
+    client = _authed_client(_emit_app())
     event = make_event(EVENT_ALERT_NEW, {"alert_id": "a1"})
     with client.websocket_connect("/ws") as ws:
         client.post("/_emit", json=event)  # runs in the app loop -> broadcasts
@@ -149,7 +170,7 @@ def test_broadcast_reaches_connected_ws_client_in_envelope_format():
 
 
 def test_broadcast_reaches_all_connected_ws_clients():
-    client = TestClient(_emit_app())
+    client = _authed_client(_emit_app())
     event = make_event(EVENT_JOURNEY_UPDATED, {"journey_id": "J1"})
     with client.websocket_connect("/ws") as ws1, client.websocket_connect("/ws") as ws2:
         client.post("/_emit", json=event)
@@ -166,6 +187,14 @@ def test_broadcast_reaches_all_connected_ws_clients():
 class _FakeResult:
     def __init__(self, rowcount: int = 1) -> None:
         self.rowcount = rowcount
+
+    def first(self):
+        # backend.linking's incident-backfill lookups read "nothing found"
+        # here — none of these WS-event tests exercise incidents.
+        return None
+
+    def scalar_one_or_none(self):
+        return None
 
 
 class _FakeSession:
@@ -223,7 +252,6 @@ def _alert(source: str = "ai") -> ProcessedAlert:
         log=_log(message="boom", level="ERROR"),
         explanation=None if source == "fallback" else "explained",
         department=None if source == "fallback" else Department.backend,
-        confidence=None if source == "fallback" else 0.7,
         source=source,
     )
 
@@ -265,11 +293,11 @@ async def test_on_event_journey_completed_on_finalize():
     a = JourneyAssembler()
     logs = [
         _log(message="Received inbound order event evt-1", eventId="evt-1"),
-        _log(message="Received order creation response for event evt-1",
-             ts=BASE + timedelta(seconds=2), eventId="evt-1", orderId="ORD-1", cartHeaderId="C1"),
-        _log(message="Registered order ORD-1 for tracking",
-             ts=BASE + timedelta(seconds=5), app_name="cc-track-trace",
-             orderId="ORD-1", cartHeaderId="C1"),
+        _log(message="Generated order number ORD-1 for cart header 1840927365018240001",
+             ts=BASE + timedelta(seconds=2), eventId="evt-1"),
+        _log(message="Received order_created for order ORD-1: order processing complete",
+             ts=BASE + timedelta(seconds=5), app_name="cc-inbound-service",
+             orderId="ORD-1", cartHeaderId="1840927365018240001"),
     ]
     await a.ingest(_FakeSession(), logs, now=BASE + timedelta(seconds=6), on_event=on_event)
 

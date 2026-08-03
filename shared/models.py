@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer
+from pydantic import AwareDatetime, BaseModel, ConfigDict, field_serializer
 
 Level = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 BridgeIds = Literal["both", "order", "cart", "random"]
@@ -62,6 +62,13 @@ class BatonContext(BaseModel):
     cartHeaderId: str | None = None
     bridge_ids: BridgeIds = "random"
     fail_at: str | None = None
+    # A block that fails ONCE and then succeeds — the transient-blip knob,
+    # deliberately separate from ``fail_at``. ``fail_at`` means "emit the failure
+    # variant AND stop the chain" (shared/scenarios.py truncates on it); a flaky
+    # block emits its retry lines and forwards the baton, so the flow runs to
+    # completion. Keeping them apart is what leaves truncation untouched for
+    # every terminal-failure scenario.
+    flaky_at: str | None = None
 
 
 class Baton(BaseModel):
@@ -84,6 +91,20 @@ class Department(str, Enum):
     general = "general"
 
 
+class Severity(str, Enum):
+    """Per-log technical severity, judged by the router LLM from the log alone.
+
+    A relative ranking of how urgent this single WARN/ERROR is for an IT-support
+    engineer — NOT business impact (the log doesn't carry that). ``None`` on a
+    ``ProcessedAlert`` means fallback (LLM down), exactly like department.
+    """
+
+    critical = "critical"
+    high = "high"
+    medium = "medium"
+    low = "low"
+
+
 class ProcessedAlert(BaseModel):
     """Contract on the `processed.alerts` queue."""
 
@@ -94,5 +115,15 @@ class ProcessedAlert(BaseModel):
     log: LogLine
     explanation: str | None
     department: Department | None
-    confidence: float | None = Field(default=None, ge=0, le=1)
+    severity: Severity | None = None
     source: Literal["ai", "fallback"]
+    # True when this alert's explanation/routing was served from the AI
+    # service's semantic cache (a reused AI answer) rather than a fresh LLM
+    # call. ``source`` stays "ai" on a cache hit so backend routing is unchanged
+    # — this flag is purely informational (dashboard/metrics).
+    cached: bool = False
+    # The masked-message vector for incident clustering (backend/incidents.py).
+    # None when no encoder is configured (ai_service/semcache.py cache disabled)
+    # — clustering's novel/embedding path just has nothing to compare, same as
+    # any other missing optional signal.
+    embedding: list[float] | None = None

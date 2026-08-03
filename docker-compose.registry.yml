@@ -1,0 +1,68 @@
+# Pull prebuilt images instead of building on the VM.
+#
+# Layered ON TOP of the production compose — this one is an override, unlike
+# docker-compose.prod.yml which is standalone:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.registry.yml \
+#     --profile app pull
+#   docker compose -f docker-compose.prod.yml -f docker-compose.registry.yml \
+#     --profile app up -d
+#
+# Why: the images are built by .github/workflows/build-images.yml. Building on
+# the VM instead needs ~4 vCPUs (torch + the Next bundle) and would require the
+# private-registry npm token on the box. Pulling keeps the VM small and the token
+# in GitHub. It also means the dashboard bundle is built with the RELATIVE /api
+# and /ws defaults, which is what the reverse-proxied deployment needs.
+#
+# `image:` here replaces the base file's build+image pair. Compose still honours a
+# `build:` section from the base file when the tag is missing locally, so each
+# service below sets `pull_policy: always` to force the registry copy — otherwise
+# a stale local `oil-app` built by an earlier manual run would win silently.
+#
+# Required in .env on the VM:
+#   IMAGE_OWNER=computacenter-ro     # GHCR owner (lowercase)
+#   IMAGE_TAG=prep-for-prod          # branch tag, or a sha-<full-sha> to pin
+#
+# Pin IMAGE_TAG to a sha for the demo: a branch tag moves under you the next time
+# the workflow runs, so `pull` could swap the image mid-week.
+#
+# GHCR packages are private by default. Either make the two packages public
+# (Package settings → Change visibility) or log the VM in once:
+#   echo <PAT-with-read:packages> | docker login ghcr.io -u <user> --password-stdin
+
+x-app-image: &app-image
+  image: ghcr.io/${IMAGE_OWNER:?IMAGE_OWNER must be set}/oil-app:${IMAGE_TAG:-prep-for-prod}
+  pull_policy: always
+
+services:
+  # migrate + collector are the only two services that declare `build:` in the
+  # base file, so they need `build: !reset null` written out here. It cannot live
+  # in the shared anchor: a YAML merge key (`<<:`) resolves the mapping BEFORE
+  # compose interprets the !reset tag, so the inherited build section survives —
+  # verified by inspecting `docker compose config`. Without the reset, `up` would
+  # fall back to BUILDING on the VM whenever the tag is absent locally, which is
+  # exactly what pulling prebuilt images is meant to avoid.
+  migrate:
+    <<: *app-image
+    build: !reset null
+
+  collector:
+    <<: *app-image
+    build: !reset null
+
+  mock-services:
+    <<: *app-image
+
+  ai-service:
+    <<: *app-image
+
+  backend:
+    <<: *app-image
+
+  injector:
+    <<: *app-image
+
+  dashboard:
+    image: ghcr.io/${IMAGE_OWNER:?IMAGE_OWNER must be set}/oil-dashboard:${IMAGE_TAG:-prep-for-prod}
+    pull_policy: always
+    build: !reset null

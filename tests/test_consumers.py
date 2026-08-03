@@ -3,7 +3,7 @@
 Exercised without a broker or a DB:
 
 * ``alert_row_values`` — pure mapping ProcessedAlert -> Alert columns; fallback
-  alerts carry null explanation/department/confidence.
+  alerts carry null explanation/department/severity.
 * ``_process`` on each consumer — with a fake session (and, for raw events, a
   fake assembler) we assert the persistence call shape without Postgres.
 * **Idempotency** is asserted structurally: the alert INSERT compiles to an
@@ -58,7 +58,6 @@ def _alert(source: str = "ai", **over) -> ProcessedAlert:
         log=over.pop("log", _log()),
         explanation=None if source == "fallback" else "SPT was unreachable",
         department=None if source == "fallback" else Department.backend,
-        confidence=None if source == "fallback" else 0.82,
         source=source,
     )
 
@@ -69,6 +68,14 @@ def _alert(source: str = "ai", **over) -> ProcessedAlert:
 class _FakeResult:
     def __init__(self, rowcount: int = 1) -> None:
         self.rowcount = rowcount
+
+    def first(self):
+        # backend.linking's incident-backfill lookups read "nothing found"
+        # here — none of these alert-persistence tests exercise incidents.
+        return None
+
+    def scalar_one_or_none(self):
+        return None
 
 
 class _FakeSession:
@@ -94,12 +101,13 @@ class _FakeSession:
 
 
 class _FakeAssembler:
-    def __init__(self) -> None:
+    def __init__(self, completions: list | None = None) -> None:
         self.ingested: list[tuple[object, list, object]] = []
+        self._completions = completions or []
 
     async def ingest(self, session, logs, now=None, on_event=None):
         self.ingested.append((session, list(logs), on_event))
-        return []
+        return self._completions
 
 
 def _compiled(stmt) -> str:
@@ -122,8 +130,33 @@ def test_alert_row_values_ai_maps_log_and_enrichment():
     assert values["account_number"] == "81036533"
     assert values["explanation"] == "SPT was unreachable"
     assert values["department"] == "backend"  # enum -> its string value
-    assert values["confidence"] == 0.82
     assert values["source"] == "ai"
+    # The router no longer produces a confidence, so it must not reach the row —
+    # the alerts.confidence column is dropped (see the c9b3f07a51de migration),
+    # and a stray key here would make the INSERT fail.
+    assert "confidence" not in values
+
+
+def test_alert_row_values_maps_cached_flag():
+    # A semantic-cache hit must reach the row; it was previously computed on the
+    # ProcessedAlert and then dropped at the DB boundary.
+    hit = _alert("ai")
+    hit.cached = True
+    assert alert_row_values(hit)["cached"] is True
+
+
+def test_alert_row_values_cached_defaults_false_and_keeps_source_ai():
+    # cached modifies source rather than replacing it: a hit is still "ai", which
+    # is what the backend's Teams routing keys off.
+    values = alert_row_values(_alert("ai"))
+    assert values["cached"] is False
+    assert values["source"] == "ai"
+
+
+def test_alert_row_values_fallback_is_never_cached():
+    # Fallbacks are never stored in the cache, so they can never be served from it.
+    values = alert_row_values(_alert("fallback"))
+    assert values["cached"] is False
 
 
 def test_alert_row_values_fallback_nulls_enrichment():
@@ -131,9 +164,25 @@ def test_alert_row_values_fallback_nulls_enrichment():
     assert values["source"] == "fallback"
     assert values["explanation"] is None
     assert values["department"] is None
-    assert values["confidence"] is None
+    assert values["severity"] is None
+    assert "confidence" not in values
     # the log fields are still present
     assert values["log_id"] == "log-1"
+
+
+def test_alert_row_values_maps_embedding():
+    # Regression: the embedding was computed by ai_service and carried on the
+    # ProcessedAlert, but silently dropped at this exact DB boundary — every
+    # persisted alert had embedding=NULL, which made backend/incidents.py's
+    # novel/embedding clustering path (_find_open_incident_by_cosine) bail out
+    # immediately for every unrecognized failure, live-testing discovery.
+    alert = _alert("ai")
+    alert.embedding = [0.1, 0.2, 0.3]
+    assert alert_row_values(alert)["embedding"] == [0.1, 0.2, 0.3]
+
+
+def test_alert_row_values_embedding_defaults_none():
+    assert alert_row_values(_alert("ai"))["embedding"] is None
 
 
 # --- AlertsConsumer ----------------------------------------------------------
@@ -189,6 +238,36 @@ async def test_raw_process_forwards_log_to_assembler():
     assert passed_session is session
     assert passed_logs == [log]
     assert passed_on_event is None  # no hub wired -> no broadcasting
+
+
+async def test_raw_events_consumer_triggers_incident_clustering_on_completion(monkeypatch):
+    """A journey that completes as FAILED must be handed to
+    backend.incidents.process_completion — this is the hook point the whole
+    clustering engine depends on."""
+    from backend.journeys import Completion
+    from backend.stitching import StitchedJourney
+
+    called_with = []
+
+    async def fake_process_completion(session, completion, **kw):
+        called_with.append(completion)
+        return None
+
+    monkeypatch.setattr("backend.consumers.process_completion", fake_process_completion)
+
+    completed = Completion(
+        journey_id="j1",
+        journey=StitchedJourney(journey_id="j1", order_id="ORD-1"),
+        status=JourneyStatus.FAILED,
+        outcome="ENRICHMENT_FAILED",
+    )
+    session = _FakeSession()
+    assembler = _FakeAssembler(completions=[completed])
+    consumer = RawEventsConsumer(session_factory=lambda: session, assembler=assembler)
+
+    await consumer._process(_log())
+
+    assert called_with == [completed]
 
 
 async def test_raw_process_forwards_on_event_to_assembler():
@@ -331,7 +410,7 @@ async def test_sweep_stalled_finalizes_timed_out_journey():
     # be finalized as TIMED_OUT by the sweep (no new message needed).
     start = datetime(2026, 7, 20, 8, 0, 0, tzinfo=timezone.utc)
     assembler = JourneyAssembler(stalled_timeout=90)
-    assembler.add([_log(log_id="x-1", timestamp=start, message="Received inbound order event evt-1")])
+    assembler.add([_log(log_id="x-1", timestamp=start, message="Received inbound order event evt-1", level="INFO")])
 
     session = _FakeSession()
     now = start + timedelta(seconds=120)  # well past the 90s stall window

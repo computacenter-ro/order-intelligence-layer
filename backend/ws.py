@@ -11,18 +11,26 @@ Every pushed message uses one consistent envelope::
     {"type": <str>, "data": <dict>}
 
 with ``type`` one of ``alert.new`` / ``journey.updated`` / ``journey.completed``
-(CLAUDE.md: ``alert.new | journey.updated | journey.completed``).
+(CLAUDE.md: ``alert.new | journey.updated | journey.completed``) plus
+``incident.new`` (a freshly created incident) and ``incident.updated`` (an
+existing OPEN incident just absorbed another journey — counts/last_ts
+changed). Resolving an incident is not pushed live — same as an individual
+alert resolve, which is REST-only and applied by the dashboard optimistically.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+
+from backend.auth import COOKIE_NAME, decode_token
 
 # --- event envelope ----------------------------------------------------------
 
 EVENT_ALERT_NEW = "alert.new"
 EVENT_JOURNEY_UPDATED = "journey.updated"
 EVENT_JOURNEY_COMPLETED = "journey.completed"
+EVENT_INCIDENT_NEW = "incident.new"
+EVENT_INCIDENT_UPDATED = "incident.updated"
 
 
 def make_event(type_: str, data: dict) -> dict:
@@ -76,13 +84,34 @@ manager = ConnectionManager()
 router = APIRouter()
 
 
+def _ws_session_token(websocket: WebSocket) -> str | None:
+    """Extract the session token from the handshake.
+
+    Browsers can't set custom headers on a WS upgrade, so the httpOnly session
+    cookie (sent automatically) is the primary source; ``?token=`` is a fallback
+    for non-browser clients. Returns None when neither is present.
+    """
+    cookie = websocket.cookies.get(COOKIE_NAME)
+    if cookie:
+        return cookie
+    return websocket.query_params.get("token")
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    """Register the client, then keep the socket open until it disconnects.
+    """Authenticate, register the client, then keep the socket open until it
+    disconnects.
 
-    The server only pushes (via :meth:`ConnectionManager.broadcast`); inbound
-    frames are read solely to detect the disconnect, then discarded.
+    The WS carries the same alert/journey data as the REST API, so it enforces
+    the same session: a missing/invalid token closes the handshake with policy
+    code 1008 before the client is registered. The server only pushes (via
+    :meth:`ConnectionManager.broadcast`); inbound frames are read solely to
+    detect the disconnect, then discarded.
     """
+    token = _ws_session_token(websocket)
+    if token is None or decode_token(token) is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     await manager.connect(websocket)
     try:
         while True:

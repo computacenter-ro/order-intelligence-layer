@@ -1,0 +1,149 @@
+# Mock-to-real service map — the bridge between the logs and the documentation.
+#
+# WHY THIS EXISTS
+# The service docs in this folder describe the REAL Computacenter services
+# ("jam-ws", "order-engine"). The logs in this system come from MOCK emitters with
+# different names ("cc-jam-service", "cc-order-engine"). No string connects the
+# two: the `aliases` in each doc's frontmatter are human names ("JAM",
+# "Order Engine"), and not one of them is a cc-* name. Without this file, an agent
+# looking at a cc-jam-service alert who asks "what does this service do?" gets
+# "I have no documented knowledge of that service" — while jam-ws.md sits right
+# there.
+#
+# Guessing by name similarity is not a substitute: "inbound-order" contains
+# "order", and so does "cc-order-engine", so a fuzzy match ties the front door to
+# the hub — the two services most easily confused in a journey — and does it
+# silently.
+#
+# THREE JOBS
+#   1. mock app_name -> doc file          (the everyday path: every question that
+#                                          starts from the dashboard starts from a
+#                                          cc-* app_name)
+#   2. doc -> mock app_name               (so an answer can NAME the correspondence
+#                                          instead of substituting quietly; see
+#                                          rag-plan.md D3 / §7)
+#   3. "is this service documented at all?" -> a lookup, not a guess, so
+#      "I have no documentation for SPT" is deterministic
+#
+# ALIASES: deliberately asymmetric. A documented service's aliases live in its own
+# doc frontmatter — the single source of truth — and the loader merges them from
+# there. This file carries aliases ONLY for services with no doc file, because
+# nothing else records them.
+#
+# SEE_ALSO: for an UNDOCUMENTED service, the doc that covers it second-hand. It
+# decides what a question scoped to that service searches. Without it the routing
+# has only two options — search nothing, or search everything — and "everything"
+# is how a margin-check question ends up citing rsm-ws key concepts. `folded_in`
+# entries need no explicit value: their `emitted_by` service IS the doc that
+# describes them.
+#
+# GROUND TRUTH: mock_app_name / mock_host come from
+# pipeline/services/profiles.py PROFILES. If a profile changes, change it here too.
+
+services:
+  # --- documented -------------------------------------------------------------
+  - mock_app_name: cc-order-engine
+    mock_host: CCECMEWEBT001
+    doc: order-engine
+    file: order-engine.md
+    note: >
+      The hub. Also the only place SOLR appears — product-id resolution happens
+      inside the order engine, so there is no separate SOLR app_name.
+
+  - mock_app_name: cc-inbound-service
+    mock_host: CCECMETLT001
+    doc: inbound-order
+    file: inbound-order.md
+
+  - mock_app_name: cc-validator-service
+    mock_host: CCECMSRVT002
+    doc: order-validator-web-service
+    file: order-validator-web-service.md
+    note: >
+      Also emits the Avalara ship-to verification lines on US flows
+      (c.c.validator.client.AvalaraClient) — Avalara has no app_name of its own.
+
+  - mock_app_name: cc-rsm-service
+    mock_host: CCECMSRVT001
+    doc: rsm-ws
+    file: rsm-ws.md
+
+  - mock_app_name: cc-jam-service
+    mock_host: CCECMSRVT001
+    doc: jam-ws
+    file: jam-ws.md
+
+  # --- emitted, not yet documented --------------------------------------------
+  # These DO appear in logs, so they will be asked about. Answer with
+  # "no documented knowledge of that service" (answering-policy.md §7) rather
+  # than reasoning from a neighbouring service's file.
+  - mock_app_name: cc-spt-service
+    mock_host: CCECMSRVT001
+    doc: null
+    file: null
+    aliases: ["SPT", "Sales Pricing Tool", "spt-ws", "pricing"]
+
+  - mock_app_name: cc-settings-service
+    mock_host: CCECMSRVT002
+    doc: null
+    file: null
+    aliases: ["Settings", "settings service", "margin thresholds"]
+
+  - mock_app_name: cc-checker-service
+    mock_host: CCECMSRVT002
+    doc: null
+    file: null
+    aliases: ["Checker", "Cart Checker", "margin check"]
+    see_also: order-engine
+    note: >
+      A second-hand account exists in order-engine.md §4.3 — that is the Order
+      Engine's view of the Checker, not documentation of the Checker itself.
+      `see_also` points retrieval there: a question scoped to a cc-checker-service
+      alert must search THAT doc rather than falling back to all five, and an
+      answer built from it should say whose view it is.
+
+  - mock_app_name: cc-outbound-osw
+    mock_host: CCECMEWEBT002
+    doc: null
+    file: null
+    aliases: ["Outbound OSW", "OSW", "SAP submission"]
+
+  - mock_app_name: cc-track-trace
+    mock_host: CCECMEWEBT002
+    doc: null
+    file: null
+    aliases: ["Track & Trace", "Track and Trace", "T&T", "tracking"]
+
+# Real-system components with NO app_name of their own. A question about one of
+# these must be answered about the service that actually emits its lines — and
+# the answer should say so, since "there is no SOLR log" is itself the finding.
+# Ground truth: shared/scenarios.py ENRICH_SATELLITES and its note.
+folded_in:
+  - name: SOLR
+    aliases: ["SOLR", "Solr", "product search"]
+    emitted_by: cc-order-engine
+    doc: null
+    note: >
+      Not a standalone enrich satellite. Product-id resolution happens inside the
+      order engine; no reference flow contains a cc-solr-service step.
+
+  - name: Avalara
+    aliases: ["Avalara", "AvaTax", "address verification", "ship-to"]
+    emitted_by: cc-validator-service
+    doc: null
+    note: >
+      US flows only. Emitted by the validator's AvalaraClient and
+      ValidateShipToWithAvalara strategy, not by a standalone service. A
+      second-hand account exists in order-engine.md §4.6. Its lines print the
+      customer address — redact (order-engine.md §11.8).
+
+# Present in the documentation and in the real journey, but never simulated, so
+# no log line will ever carry them. Questions about these are answerable from the
+# docs only, and the answer should say there is no log evidence by design.
+not_simulated:
+  - name: SAP / BTP
+    aliases: ["SAP", "BTP", "ERP", "SAP BTP", "CPI"]
+    doc: null
+  - name: Salesforce
+    aliases: ["Salesforce", "SFDC", "VCT", "CPQ"]
+    doc: null

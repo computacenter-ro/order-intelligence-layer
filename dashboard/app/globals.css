@@ -12,50 +12,60 @@
   }
 }
 
+html {
+  /* Always reserve the vertical scrollbar gutter so it appearing (e.g. after
+     "Load more" makes the page taller) never narrows the content and reflows
+     the tables. */
+  scrollbar-gutter: stable;
+}
+
 body {
   background: var(--cc-cloud-white);
   color: var(--cc-grey-one);
   font-family: var(--cc-font-brand);
 }
 
-/* Journeys table — the style-guide package doesn't tokenize these two
-   table-specific hexes from the guidelines' Tables spec, so they're defined
-   once here as reusable CSS custom properties instead of inline hex. */
+/* Shared data table (journeys, history, ...) — the style-guide package
+   doesn't tokenize these two table-specific hexes from the guidelines' Tables
+   spec, so they're defined once here as reusable CSS custom properties
+   instead of inline hex. */
 :root {
   --cc-table-header-bg: #E3E8F4;
   --cc-table-zebra: #F4F4F9;
 }
 
-.oil-journeys-table {
+.oil-table {
   width: 100%;
   border-collapse: collapse;
 }
 
-.oil-journeys-table thead th {
+.oil-table thead th {
   text-align: left;
   font-size: 14px;
   font-weight: 600;
   color: var(--cc-foundation-blue);
   background: var(--cc-table-header-bg);
   padding: 12px 16px;
+  white-space: nowrap;
 }
 
-.oil-journeys-table tbody td {
+.oil-table tbody td {
   padding: 14px 16px;
   font-size: 14px;
   color: var(--cc-grey-one);
   border-bottom: 1px solid var(--cc-grey-five);
+  white-space: nowrap;
 }
 
-.oil-journeys-table tbody tr:nth-child(even) {
+.oil-table tbody tr:nth-child(even) {
   background: var(--cc-table-zebra);
 }
 
-.oil-journeys-table tbody tr:hover {
+.oil-table tbody tr:hover {
   background: var(--cc-grey-six);
 }
 
-.oil-journeys-table tbody tr {
+.oil-table tbody tr {
   cursor: pointer;
 }
 
@@ -76,4 +86,236 @@ body {
 
 .oil-new-alerts-banner:hover {
   box-shadow: var(--shadow-cc-md);
+}
+
+/* Floating assistant launcher (components/chat/ChatLauncher.tsx). The
+   style-guide Button forwards neither style nor className, so the two properties
+   that make it read as a floating pill rather than an inline button are applied
+   from its positioning wrapper. Everything else — fill, hover, focus, pressed —
+   stays the Button's own primary variant, untouched. */
+.oil-chat-launcher > button {
+  /* !important is load-bearing, not sloppiness: the style-guide Button sets
+     `borderRadius: var(--cc-radius-md)` as an INLINE style, which outranks any
+     class selector — an author !important declaration is the only thing that
+     beats a style attribute. Without it the launcher silently renders as an
+     8px-cornered button instead of a pill. box-shadow needs no such escape
+     hatch: the Button leaves that property alone. */
+  border-radius: var(--cc-radius-full) !important;
+  box-shadow: var(--shadow-cc-lg);
+}
+
+/* Filter-bar controls — hover/focus per the Forms spec (2px Heritage Blue focus
+   simulated with border + 1px ring so the control doesn't shift on focus). Worn
+   by the FilterDropdown trigger buttons, so every control in the bar reacts
+   identically. */
+.oil-filter-select {
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.oil-filter-select:hover {
+  border-color: var(--cc-grey-three);
+}
+
+.oil-filter-select:focus {
+  outline: none;
+  border-color: var(--cc-heritage-blue);
+  box-shadow: 0 0 0 1px var(--cc-heritage-blue);
+}
+
+/* The ghost/Clear button used where a plain <button> is required — the filter
+   bar's "More/Fewer Filters" disclosure (needs aria-expanded / aria-controls) and
+   the AI-performance "Update" control. The style-guide Button does not forward
+   those attributes, so the ghost variant's states live here instead.
+
+   The transparent resting fill BELONGS IN THIS CLASS, not in each call site's
+   inline style: `style={{ background: "transparent" }}` sets the property with
+   inline specificity, which silently beats the :hover rule below, so both users of
+   this class had a hover that never fired. Keeping the whole state machine —
+   resting, hover, pressed, busy — in one place is what makes it actually work. */
+.oil-filter-toggle {
+  background-color: transparent;
+  transition: background-color 200ms ease;
+}
+
+.oil-filter-toggle:hover {
+  background-color: var(--cc-btn-secondary-fill);
+}
+
+/* Pressed. A distinct, deeper step from hover so the click is acknowledged even
+   when the resulting work finishes too fast to see. */
+.oil-filter-toggle:active {
+  background-color: var(--cc-btn-secondary-pressed);
+}
+
+/* In flight. aria-busy is the state, so the visual and the announced state cannot
+   drift apart. Pointer events stay on: this control is idempotent, and blocking
+   the cursor mid-request reads as a frozen UI. */
+.oil-filter-toggle[aria-busy="true"] {
+  background-color: var(--cc-btn-secondary-fill);
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.oil-filter-toggle:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+}
+
+/* ── Architecture diagram ─────────────────────────────────────────────────── */
+
+/* Zoom/fit controls. Icon-only buttons per the Buttons spec: Horizon Blue tint
+   on hover/press, Foundation Blue focus ring. Classed rather than styled inline
+   because :hover/:focus-visible have no inline equivalent. */
+.oil-zoom-button {
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.oil-zoom-button:hover {
+  background-color: var(--cc-btn-secondary-fill);
+  border-color: var(--cc-horizon-blue);
+}
+
+.oil-zoom-button:active {
+  background-color: var(--cc-btn-secondary-pressed);
+}
+
+.oil-zoom-button:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+}
+
+/* The journey-replay Play/Stop control. A primary button when idle (Heritage
+   Blue fill) and a hollow one while playing, so "stop" never looks like the
+   page's main call to action. */
+.oil-journey-button {
+  transition: background-color 200ms ease, box-shadow 200ms ease;
+}
+
+/* :not(:disabled) — the Reset button is disabled while the replay is idle, and a
+   hover lift on an inert control reads as interactive. */
+.oil-journey-button:hover:not(:disabled) {
+  box-shadow: var(--cc-shadow-md);
+}
+
+.oil-journey-button:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+}
+
+/* Journey-replay speed slider. A native <input type="range"> so it stays
+   keyboard-operable (arrows / Home / End) and announces as a slider for free;
+   only the paint is replaced, since the UA default is grey and does not read as
+   part of the diagram's control set. Track and thumb need vendor-prefixed
+   selectors — they cannot be combined into one rule, because an unknown
+   pseudo-element invalidates the whole selector list in both engines. */
+.oil-speed-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.oil-speed-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--cc-grey-five);
+}
+
+.oil-speed-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--cc-grey-five);
+}
+
+.oil-speed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  /* Centres the 14px thumb on the 4px track. */
+  margin-top: -5px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--cc-heritage-blue);
+}
+
+.oil-speed-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--cc-heritage-blue);
+}
+
+.oil-speed-slider:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Diagram nodes are focusable <g> elements. The default UA focus ring hugs the
+   glyph's bounding box (including the label), so it's replaced by an offset
+   Foundation Blue ring that traces the node the same way the hover halo does. */
+.oil-arch-node {
+  transition: opacity 120ms ease;
+}
+
+.oil-arch-node:focus-visible {
+  outline: 2px solid var(--cc-foundation-blue);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+/* Side-nav header: stack the collapse caret UNDER the logo — COLLAPSED ONLY.
+
+   The style-guide SideNav renders its header as one flex ROW containing the
+   logo and the caret button, and exposes no className/style hook for it — so
+   this is done here, structurally (nav's first child), rather than by forking
+   the vendored component or hacking it from inside `logoMark` (a child cannot
+   restyle its parent). Two rows instead of one, hence the taller min-height:
+   the component hardcodes 64px for a single row.
+
+   EXPANDED IS DELIBERATELY NOT OVERRIDDEN. The component's own defaults there
+   are `row` + `space-between`, which is exactly the wanted layout: logo and app
+   name on the left, caret on the far right. Every rule below is scoped to
+   `.oil-nav-collapsed` (set on the shell root by AppShell) so the wide panel
+   keeps those defaults. Overriding it to match and then re-reverting would be
+   two chances to drift; not touching it is one.
+
+   On the 64px rail there is no room for a caret beside the mark, which is the
+   whole reason the two rows exist. */
+.oil-nav-collapsed nav[aria-label="Sidebar navigation"] > div:first-child {
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  /* Two stacked rows no longer fit the component's 64px single-row header. */
+  min-height: auto;
+  padding: 12px;
+}
+
+/* The caret is the header's last child; the logo wrapper precedes it. Centre it
+   under the mark on the rail. */
+.oil-nav-collapsed nav[aria-label="Sidebar navigation"] > div:first-child > button:last-child {
+  align-self: center;
+}
+
+/* The collapsed logoMark overlaps the caret with a negative right margin to win
+   back the width the caret used to steal from the same row (see AppShell). Once
+   the caret moves to its own row there is nothing to overlap, so that offset
+   would push the mark off-centre — neutralise it here, where the row/column
+   change is made. */
+.oil-nav-collapsed nav[aria-label="Sidebar navigation"] > div:first-child > div > span {
+  margin-right: 0 !important;
+}
+
+/* The pan/zoom transform is applied directly, never animated, so there is no
+   zoom easing to disable. What remains are the hover transitions above; reduced
+   motion removes them so hover state changes instantly. */
+@media (prefers-reduced-motion: reduce) {
+  .oil-zoom-button,
+  .oil-journey-button,
+  .oil-arch-node {
+    transition: none;
+  }
 }

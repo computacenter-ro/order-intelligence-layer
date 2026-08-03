@@ -34,6 +34,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend import teams
 from backend.api import router as api_router
+from backend.auth import router as auth_router
+from backend.auth_entra import router as entra_router
 from backend.consumers import run_consumers
 from backend.ws import manager as hub
 from backend.ws import router as ws_router
@@ -118,6 +120,28 @@ async def lifespan(app: FastAPI):
             pass
 
 
+def cors_allow_origins() -> list[str]:
+    """The browser origins allowed to call this API, from ``CORS_ALLOW_ORIGINS``.
+
+    Comma-separated, e.g.
+    ``https://dash.example.com,https://dash-staging.example.com``. The default is
+    the local dashboard, so docker-compose dev is unchanged.
+
+    Env-driven because the deployed dashboard lives on a different HTTPS
+    subdomain than the backend (Azure Container Apps gives each app its own
+    hostname), and that hostname is a deployment detail — baking it in would mean
+    a code change per environment.
+
+    Entries are trimmed and blanks dropped, so a trailing comma or a wrapped
+    value in a compose/portal field can't inject an empty origin. An empty result
+    means "no cross-origin browser calls", NOT "allow everything": with
+    ``allow_credentials=True`` a wildcard is rejected by browsers anyway, so
+    silently widening would be both wrong and unsafe.
+    """
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app = FastAPI(
     title="Order Intelligence Layer — Core Backend",
     version="0.1.0",
@@ -125,10 +149,18 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_methods=["GET"],
+    allow_origins=cors_allow_origins(),
+    # POST for /auth/login + /auth/logout; PATCH for marking an alert resolved;
+    # OPTIONS for the preflight.
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
+    # Required so the browser sends/receives the httpOnly session cookie
+    # cross-origin (dashboard :3000 → backend :8000, or the two deployed
+    # subdomains). Note this forbids a "*" origin — hence the explicit list.
+    allow_credentials=True,
 )
+app.include_router(auth_router)
+app.include_router(entra_router)
 app.include_router(api_router)
 app.include_router(ws_router)
 

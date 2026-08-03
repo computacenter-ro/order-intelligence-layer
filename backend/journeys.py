@@ -32,8 +32,13 @@ Journey-over rules (CLAUDE.md — exactly three; message texts are load-bearing)
   "submission aborted", "blocked by margin check", JAM "not authorized" 403,
   "Max redelivery attempts reached"). The subtype is derived from the message.
 * **TIMED_OUT** — no new event for the journey's ids for ``STALLED_TIMEOUT``
-  seconds (default 90; env-configurable). All clock arithmetic is UTC and
-  timezone-aware — never ``utcnow()``.
+  seconds (default 90; env-configurable), with no UNRECOVERED error. All clock
+  arithmetic is UTC and timezone-aware — never ``utcnow()``.
+* **UNRECOGNIZED_FAILURE** — stalled, but carrying an ERROR that no
+  ``_FAILURE_RULES`` marker matched AND that never recovered (see
+  :func:`unrecovered_errors`). An ERROR whose own source logged healthy activity
+  afterwards was a transient blip — routine in the real system — and must not
+  condemn the journey.
 
 Pre-creation failures never acquire order ids: their journeys carry only
 ``event_id``. Under the five-hop pipeline that is transform and creation
@@ -76,6 +81,17 @@ TIMED_OUT = "TIMED_OUT"
 UNRECOGNIZED_FAILURE = "UNRECOGNIZED_FAILURE"  # a real ERROR occurred but no
 # _FAILURE_RULES marker matched it — distinct from TIMED_OUT (which means no
 # ERROR signal was ever seen at all). See _state()'s stall branch below.
+
+# NOT a journey outcome — a journey that recovered is SUCCESS, full stop, and
+# this string is never written to ``journeys.outcome``. It exists ONLY as an
+# incident ``failure_subtype`` (backend/incidents.py), so a dependency that
+# flapped and recovered gets its own cluster instead of leaving its alerts
+# stranded with no incident to collapse them into. Kept here beside the other
+# subtype constants because incidents.py's vocabulary is this module's
+# vocabulary — but the split is deliberate: the ORDER succeeded, only the
+# DEPENDENCY misbehaved, so the journey's outcome and its incident's subtype
+# are legitimately different facts.
+TRANSIENT_FAILURE = "TRANSIENT_FAILURE"
 
 INBOUND_TRANSFORM_FAILED = "INBOUND_TRANSFORM_FAILED"
 ORDER_CREATION_FAILED = "ORDER_CREATION_FAILED"
@@ -173,6 +189,47 @@ def detect_terminal(logs: list[LogLine]) -> str | None:
     if all(marker in last for marker in _SUCCESS_MARKERS):
         return SUCCESS
     return None
+
+
+def unrecovered_errors(logs: list[LogLine]) -> list[LogLine]:
+    """The journey's ERRORs that were never followed by a recovery.
+
+    An ERROR is **recovered** when a LATER log in the same journey comes from the
+    same source — same ``app_name`` AND same ``logger`` — at INFO or DEBUG. That
+    is a transient failure: the client that just failed went on to log healthy
+    activity, which is precisely what a Feign retry succeeding looks like
+    (ai_service/knowledge/inbound-order.md §7.2 — retries on 5xx are routine, so
+    a blip is the normal case, not the exception).
+
+    Why the pair and not just ``app_name``: ``cc-order-engine`` emits a great
+    many INFO lines from other classes after any given failure, so an app-only
+    rule would clear a genuine outage the moment any unrelated part of the engine
+    logged something. The ``logger`` is the emitting *class*
+    (``c.c.orderengine.client.SptClient``), and a retry succeeds in the same
+    client that failed — so the pair is the honest "same source".
+
+    Why not just ``level``: the ordering matters. Only lines strictly AFTER the
+    ERROR count, so an outage's own preamble can never retro-clear it.
+
+    Used by :meth:`JourneyAssembler._state` for the stall branch. The distinction
+    it protects is CLAUDE.md's: ``UNRECOGNIZED_FAILURE`` means "a real,
+    unresolved ERROR that nothing matched", ``TIMED_OUT`` means silence. A
+    journey whose only ERROR recovered and which then went quiet is silence — it
+    must NOT be labelled FAILED with the recovered blip as its apparent cause,
+    or clustering (backend/incidents.py) will take it down the embedding path and
+    can merge it with genuinely unrelated incidents.
+    """
+    healthy_after: set[tuple[str, str]] = set()
+    unrecovered: list[LogLine] = []
+    # Walk backwards: everything already seen is "later" than the current log.
+    for log in reversed(logs):
+        if log.level == "ERROR":
+            if (log.app_name, log.logger) not in healthy_after:
+                unrecovered.append(log)
+        elif log.level in ("INFO", "DEBUG"):
+            healthy_after.add((log.app_name, log.logger))
+    unrecovered.reverse()  # restore journey order
+    return unrecovered
 
 
 def is_stalled(last_ts: datetime, now: datetime, timeout: int = STALLED_TIMEOUT) -> bool:
@@ -288,7 +345,12 @@ class JourneyAssembler:
         if outcome is not None:
             return status_for(outcome), outcome
         if journey.last_ts is not None and is_stalled(journey.last_ts, now, self._timeout):
-            if any(log.level == "ERROR" for log in journey.logs):
+            # UNRECOVERED errors only — an ERROR whose source later logged
+            # healthy activity was a transient blip, and a journey that stalls
+            # afterwards stalled for some OTHER reason. Labelling it FAILED would
+            # name the recovered blip as the cause and send it down clustering's
+            # embedding path. See :func:`unrecovered_errors`.
+            if unrecovered_errors(journey.logs):
                 return JourneyStatus.FAILED, UNRECOGNIZED_FAILURE
             return JourneyStatus.TIMED_OUT, TIMED_OUT
         return JourneyStatus.IN_PROGRESS, None

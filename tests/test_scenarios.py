@@ -38,7 +38,7 @@ from shared.scenarios import (
     satellite_block,
 )
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v7.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v8.json"
 
 # CLAUDE.md canonical table: {id: (outcome, fail_at)}
 CANONICAL = {
@@ -434,6 +434,62 @@ def test_fail_at_none_produces_untruncated_chain():
     # A success scenario forced through the failing-step path shouldn't lose steps.
     s = SCENARIOS[1]
     assert compile_steps(s) == compile_steps(replace(s, fail_at=None))
+
+
+# --- flaky_at: the transient-failure knob ------------------------------------
+# The trap this guards: expressing recovery through ``fail_at`` would truncate
+# the chain (``_failing_step``), so the flow could never run to completion.
+# ``flaky_at`` is a SEPARATE knob the compiler deliberately ignores.
+
+
+def test_flaky_scenario_compiles_to_the_full_untruncated_chain():
+    """A recovering flow runs to completion — byte-identical to a clean success.
+
+    Scenario 18's chain must equal scenario 1's modulo nothing at all: same
+    country (UK, so no Avalara), same satellites, same close.
+    """
+    flaky = SCENARIOS[18]
+    assert flaky.flaky_at == "spt"
+    assert flaky.fail_at is None, "recovery must never be expressed through fail_at"
+    assert compile_steps(flaky) == compile_steps(SCENARIOS[1])
+    assert compile_steps(flaky)[-1] == (INBOUND, BLOCKS.CLOSE)
+
+
+def test_flaky_at_does_not_truncate_where_fail_at_would():
+    """The knobs are not interchangeable: same block, opposite chain lengths."""
+    base = SCENARIOS[18]
+    flaky = compile_steps(base)
+    terminal = compile_steps(replace(base, flaky_at=None, fail_at="spt"))
+    assert terminal == flaky[: len(terminal)]
+    assert len(terminal) < len(flaky)
+    assert terminal[-1] == (SPT, BLOCKS.SERVE)
+
+
+def test_flaky_at_is_never_read_by_the_compiler():
+    """Setting flaky_at on ANY scenario leaves its chain untouched.
+
+    This is the regression guard for the trap: if the compiler ever grows a
+    ``flaky_at`` branch, truncation for the terminal-failure scenarios is at
+    risk, and this fails for all 18 at once.
+    """
+    for s in all_scenarios():
+        assert compile_steps(replace(s, flaky_at="spt")) == compile_steps(s), (
+            f"S{s.id}: flaky_at changed the compiled chain"
+        )
+
+
+def test_the_two_knobs_are_mutually_exclusive_across_the_corpus():
+    """No scenario sets both — one truncates, the other cannot then fire."""
+    both = [s.id for s in all_scenarios() if s.fail_at and s.flaky_at]
+    assert both == [], f"scenarios setting both fail_at and flaky_at: {both}"
+
+
+def test_flaky_scenario_is_seeded_into_the_baton_ctx():
+    """The knob must reach the emitter — it is consumed from ctx, not the chain."""
+    seed = SCENARIOS[18].context_seed()
+    assert seed["flaky_at"] == "spt"
+    ctx = BatonContext(eventId="evt-test", **seed)
+    assert ctx.flaky_at == "spt" and ctx.fail_at is None
 
 
 def test_all_fail_at_values_resolve_to_a_real_step():

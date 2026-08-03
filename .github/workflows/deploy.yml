@@ -1,0 +1,77 @@
+name: Deploy to Azure Container Apps
+
+# ---------------------------------------------------------------------------
+# CD pipeline SCAFFOLD. It does NOT create infrastructure — it updates already-
+# existing Azure Container Apps to the newest image. Run the first deploy
+# manually (see DEPLOY_STEP_BY_STEP.md); after that, this redeploys on demand.
+#
+# BEFORE THIS CAN RUN you must fill in:
+#   1. GitHub secret  AZURE_CREDENTIALS  — a service-principal JSON so the
+#      workflow can log into Azure. 🤝 Your Azure colleague creates it with:
+#        az ad sp create-for-rbac --name oil-cd \
+#          --role contributor \
+#          --scopes /subscriptions/<SUB_ID>/resourceGroups/rg-internship-2026 \
+#          --sdk-auth
+#      Copy the whole JSON it prints into:
+#        GitHub repo → Settings → Secrets and variables → Actions → New secret
+#        Name: AZURE_CREDENTIALS
+#   2. Confirm the app names + resource group below match what you created.
+#   3. Confirm the image source (GHCR by default; switch to ACR if you prefer).
+#
+# The container apps themselves must already have registry pull credentials
+# (set when you created them). If pulling from GHCR, each app needs a GitHub
+# token with read:packages as its registry password.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:            # run manually from the GitHub "Actions" tab
+  # Uncomment to auto-deploy after the images finish building:
+  # workflow_run:
+  #   workflows: ["Build & push images"]
+  #   types: [completed]
+
+env:
+  RESOURCE_GROUP: rg-internship-2026
+
+  # --- Image source: GHCR (already built by build-images.yml) -----------------
+  # github.repository_owner is filled automatically. ":latest" or a specific tag.
+  IMAGE_APP:       ghcr.io/computacenter-ro/oil-app:prep-for-prod
+  IMAGE_DASHBOARD: ghcr.io/computacenter-ro/oil-dashboard:prep-for-prod
+  # --- OR switch to ACR (uncomment + set your ACR login server) ---------------
+  # IMAGE_APP:       croildevweu01.azurecr.io/oil-app:latest
+  # IMAGE_DASHBOARD: croildevweu01.azurecr.io/oil-dashboard:latest
+
+  # Container app names (must match what you created)
+  APP_COLLECTOR:  ca-oil-collector-dev-weu
+  APP_MOCK:       ca-oil-mock-dev-weu
+  APP_AI:         ca-oil-ai-dev-weu
+  APP_BACKEND:    ca-oil-backend-dev-weu
+  APP_DASHBOARD:  ca-oil-dashboard-dev-weu
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}     # TODO: add this secret (see header) 🤝
+
+      - name: Deploy collector
+        run: az containerapp update -n "$APP_COLLECTOR" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+
+      - name: Deploy mock-services
+        run: az containerapp update -n "$APP_MOCK" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+
+      - name: Deploy ai-service
+        run: az containerapp update -n "$APP_AI" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+
+      - name: Deploy backend
+        run: az containerapp update -n "$APP_BACKEND" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+
+      - name: Deploy dashboard
+        run: az containerapp update -n "$APP_DASHBOARD" -g "$RESOURCE_GROUP" --image "$IMAGE_DASHBOARD"
+
+      # Optional: also re-run the DB migration job on each deploy (safe/idempotent)
+      # - name: Run migrations
+      #   run: az containerapp job start -n ca-oil-migrate-dev-weu -g "$RESOURCE_GROUP"

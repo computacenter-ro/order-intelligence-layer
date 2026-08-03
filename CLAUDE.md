@@ -90,7 +90,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
 │   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
 │   │   dump_backend.py           # dev harness: dump backend DB state to JSON
-│   └── data/                     # reference fixtures (v7 = current; v2..v6 kept for history)
+│   └── data/                     # reference fixtures (v8 = current; v2..v7 kept for history)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 │   ├── settings.py  llm.py        # config + the ONE provider-wiring module
@@ -298,13 +298,21 @@ never crosses journeys, because that line already belongs to exactly one).
 
 Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
 NOT stitch — it processes individual logs. The reference fixture reflecting
-the five-hop flow is **`pipeline/data/mock-order-flows-v7.json`** — the
+the five-hop flow is **`pipeline/data/mock-order-flows-v8.json`** — the
 current reference fixture, and the one the tests read. It is **captured from
-the emitters** (never hand-written), so it always reflects what the services
-actually produce: Inbound's pre-creation Settings/JAM/SOLR leg, the mid-flow
-Track & Trace registration, the Validator→Avalara→Checker rule order, and the
-`order_created` close. v2–v6 are retained for history (v6 still shows the
-single-turn engine with its bridge ack and Track & Trace as the terminal).
+the emitters** (never hand-written) by
+**`python -m pipeline.scripts.capture_fixture --out pipeline/data/mock-order-flows-vN.json`**,
+which drives every scenario's compiled chain in-process (no broker, no
+collector), so it always reflects what the services actually produce: Inbound's
+pre-creation Settings/JAM/SOLR leg, the mid-flow Track & Trace registration, the
+Validator→Avalara→Checker rule order, and the `order_created` close. v8 adds
+scenario 18's transient SPT blip; v2–v7 are retained for history (v6 still shows
+the single-turn engine with its bridge ack and Track & Trace as the terminal).
+
+When you re-capture, remember the fixture holds **randomized** values (margins,
+Feign latencies) as well as minted ids — a test that compares against it must
+mask both, or it will fail on the next capture without anything having changed
+(`tests/test_ai_service.py::_mask_ids`).
 
 ---
 
@@ -421,6 +429,14 @@ engine's post-creation leg. `bridge_ids` no longer appears — it is inert.
 Every flow that crosses `‖` also registers with Track & Trace right after
 creation, even ones that fail later.
 
+Two knobs drive abnormal behaviour, and they are **not interchangeable**:
+`fail_at` means "emit the failure variant AND stop" — `compile_steps` truncates
+the chain at it — while **`flaky_at`** (scenario 18) means "fail once, then
+recover", so the compiler deliberately **ignores** it and the flow runs the full
+chain. Expressing recovery through `fail_at` would truncate the chain and the
+journey could never complete; a test pins that the compiler never reads
+`flaky_at`.
+
 | # | Outcome | fail_at | Satellites reached |
 |---|---|---|---|
 | 1 | `SUCCESS` (UK, 3 lines) | — | settings → jam → solr ‖ spt → rsm → validator → checker |
@@ -433,6 +449,7 @@ creation, even ones that fail later.
 | 8 | `ENRICHMENT_FAILED` (SPT down) | spt | settings → jam → solr ‖ spt |
 | 9 | `AUTH_FAILED` (JAM 403) | jam | settings → jam (PRE-creation — no order ids) |
 | 10 | `SAP_SUBMISSION_FAILED` | sap | settings → jam → solr ‖ spt → rsm → validator → checker |
+| 18 | `SUCCESS` (SPT blips, recovers) | — (`flaky_at=spt`) | settings → jam → solr ‖ spt → rsm → validator → checker |
 
 Scenarios 11–17 (clustering / novel-failure cases, also in `shared/scenarios.py`)
 follow the same rules: 11/12 are SPT-down (like 8 — and 12 is US but never
@@ -459,6 +476,32 @@ you can watch clustering merge or refuse to:
 currently emits flow 15's exact message, so until `pipeline/services/settings.py`
 gains a differently-worded variant, 15 and 16 are byte-identical rather than
 "same meaning, different wording".
+
+**18 is the TRANSIENT failure** — the only scenario that fails and recovers.
+1–17 either succeed cleanly or fail terminally (every retry loop in
+`pipeline/services/` exhausts), which models only the terminal tail of the real
+system: `ai_service/knowledge/inbound-order.md` §7.2 documents Feign clients
+retrying 4× with backoff on 5xx, so a downstream blip recovering is the NORMAL
+case. SPT times out once, the retry succeeds, and the flow completes as
+`SUCCESS`. Three things make that work, all load-bearing:
+
+* the recovery variant emits the SAME timeout ERROR and retry WARN as the outage
+  (a blip and an outage are indistinguishable until the retry lands) but **never**
+  the fatal `"Order processing aborted"` line — the only line in SPT's failure
+  path `_FAILURE_RULES` matches;
+* the recovery marker comes from the **same logger** as the timeout
+  (`SptClient`), which is what `backend/journeys.py`'s `unrecovered_errors`
+  reads;
+* the journey therefore carries a real ERROR **and** resolves SUCCESS — which is
+  the point: an ERROR alone must not condemn a journey.
+
+This is the first flow to attach WARN/ERROR **alerts to a SUCCESS journey**. On
+the dashboard it reads as an order that succeeded while showing red alerts —
+which is honest: the blip really happened, and a service flapping is worth
+seeing. Those alerts DO cluster, into a `TRANSIENT_FAILURE` incident of their own
+(see [5] Incident Clustering, Eligibility) — separate from the outage incident
+for the same service, so the failure incident's blast radius stays truthful while
+the recovered alerts remain bulk-resolvable.
 
 ### Injector (`pipeline/injector/inject.py`)
 Mints **only** `eventId` (= `evt-<uuid>`) — per the correlation model the order
@@ -1016,8 +1059,20 @@ journey that *did* log a real ERROR resolves to:
 |---|---|
 | Last event = Inbound's `order_created` close (`"Received order_created for order ... : order processing complete"` — BOTH markers). **NOT** Track & Trace: `"Registered order ... for tracking"` is mid-flow and terminates nothing. | `SUCCESS` |
 | A dead-letter routing marker (message contains `order.init_error` / `order.create.sap_error`, or the legacy `order.inbound.queue_error`/`.dlq` / `order.outbound.queue_error`/`.dlq` spellings) or a fatal abort ERROR (`"Order creation failed for event"`, `"Order processing aborted"`, `"submission aborted"`, `"blocked by margin check"`, JAM `"not authorized"` 403, `"Max redelivery attempts reached"`) | `FAILED` (subtype from the message, via `_FAILURE_RULES`) |
-| Stalled (no new event for the journey's ids for **90s**, `STALLED_TIMEOUT`) **and** a real ERROR was logged that no `_FAILURE_RULES` marker matched | `FAILED` / **`UNRECOGNIZED_FAILURE`** |
-| Stalled with **no** ERROR signal at all | `TIMED_OUT` |
+| Stalled (no new event for the journey's ids for **90s**, `STALLED_TIMEOUT`) **and** an **UNRECOVERED** ERROR was logged that no `_FAILURE_RULES` marker matched | `FAILED` / **`UNRECOGNIZED_FAILURE`** |
+| Stalled with **no** ERROR signal at all, **or only recovered ones** | `TIMED_OUT` |
+
+**"Unrecovered" is the load-bearing word** (`unrecovered_errors` in
+`backend/journeys.py`). An ERROR counts as *recovered* when a LATER log in the
+same journey comes from the same source — same `app_name` **and** same `logger`
+— at INFO/DEBUG: the client that just failed went on to log healthy activity,
+which is exactly what a Feign retry succeeding looks like (scenario 18). The
+condition used to be "any ERROR anywhere", which labelled a journey with a
+recovered blip `FAILED` and named that blip as its apparent cause — sending it
+down clustering's embedding path, where it could merge with unrelated incidents.
+Both halves of the pair matter: `app_name` alone would let any later
+`cc-order-engine` INFO clear a genuine outage, and only lines strictly *after*
+the ERROR count, or an outage's own healthy preamble would retro-clear it.
 
 `UNRECOGNIZED_FAILURE` is deliberately distinct from `TIMED_OUT`: "something broke
 and we don't recognize it" is a different fact from "it went quiet". It is the
@@ -1067,10 +1122,38 @@ DB-touching layer over them.
    divergence-guard idea as the semantic cache. Ids are masked before comparing, or
    two identical failures from different orders would read as "diverged" purely
    because their order numbers differ.
-5. **Eligibility.** `FAILED` and `TIMED_OUT` journeys only, and a `TIMED_OUT` one
+5. **Eligibility.** `FAILED` and `TIMED_OUT` journeys, and a `TIMED_OUT` one
    additionally needs a real linked **ERROR** alert (there is no terminal marker to
    anchor a "timed out because X" story on otherwise). Idempotent on `journey_id`:
    a journey whose `incident_id` is set is a no-op.
+
+   **Plus `SUCCESS` journeys that carried a RECOVERED error** (scenario 18) — a
+   dependency flapped mid-flow and the order still shipped. These cluster under a
+   subtype of their own, **`TRANSIENT_FAILURE`**, and that name is the whole
+   mechanism: `sha256("TRANSIENT_FAILURE:SPT")` cannot collide with
+   `sha256("ENRICHMENT_FAILED:SPT")`, so a recovered order can **never** land in
+   the outage incident and inflate a `journey_count` past the orders that actually
+   broke. It is classed INFRA, so several flapping orders merge into ONE incident.
+   Without this the journey's alerts kept `incident_id = NULL` forever and no bulk
+   action could clear them — `PATCH /incidents/{id}/resolve` cascades on
+   `incident_id`, so an alert outside every incident is only ever resolvable one
+   click at a time.
+
+   `TRANSIENT_FAILURE` is **never a journey outcome** — it is not written to
+   `journeys.outcome` and `status_for` never returns it. The journey stays
+   `SUCCESS` because the ORDER succeeded; only the incident records that the
+   DEPENDENCY misbehaved. This is the ONE place the incident subtype is not the
+   journey's own outcome (`incident_subtype_for`), and the exception is
+   deliberate: passing `SUCCESS` through would hash a meaningless `SUCCESS:<svc>`
+   and title an incident "SUCCESS — SPT".
+
+   A **clean** success (no ERROR at all) is still ineligible and never clusters —
+   gated on the recovered-error flag, not on `SUCCESS`, and answered from the
+   journey's in-memory logs so the common healthy path costs no query. The
+   `retry_unclustered_completions` sweep now includes `SUCCESS` rows in its
+   candidate set for the same reason it includes the others (completion outruns
+   alert persistence); on that path the logs are re-read from `journey_events`,
+   since the swept completion is rebuilt with an empty log list.
 6. **Lifecycle: manual close only.** `PATCH /incidents/{id}/resolve` is the only
    way an incident closes — there is deliberately no automatic mechanism. Resolving
    **cascades to every linked alert** (an incident is a collapsed *view* of those
@@ -1722,6 +1805,17 @@ reads no longer fetch, so there is nothing to expire.
   and dumps every recognized failure onto the novel path.
 - **Unknown clustering shapes default to order-specific, never INFRA.** A wrong
   fragment is noisy; a wrong merge asserts a shared root cause that doesn't exist.
+- **A recovered journey clusters as `TRANSIENT_FAILURE`, never as the failure
+  subtype for the same service.** The distinct subtype is what keeps the digests
+  apart; reusing `ENRICHMENT_FAILED` for a blip would merge a shipped order into
+  the outage incident and make every `journey_count` on the dashboard mean
+  "orders that touched a broken service" instead of "orders that broke". And
+  `TRANSIENT_FAILURE` must stay OUT of `journeys.outcome` — the order succeeded;
+  only the incident says a dependency flapped.
+- **Clean successes must never cluster.** `SUCCESS` eligibility is gated on the
+  journey having an ERROR that RECOVERED, not on `SUCCESS` itself — otherwise
+  every healthy order would attempt to cluster on every run and find no causal
+  line. Keep that check answerable from the in-memory logs on the live path.
 - **`UNRECOGNIZED_FAILURE` ≠ `TIMED_OUT`.** The first means a real ERROR nothing
   matched; the second means silence. Clustering treats them differently
   (`TIMED_OUT` needs a linked ERROR to be eligible at all), and collapsing the two

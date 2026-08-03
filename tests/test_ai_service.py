@@ -352,15 +352,15 @@ def test_route_prompt_examples_cover_general_and_technical_routes():
 # motivated this: a DLQ example still naming "order.inbound.dlq" (renamed to
 # "<queue>_error" by the realignment) and a creation-failure example inventing a
 # fused "DB_TIMEOUT — no order was created" line no emitter ever wrote.
-_V7 = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v7.json"
+_FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v8.json"
 
 
-def _v7_alertable_messages() -> list[str]:
+def _alertable_messages() -> list[str]:
     """Every WARN/ERROR message in the captured corpus.
 
-    v7 is a list of flow objects, each holding its log lines under ``events``.
+    The fixture is a list of flow objects, each holding its lines under ``events``.
     """
-    flows = json.loads(_V7.read_text(encoding="utf-8"))
+    flows = json.loads(_FIXTURE.read_text(encoding="utf-8"))
     return [
         log["message"]
         for flow in flows
@@ -370,32 +370,41 @@ def _v7_alertable_messages() -> list[str]:
 
 
 def _mask_ids(text: str) -> str:
-    """Mask the volatile id families so an example matches the corpus by SHAPE.
+    """Mask the volatile values so an example matches the corpus by SHAPE.
 
-    Same three shapes the stitcher mines and semcache normalizes — the examples
+    The three id shapes the stitcher mines and semcache normalizes — the examples
     carry their own illustrative ids (ORD-6042, evt-1a2b), which will never equal
     a captured one.
+
+    Plus two values the EMITTERS randomize per run: the computed margin
+    percentage (checker.py) and Feign call latencies. They are not ids, so
+    semcache deliberately leaves them alone, but here they would make an example
+    match only the one capture it was copied from — which is why re-capturing the
+    fixture used to "break" a prompt that had not changed. The threshold is NOT
+    masked: it is fixed, and it is the part of the sentence that carries meaning.
     """
     for pattern, token in (
         (r"evt-[0-9a-f-]{8,}", "<EVT>"),
         (r"\bORD-\d+\b", "<ORD>"),
         (r"\b\d{19}\b", "<CART>"),
         (r"\b\d{8}\b", "<ACC>"),
+        (r"margin \d+\.\d+%", "margin <PCT>%"),
+        (r"\(\d+ms\)", "(<MS>)"),
     ):
         text = re.sub(pattern, token, text)
     return text
 
 
-@pytest.mark.skipif(not _V7.exists(), reason="mock-order-flows-v7.json not captured")
+@pytest.mark.skipif(not _FIXTURE.exists(), reason="mock-order-flows-v8.json not captured")
 def test_route_prompt_examples_match_the_fixture_corpus():
-    """Every `message=` in the few-shot must exist in v7, up to volatile ids.
+    """Every `message=` in the few-shot must exist in the fixture, up to volatile values.
 
     Failing here means either the prompt drifted or an emitter's message changed —
     both need a human, because the examples are what steer the routing.
     """
     from ai_service.nodes import _ROUTE_EXAMPLES
 
-    corpus = {_mask_ids(m) for m in _v7_alertable_messages()}
+    corpus = {_mask_ids(m) for m in _alertable_messages()}
     assert corpus, "fixture produced no WARN/ERROR logs"
 
     # Each example line is `message=<text> -> {json}`; take the text between them.
@@ -405,11 +414,11 @@ def test_route_prompt_examples_match_the_fixture_corpus():
     stale = [ex for ex in examples if _mask_ids(ex.strip()) not in corpus]
     assert not stale, (
         "few-shot examples no longer match any message the emitters produce "
-        f"(update them from {_V7.name}): {stale}"
+        f"(update them from {_FIXTURE.name}): {stale}"
     )
 
 
-@pytest.mark.skipif(not _V7.exists(), reason="mock-order-flows-v7.json not captured")
+@pytest.mark.skipif(not _FIXTURE.exists(), reason="mock-order-flows-v8.json not captured")
 def test_route_prompt_covers_the_corpus_frequent_alert_types():
     """The recurring alert types must each be represented in the few-shot.
 

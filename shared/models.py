@@ -62,6 +62,13 @@ class BatonContext(BaseModel):
     cartHeaderId: str | None = None
     bridge_ids: BridgeIds = "random"
     fail_at: str | None = None
+    # A block that fails ONCE and then succeeds — the transient-blip knob,
+    # deliberately separate from ``fail_at``. ``fail_at`` means "emit the failure
+    # variant AND stop the chain" (shared/scenarios.py truncates on it); a flaky
+    # block emits its retry lines and forwards the baton, so the flow runs to
+    # completion. Keeping them apart is what leaves truncation untouched for
+    # every terminal-failure scenario.
+    flaky_at: str | None = None
 
 
 class Baton(BaseModel):

@@ -24,6 +24,7 @@ from backend.journeys import (
     detect_terminal,
     is_stalled,
     status_for,
+    unrecovered_errors,
     SUCCESS,
     TIMED_OUT,
     UNRECOGNIZED_FAILURE,
@@ -52,13 +53,14 @@ def mk(
     orderId: str | None = None,
     cartHeaderId: str | None = None,
     log_id: str | None = None,
+    logger: str = "c.c.test.Logger",
 ) -> LogLine:
     return LogLine(
         log_id=log_id or f"log-{offset_s}-{message[:10]}",
         timestamp=BASE + timedelta(seconds=offset_s),
         app_name=app_name,
         level=level,
-        logger="c.c.test.Logger",
+        logger=logger,
         host="CCECMEWEBT001",
         process_id="1234",
         thread="rabbit-listener-1",
@@ -213,6 +215,134 @@ def test_status_for():
     assert status_for(UNRECOGNIZED_FAILURE) is JourneyStatus.FAILED
 
 
+# --- unrecovered_errors: transient blips vs real failures --------------------
+# The rule: an ERROR is RECOVERED when a later log from the same source
+# (app_name AND logger) is INFO/DEBUG. Scenario 18 (SPT times out once, the
+# retry succeeds) is the flow this exists for.
+
+_SPT_CLIENT = "c.c.orderengine.client.SptClient"
+_SPT_TIMEOUT_MSG = (
+    "[SptClient#getSptPriceListCode] <--- ERROR "
+    "java.net.SocketTimeoutException: connect timed out (10014ms)"
+)
+_SPT_RETRY_MSG = "Retrying SPT price list call for account 81036533 (attempt 2/3)"
+_SPT_RECOVERED_MSG = "SPT price list call for account 81036533 succeeded on attempt 2/3"
+
+
+def _recovered_blip() -> list[LogLine]:
+    """Scenario 18's SPT window: timeout ERROR, retry WARN, then success."""
+    return [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+        mk(1, _SPT_RETRY_MSG, level="WARN", logger=_SPT_CLIENT),
+        mk(2, _SPT_RECOVERED_MSG, level="INFO", logger=_SPT_CLIENT),
+    ]
+
+
+def test_a_recovered_error_is_not_unrecovered():
+    assert unrecovered_errors(_recovered_blip()) == []
+
+
+def test_an_error_with_no_later_success_stays_unrecovered():
+    logs = _recovered_blip()[:2]  # timeout + retry, no recovery line
+    assert [l.message for l in unrecovered_errors(logs)] == [_SPT_TIMEOUT_MSG]
+
+
+def test_recovery_must_come_from_the_same_logger():
+    """A different class logging INFO afterwards is NOT this error's recovery.
+
+    cc-order-engine emits many INFO lines from other classes after any failure,
+    so an app_name-only rule would clear a genuine outage.
+    """
+    logs = [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+        mk(1, "Order was created successfully for account : 81036533",
+           level="INFO", logger="c.c.orderengine.service.OrderService"),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_recovery_must_come_from_the_same_app():
+    """Same class name, different service — not the same source."""
+    logs = [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR",
+           app_name="cc-order-engine", logger=_SPT_CLIENT),
+        mk(1, "fine", level="INFO", app_name="cc-spt-service", logger=_SPT_CLIENT),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_recovery_must_come_AFTER_the_error():
+    """An earlier healthy line cannot retro-clear a later failure.
+
+    Every outage logs its own healthy preamble (the ---> request line), so
+    ignoring order would clear every ERROR in the corpus.
+    """
+    logs = [
+        mk(0, "[SptClient#getSptPriceListCode] ---> GET", level="DEBUG", logger=_SPT_CLIENT),
+        mk(1, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_a_warn_does_not_count_as_recovery():
+    """Only INFO/DEBUG is healthy activity — a retry WARN is still trouble."""
+    logs = [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+        mk(1, _SPT_RETRY_MSG, level="WARN", logger=_SPT_CLIENT),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_stalled_journey_with_a_RECOVERED_error_is_timed_out():
+    """THE regression test for the transient-failure fix.
+
+    A journey whose only ERROR recovered, and which then stalls for some
+    unrelated reason, is SILENCE — TIMED_OUT. Labelling it FAILED would name the
+    recovered blip as its cause and send it down clustering's embedding path,
+    where it can merge with genuinely unrelated incidents.
+    """
+    a = JourneyAssembler()
+    a.add([
+        mk(0, "Received inbound order event evt-1",
+           app_name="cc-inbound-service", eventId="evt-1"),
+        *[mk(l.timestamp.second + 1, l.message, level=l.level,
+             logger=l.logger, eventId="evt-1") for l in _recovered_blip()],
+    ])
+    done = a.evaluate(now=BASE + timedelta(seconds=STALLED_TIMEOUT + 10))
+    assert len(done) == 1
+    assert done[0].status is JourneyStatus.TIMED_OUT
+    assert done[0].outcome == TIMED_OUT
+
+
+def test_stalled_journey_with_an_UNRECOVERED_error_is_still_unrecognized_failure():
+    """The over-correction guard: a real ERROR that never recovered still fails.
+
+    This is scenarios 15/16/17 — the Settings ERROR whose chain truncates
+    immediately after, so nothing from that logger ever logs again.
+    """
+    a = JourneyAssembler()
+    a.add([
+        mk(0, "Received inbound order event evt-1",
+           app_name="cc-inbound-service", eventId="evt-1"),
+        mk(1, "Error while calling settings: settings service unavailable after 8000ms",
+           level="ERROR", app_name="cc-inbound-service",
+           logger="c.c.inbound.client.SettingsClient", eventId="evt-1"),
+    ])
+    done = a.evaluate(now=BASE + timedelta(seconds=STALLED_TIMEOUT + 10))
+    assert len(done) == 1
+    assert done[0].status is JourneyStatus.FAILED
+    assert done[0].outcome == UNRECOGNIZED_FAILURE
+
+
+def test_a_journey_with_no_error_at_all_is_still_timed_out():
+    """Unchanged behaviour — silence with no ERROR was always TIMED_OUT."""
+    a = JourneyAssembler()
+    a.add([mk(0, "Received inbound order event evt-1",
+              app_name="cc-inbound-service", eventId="evt-1")])
+    done = a.evaluate(now=BASE + timedelta(seconds=STALLED_TIMEOUT + 10))
+    assert done[0].outcome == TIMED_OUT
+
+
 # --- JourneyAssembler: incremental decisions --------------------------------
 
 
@@ -352,7 +482,7 @@ def test_assembler_lazy_across_batches():
 
 # =============================================================================
 # Fixture-driven end-to-end: the canonical flows
-# (pipeline/data/mock-order-flows-v7.json — captured from the five-hop
+# (pipeline/data/mock-order-flows-v8.json — captured from the five-hop
 # emitters; the realignment's Layer 4 produces it).
 #
 # Each flow is a real captured log stream ("events") plus its expected
@@ -369,14 +499,14 @@ from backend.stitching import Stitcher  # noqa: F401 — used via JourneyAssembl
 
 FIXTURE = (
     Path(__file__).resolve().parent.parent
-    / "pipeline" / "data" / "mock-order-flows-v7.json"
+    / "pipeline" / "data" / "mock-order-flows-v8.json"
 )
 # v6 predates the five-hop realignment (its success flows end at Track & Trace,
 # which is mid-flow now), so these tests only make sense against v7. Until the
 # Layer-4 capture lands, skip loudly rather than fail confusingly.
 _V7_MISSING = not FIXTURE.exists()
 pytest_v7 = pytest.mark.skipif(
-    _V7_MISSING, reason="mock-order-flows-v7.json not yet captured (realignment Layer 4)"
+    _V7_MISSING, reason="mock-order-flows-v8.json not yet captured (realignment Layer 4)"
 )
 
 # The join lives in the order-engine creation logs' TEXT (mined). We locate the

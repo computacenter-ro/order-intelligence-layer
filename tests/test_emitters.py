@@ -32,7 +32,7 @@ from pipeline.services.registry import BLOCKS
 from shared.models import Baton, BatonContext, LogLine
 from shared.scenarios import SCENARIOS, all_scenarios, compile_steps
 
-FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v7.json"
+FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v8.json"
 
 # Importing the service modules registers their blocks (import side-effect).
 _SERVICE_MODULES = [
@@ -121,6 +121,10 @@ TERMINAL_CONTAINS = {
     15: "settings service unavailable",
     16: "settings service unavailable",
     17: "rejected",
+    # 18 RECOVERS from its SPT blip, so it runs the full chain and ends exactly
+    # where scenarios 1-3 do — on Inbound's close. That it shares a terminal with
+    # the clean successes is the point: a transient failure is not a failure.
+    18: "processing complete",
 }
 
 
@@ -389,6 +393,91 @@ async def test_solr_absent_from_flows_that_die_before_it(sid):
     failure (9) — all of which die earlier on Inbound's leg."""
     logs, _ctx = await _drive(sid)
     assert not [l for l in logs if l.app_name == "cc-solr-service"]
+
+
+# --- scenario 18: the transient failure that recovers ------------------------
+
+_SPT_CLIENT = "c.c.orderengine.client.SptClient"
+
+
+@pytest.mark.asyncio
+async def test_flaky_spt_emits_a_timeout_then_recovers():
+    """The blip: a timeout ERROR and a retry WARN, then the normal success lines.
+
+    The first two are the SAME wording the SPT-down variant uses for its first
+    attempt — a blip and an outage are indistinguishable until the retry lands.
+    """
+    logs, _ctx = await _drive(18)
+    spt_client = [l for l in logs if l.logger == _SPT_CLIENT]
+    levels = [l.level for l in spt_client]
+    assert "ERROR" in levels and "WARN" in levels
+
+    error = next(l for l in spt_client if l.level == "ERROR")
+    assert "SocketTimeoutException" in error.message
+    retry = next(l for l in spt_client if l.level == "WARN")
+    assert "attempt 2/3" in retry.message
+
+    # The recovery marker comes from the SAME logger — that pairing is what
+    # backend/journeys.py's unrecovered_errors reads.
+    recovery = [l for l in spt_client if l.level == "INFO" and "succeeded" in l.message]
+    assert recovery, "no recovery line from SptClient"
+    assert logs.index(recovery[0]) > logs.index(error)
+
+    # The satellite's own happy-path lines still ran: the retry is what succeeds.
+    assert [l for l in logs if l.app_name == "cc-spt-service"
+            and "Resolved price list code" in l.message]
+
+
+@pytest.mark.asyncio
+async def test_flaky_spt_never_emits_the_fatal_abort_line():
+    """The one line that separates a blip from an outage.
+
+    "Order processing aborted" is what _FAILURE_RULES maps to ENRICHMENT_FAILED;
+    emitting it here would turn the recovery into a FAILED journey.
+    """
+    logs, _ctx = await _drive(18)
+    assert not [l for l in logs if "processing aborted" in l.message.lower()]
+
+
+@pytest.mark.asyncio
+async def test_flaky_flow_runs_the_whole_chain_and_classifies_as_success():
+    """End to end: no retry line classifies, and the journey resolves SUCCESS."""
+    from backend.journeys import SUCCESS, classify_failure, detect_terminal
+
+    logs, _ctx = await _drive(18)
+    for log in logs:
+        assert classify_failure(log.message) is None, (
+            f"S18: {log.message!r} classifies as a failure"
+        )
+    assert detect_terminal(logs) == SUCCESS
+    # It reached the far end of the chain — SAP submission and Inbound's close.
+    assert [l for l in logs if l.app_name == "cc-outbound-osw"]
+    assert logs[-1].app_name == "cc-inbound-service"
+
+
+@pytest.mark.asyncio
+async def test_flaky_flow_carries_a_real_error_on_a_success_journey():
+    """The point of the scenario: an ERROR alone does not condemn a journey.
+
+    Deliberate and noted in CLAUDE.md — these WARN/ERROR alerts hang off a
+    SUCCESS journey and are never clustered (incident eligibility is
+    FAILED/TIMED_OUT only).
+    """
+    from backend.journeys import unrecovered_errors
+
+    logs, _ctx = await _drive(18)
+    assert [l for l in logs if l.level == "ERROR"], "S18 should carry a real ERROR"
+    assert unrecovered_errors(logs) == [], "S18's ERROR must read as recovered"
+
+
+@pytest.mark.asyncio
+async def test_the_spt_outage_still_fails_terminally():
+    """The guard against over-correcting: scenario 8 is unchanged."""
+    from backend.journeys import ENRICHMENT_FAILED, detect_terminal, unrecovered_errors
+
+    logs, _ctx = await _drive(8)
+    assert detect_terminal(logs) == ENRICHMENT_FAILED
+    assert unrecovered_errors(logs), "a real outage must leave unrecovered ERRORs"
 
 
 @pytest.mark.asyncio

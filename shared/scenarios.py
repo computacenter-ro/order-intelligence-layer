@@ -157,7 +157,23 @@ class Scenario:
     accountNumber: str
     lines: list[OrderLine]
     bridge_ids: BridgeIds = "both"      # INERT — kept only for schema stability
-    fail_at: str | None = None          # block name that fails, or None
+    fail_at: str | None = None          # block name that fails FATALLY, or None
+    # A block that fails once and RECOVERS on retry — the normal case in the real
+    # system (inbound-order.md §7.2: Feign clients retry 4x with backoff on 5xx,
+    # so Settings/JAM/Salesforce blips recover routinely; we used to model only
+    # the terminal tail of that).
+    #
+    # DELIBERATELY NOT ``fail_at``: that knob means "emit the failure variant AND
+    # stop", and ``compile_steps`` truncates the chain at it (``_failing_step``).
+    # A recovering flow must run to completion, so the compiler below reads
+    # ``flaky_at`` NOWHERE — a flaky scenario compiles to the full success chain,
+    # byte-identical to scenario 1's. The knob is consumed only by the emitter
+    # block, which emits its retry lines and then forwards the baton.
+    #
+    # The two are mutually exclusive: setting both would truncate at ``fail_at``
+    # before the flaky block ever ran. Pinned by a test rather than enforced at
+    # runtime.
+    flaky_at: str | None = None
 
     # test ground-truth (derived-but-explicit, so tests key off one place)
     reaches_creation: bool = True       # False for pre-creation failures
@@ -179,6 +195,7 @@ class Scenario:
             "lines": list(self.lines),
             "bridge_ids": self.bridge_ids,
             "fail_at": self.fail_at,
+            "flaky_at": self.flaky_at,
         }
 
 
@@ -279,6 +296,10 @@ def compile_steps(scenario: Scenario) -> list[tuple[str, str]]:
     Success scenarios return the full chain; failure scenarios truncate the
     chain *inclusive* of the failing block, so nothing runs past a fatal
     failure (CLAUDE.md: "the baton is not forwarded past a fatal failure").
+
+    ``scenario.flaky_at`` is deliberately NOT consulted: a transient failure
+    recovers, so its flow runs the complete chain exactly like a success
+    scenario. Only ``fail_at`` truncates.
     """
     chain = _full_chain(scenario)
     if scenario.fail_at is None:
@@ -586,6 +607,42 @@ SCENARIOS: dict[int, Scenario] = {
         fail_at="settings_rejected",
         reaches_creation=False,     # pre-creation — see scenario 15
         terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
+    # =====================================================================
+    # 18 — the TRANSIENT failure: the only scenario that fails and RECOVERS.
+    #
+    # Scenarios 1-17 either succeed cleanly or fail terminally; every retry
+    # loop in pipeline/services/ exhausts. That models only the terminal tail
+    # of the real system's behaviour — inbound-order.md §7.2 documents Feign
+    # clients retrying 4x with backoff on 5xx, so a downstream blip recovering
+    # on retry is the NORMAL case.
+    #
+    # SPT times out once, the retry succeeds, and the flow continues through
+    # RSM → Validator → Checker → dispatch → SAP → Inbound's close. So:
+    #   * ``flaky_at`` (NOT ``fail_at``) — the chain is NOT truncated;
+    #     ``terminal`` is Inbound's close, exactly like scenarios 1-3.
+    #   * the outcome is SUCCESS: the recovery variant emits the timeout ERROR
+    #     and the retry WARN, but never SPT-down's fatal "Order processing
+    #     aborted" line — the only line in that path _FAILURE_RULES matches.
+    #   * the journey still carries a real ERROR. That is the point: it proves
+    #     an ERROR alone does not make a journey FAILED (backend/journeys.py's
+    #     _state consults unrecovered_errors, not any-ERROR).
+    #
+    # Known and deliberate (see CLAUDE.md): this produces WARN/ERROR alerts on
+    # a SUCCESS journey, and those alerts are never clustered — incident
+    # eligibility is FAILED/TIMED_OUT only.
+    # =====================================================================
+    18: Scenario(
+        id=18,
+        name="Transient enrichment failure (SPT times out once, recovers on retry)",
+        outcome="SUCCESS",
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("3652269", "SKU-GPU-A100-80GB")],
+        bridge_ids="both",
+        flaky_at="spt",             # recovers — does NOT truncate the chain
+        terminal=(INBOUND, BLOCKS.CLOSE),
     ),
 }
 

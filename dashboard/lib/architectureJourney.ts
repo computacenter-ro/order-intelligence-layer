@@ -319,11 +319,20 @@ export const JOURNEY_STEPS: JourneyStep[] = [
   },
 
   // ── Hop 4: dispatch and submission ──────────────────────────────────────
+  // Two legs, one hop — the same publish-then-consume split as hop 1: the
+  // engine's responsibility ends at the queue (order-engine.md §9.3), so the
+  // token must visibly pass through rmq_out, never shortcut to Outbound OSW.
   {
     from: "order_engine",
+    to: "rmq_out",
+    phase: "phase2",
+    caption: "The engine publishes order.create.sap — its part of the journey ends here  (hop 4 of 5)",
+  },
+  {
+    from: "rmq_out",
     to: "outbound",
     phase: "phase2",
-    caption: "Dispatched on order.create.sap → Outbound OSW  (hop 4 of 5)",
+    caption: "order.create.sap reaches Outbound OSW",
   },
   {
     from: "outbound",

@@ -91,7 +91,8 @@ const NODE_H = 50;
 
 /**
  * Layout: one horizontal SPINE at mid-height — Inbound → RabbitMQ → Order
- * Engine → Outbound OSW → SAP Fulfilment — with everything else hanging off it:
+ * Engine → RabbitMQ → Outbound OSW → SAP Fulfilment — with everything else
+ * hanging off it:
  *
  *   - INBOUND's satellites (Settings / JAM / SOLR) in a column BELOW-LEFT of
  *     it, top-to-bottom in call order, reached leftward from Inbound's left
@@ -132,7 +133,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Orders B2B / SF",
     category: "external",
     description:
-      "Incoming orders from B2B customers and Salesforce — the source of every order event.",
+      "Where orders come from — B2B customer channels and Salesforce. Every order in the pipeline starts here.",
     // Sits below-left of SAP BTP in the source, angling up into it.
     x: COL.ordersSrc,
     y: 736,
@@ -144,7 +145,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "SAP BTP",
     category: "external",
     description:
-      "SAP Business Technology Platform — the integration entry point where orders arrive; simulated by the injector.",
+      "SAP's integration layer — the bridge between the external order sources and the internal order pipeline.",
     x: COL.btp,
     y: 706,
     w: 124,
@@ -157,7 +158,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Inbound",
     category: "service",
     description:
-      "cc-inbound-service: receives the raw order event (audit row, transform, SKU mapping), runs the pre-creation checks via Settings, JAM and SOLR, requests creation with order.approval, and receives the closing order_created — the flow both starts AND ends here.",
+      "The pipeline's front door — receives incoming orders, prepares them, and hands them to the Order Engine.",
     x: COL.inbound,
     y: SPINE_Y,
     w: NODE_W,
@@ -168,7 +169,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "RabbitMQ",
     category: "queue",
     description:
-      "The Inbound ↔ Order Engine control queues: order.init, order_data_ready, order.approval and the closing order_created all ride here; failed deliveries dead-letter to order.init_error.",
+      "Message broker carrying the back-and-forth between Inbound and the Order Engine — orders travel through the pipeline as queue messages, not direct calls.",
     x: COL.queueIn,
     y: SPINE_Y,
     w: NODE_W,
@@ -179,7 +180,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Order Engine",
     category: "service",
     description:
-      "cc-order-engine: takes TWO turns — first assembles default order data (persisting nothing, answering order_data_ready), then on order.approval persists the cart header to BM DB (order INACTIVE), registers Track & Trace, and runs SPT, RSM and the auto-approval rules before dispatching to SAP.",
+      "The heart of the pipeline — creates the order, runs the checks, and decides whether it can go to SAP.",
     x: COL.engine,
     y: SPINE_Y,
     w: 156,
@@ -189,7 +190,7 @@ export const ARCH_NODES: ArchNode[] = [
     id: "outbound",
     label: "Outbound OSW",
     category: "service",
-    description: "cc-outbound-osw: submits the order to SAP fulfilment via RFC (Submit).",
+    description: "Sends completed orders on to SAP for fulfilment.",
     x: COL.farRight - 66,
     y: SPINE_Y,
     w: 132,
@@ -200,7 +201,7 @@ export const ARCH_NODES: ArchNode[] = [
     id: "sap_ful",
     label: "SAP Fulfilment",
     category: "external",
-    description: "SAP ECC fulfilment system that receives the submitted order.",
+    description: "Where the order goes once the pipeline is done with it — SAP takes over delivery and invoicing.",
     x: COL.farRight + 76,
     y: SPINE_Y,
     w: 74,
@@ -213,7 +214,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "BM DB",
     category: "datastore",
     description:
-      "Business-master database where the Order Engine persists the cart header on its SECOND turn — the ids are born here, with the order still INACTIVE.",
+      "The order database — the Order Engine writes each order here at creation, and the order's identifiers exist from this point on.",
     x: COL.engine,
     y: 92,
     w: 104,
@@ -224,7 +225,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "UI Order Engine (Angular)",
     category: "ui",
     description:
-      "The Angular UI an agent uses to interact with the Order Engine (not part of the simulation).",
+      "The screen agents use to view, edit, approve or reject orders in the Order Engine. Not part of this simulation.",
     x: COL.engine,
     y: 566,
     w: 140,
@@ -234,7 +235,7 @@ export const ARCH_NODES: ArchNode[] = [
     id: "oe_user",
     label: "OE Login User",
     category: "actor",
-    description: "The support agent who signs into the Order Engine UI.",
+    description: "The person behind the screen — a Computacenter agent working orders through the UI.",
     x: COL.engine,
     y: 714,
     w: 128,
@@ -246,7 +247,7 @@ export const ARCH_NODES: ArchNode[] = [
     id: "sf_settings",
     label: "Salesforce Settings",
     category: "external",
-    description: "Salesforce source that pushes settings into the Settings service.",
+    description: "Where customer configuration is maintained — pushed from Salesforce into the Settings service the pipeline reads.",
     x: COL.inboundSat,
     y: 356,
     w: 132,
@@ -257,7 +258,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Settings",
     category: "service",
     description:
-      "cc-settings-service: margin thresholds and account settings, SQL-backed and pushed from Salesforce. Called by INBOUND, before the order exists (Get Settings).",
+      "Serves per-customer configuration — account settings and business thresholds the pipeline consults before an order is created.",
     x: COL.inboundSat,
     y: 470,
     w: NODE_W,
@@ -268,7 +269,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "JAM",
     category: "service",
     description:
-      "cc-jam-service: user authentication and privileges. Called by INBOUND before the order exists — a disabled account blocks the flow (403) as a pre-creation failure.",
+      "The authentication and privileges service — confirms the ordering user's identity and rights; a blocked account stops the order before it's created.",
     x: COL.inboundSat,
     y: 550,
     w: NODE_W,
@@ -279,7 +280,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "SOLR",
     category: "service",
     description:
-      "cc-solr-service — catalogue-line matching. Called by INBOUND before the order exists (placement inferred: no service doc mentions SOLR).",
+      "The product-search service — finds the catalogue item behind each order line so the order references real products.",
     x: COL.inboundSat,
     y: 630,
     w: NODE_W,
@@ -292,7 +293,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "SPT",
     category: "service",
     description:
-      "cc-spt-service: pricing — returns the account's price lists (Get Prices). Position in the enrichment order is inferred, not documented.",
+      "The pricing service — supplies the account's price lists so the order's lines get their costs.",
     x: COL.upperSat,
     y: 84,
     w: NODE_W,
@@ -303,7 +304,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "RSM",
     category: "service",
     description:
-      "cc-rsm-service: rebate scheme manager — computes rebates / PVC rates (Get Rebates). Position in the enrichment order is inferred, not documented.",
+      "Provides rebate and PVC information.",
     x: COL.upperSat,
     y: 176,
     w: NODE_W,
@@ -316,7 +317,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Validator",
     category: "service",
     description:
-      "cc-validator-service: auto-approval RULE 1 — runs the validation strategies first among the checks; rejects on missing UDFs (e.g. costCenter).",
+      "Runs the business validation rules — required fields, addresses, quantities, dates — and reports anything wrong with the order.",
     x: COL.rightSat,
     y: 104,
     w: NODE_W,
@@ -327,7 +328,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Avalara",
     category: "service",
     description:
-      "US ship-to address verification — still rule 1, US orders only, between the Validator and the Checker.",
+      "Verifies US shipping addresses (US orders only).",
     x: COL.rightSat,
     y: 200,
     w: NODE_W,
@@ -338,7 +339,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Checker",
     category: "service",
     description:
-      "cc-checker-service: auto-approval RULE 3 — the margin check, last of the rules; can block the order when the margin is below the configured threshold.",
+      "The margin check — verifies the order meets its margin rules; an order below threshold is held for a person to review.",
     x: COL.rightSat,
     y: 288,
     w: NODE_W,
@@ -349,22 +350,27 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Track & Trace",
     category: "service",
     description:
-      "cc-track-trace: registers the order for tracking IMMEDIATELY after creation — mid-flow, before the checks. No longer the success terminal: the flow ends back at Inbound.",
+      "Registers the newly created order for tracking so its progress is visible to the customer from this point on.",
     x: COL.rightSat,
     y: 490,
     w: NODE_W,
     h: 50,
   },
 
-  // The outbound queue sits ABOVE Outbound OSW in the source.
+  // ON the spine between the engine and Outbound OSW — the same grammar as
+  // rmq_in: the order's path runs THROUGH the queue, never past it. (The
+  // source sketch parks this queue above Outbound OSW, but an off-path queue
+  // reads as optional, and routing the publish leg up to it would either
+  // cross the right-hand satellite bus or overlap the consume leg.)
   {
     id: "rmq_out",
     label: "RabbitMQ",
     category: "queue",
     description:
-      "order.create.sap — carries the checked order to Outbound OSW; failed deliveries dead-letter to order.create.sap_error.",
-    x: COL.farRight - 66,
-    y: 254,
+      "Message queue on the way out — approved orders wait here until Outbound OSW picks them up for SAP.",
+    // Midpoint of the gap between the engine's right edge and Outbound's left.
+    x: 983,
+    y: SPINE_Y,
     w: NODE_W,
     h: 50,
   },
@@ -406,9 +412,22 @@ export const ARCH_EDGES: ArchEdge[] = [
     labelDx: -4,
     labelDy: 44,
   },
-  { from: "order_engine", to: "outbound", label: "order.create.sap", fromSide: "right", toSide: "left" },
+  // Hop 4 rides a queue like every other hop: the engine PUBLISHES
+  // order.create.sap — its responsibility ends there (order-engine.md §9.3,
+  // §9 row 10) — and Outbound OSW consumes it. A direct engine → outbound
+  // edge would assert a synchronous handoff that does not exist.
+  {
+    from: "order_engine",
+    to: "rmq_out",
+    label: "order.create.sap",
+    fromSide: "right",
+    toSide: "left",
+    // Above the line: the run's midpoint sits on the satellite bus's elbows
+    // at x≈814, and the label halo would knock them out of the drawing.
+    labelDy: -26,
+  },
+  { from: "rmq_out", to: "outbound", fromSide: "right", toSide: "left" },
   { from: "outbound", to: "sap_ful", fromSide: "right", toSide: "left" },
-  { from: "rmq_out", to: "outbound", fromSide: "bottom", toSide: "top" },
 
   // ── Above / below the engine ──────────────────────────────────────────────
   {

@@ -307,7 +307,7 @@ def test_route_prompt_defines_every_department():
     assert not missing, f"departments missing a prompt definition: {missing}"
 
 
-def test_route_prompt_draws_the_backend_vs_general_line():
+def test_route_prompt_draws_the_backend_vs_business_line():
     # The misroute this prompt fixes: business-rule rejections landing on backend.
     # Assert the two load-bearing instructions survive future edits.
     from ai_service.nodes import _ROUTE_SYSTEM
@@ -334,11 +334,11 @@ def test_route_prompt_examples_are_valid_enum_values():
         assert set(obj) == {"department", "severity"}, f"unexpected keys in {raw}"
 
 
-def test_route_prompt_examples_cover_general_and_technical_routes():
-    # Paired by design: general-only examples would bias the model toward general.
+def test_route_prompt_examples_cover_business_and_technical_routes():
+    # Paired by design: business-only examples would bias the model toward business.
     from ai_service.nodes import _ROUTE_EXAMPLES
 
-    for dept in ("general", "networking", "database", "devops"):
+    for dept in ("business", "networking", "database", "devops"):
         assert f'"department": "{dept}"' in _ROUTE_EXAMPLES
 
 

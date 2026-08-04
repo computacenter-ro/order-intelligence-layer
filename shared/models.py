@@ -77,11 +77,32 @@ class Baton(BaseModel):
 
 
 class Department(str, Enum):
+    """The team an alert is routed to (``ai_service/nodes.py``'s router node).
+
+    ``business`` was called ``general`` until the Teams channel split gave it its
+    own ``business`` channel, at which point the old name was actively misleading:
+    the dashboard rendered "General" for an alert whose card went to
+    ``#business-logs``. It is also semantically empty, which is why the router
+    prompt had to insist "the answer is general, whatever the log level" — a
+    department that names what it MEANS makes the model's job easier.
+
+    ``business`` = **not an engineering fault**: the pipeline worked exactly as
+    designed and correctly *rejected* an order (margin below threshold, missing
+    ``costCenter`` UDF, disabled JAM account, unmapped product). Nobody changes
+    code. The load-bearing contrast is with ``backend``, which is an actual defect.
+
+    ⚠ A channel is not a department — see ``_DEPARTMENT_CHANNELS`` in
+    ``backend/teams.py``. There was once a ``general`` Teams channel that carried
+    journey completions; those notifications were dropped, and the channel is now
+    ``reports`` (``TEAMS_WEBHOOK_REPORTS``), carrying the twice-daily digest and
+    nothing else. None of that is or ever was this department.
+    """
+
     networking = "networking"
     devops = "devops"
     backend = "backend"
     database = "database"
-    general = "general"
+    business = "business"
 
 
 class Severity(str, Enum):

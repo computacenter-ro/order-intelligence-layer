@@ -152,13 +152,33 @@ services:
       uvicorn backend.main:app --host 0.0.0.0 --port 8000
       --proxy-headers --forwarded-allow-ips=*
     env_file:
-      - path: .env          # TEAMS_WEBHOOK_* / DASHBOARD_URL for Teams notifications
+      # TEAMS_WEBHOOK_* / DASHBOARD_URL for Teams notifications. The glob is what
+      # carries the webhooks, so a NEW channel needs nothing here — only a line in
+      # .env. Six are live, all fed by `alert.new` and nothing else: _NETWORKING,
+      # _DEVOPS, _BACKEND, _DATABASE, _BUSINESS (source="ai" +
+      # department="business" — business rejections) and _FALLBACK
+      # (source="fallback" — the LLM was down). _REPORTS carries the 09:00 + 17:00
+      # reports and NO alert traffic (it was _GENERAL, which had meant three
+      # different things; journey completions posted there until they were dropped
+      # at thousands of cards a day).
+      # See backend/teams.py::channel_for.
+      # Do NOT list them under `environment:` — an unset ${VAR:-} default there
+      # would shadow the real value from .env.
+      - path: .env
         required: false     # optional: stdout fallback when absent (e.g. CI/teammates)
     ports:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oil}:${POSTGRES_PASSWORD:-oil}@postgres:5432/${POSTGRES_DB:-oil}
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # The twice-daily report's watermark (`teams:digest:last_sent`) lives in
+      # Redis — see backend/report.py. This is the ONLY thing in the backend that
+      # needs Redis, which is exactly why it was missing: until the report existed,
+      # Redis was the AI service's alone. Without it the code falls back to
+      # `redis://localhost:6379/0`, and inside a container `localhost` is the
+      # container itself, so every cycle logged
+      # "Error 111 connecting to localhost:6379" and no report ever went out.
+      REDIS_URL: redis://redis:6379/0
       # Reserved: the backend does NOT yet call /summarize-journey (see the TODO
       # in backend/journeys.py — summary is currently left None). Pre-wired by
       # service name so the integration works once that call is added.
@@ -167,6 +187,8 @@ services:
       migrate:
         condition: service_completed_successfully
       rabbitmq:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   dashboard:

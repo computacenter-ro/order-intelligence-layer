@@ -70,7 +70,7 @@ def wired():
     def _wire(chat_model=None, breaker=None, populate=True):
         idx = RagIndex(FakeEncoder(), min_score=0.30, max_entries=100)
         if populate:
-            idx.index("a1", "alert", MARGIN, {"department": "general", "order_id": "ORD-1"})
+            idx.index("a1", "alert", MARGIN, {"department": "business", "order_id": "ORD-1"})
             idx.index("a2", "alert", SAP, {"department": "networking"})
         ragindex.configure(RagDeps(index=idx, redis=None, dump_key="test:ragindex"))
         api.configure(
@@ -91,7 +91,7 @@ def wired():
 def _sources() -> list[dict]:
     return [
         {"id": "a1", "kind": "alert", "text": MARGIN,
-         "metadata": {"department": "general", "order_id": "ORD-1"}, "score": 0.7},
+         "metadata": {"department": "business", "order_id": "ORD-1"}, "score": 0.7},
         {"id": "a2", "kind": "alert", "text": SAP,
          "metadata": {"department": "networking"}, "score": 0.5},
     ]
@@ -114,7 +114,7 @@ def test_chat_prompt_contains_only_the_retrieved_context():
 
 def test_chat_prompt_includes_useful_metadata_only():
     prompt = nodes.build_chat_prompt("q", _sources())
-    assert "department=general" in prompt
+    assert "department=business" in prompt
     assert "order_id=ORD-1" in prompt
     # score is retrieval bookkeeping, not something to reason about.
     assert "score=" not in prompt
@@ -214,7 +214,7 @@ def test_sources_carry_metadata_for_link_building(wired):
     ).json()
     top = body["sources"][0]
     assert set(top) == {"id", "kind", "score", "snippet", "metadata"}
-    assert top["metadata"]["department"] == "general"
+    assert top["metadata"]["department"] == "business"
 
 
 def test_exploding_model_falls_back_to_retrieval_only(wired):

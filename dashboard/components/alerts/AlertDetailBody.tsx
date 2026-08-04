@@ -149,7 +149,15 @@ export function AlertDetailBody({ alert, search, onAsk, onNavigate }: AlertDetai
             {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
           </>
         ) : (
-          <Badge status="inactive">Fallback → #general-logs</Badge>
+          /* No channel name here, deliberately. The badge says what the alert IS
+             (unprocessed), not where it was sent: Teams routing changes again in
+             the later stages of docs/teams-notifications-plan.md, and a hardcoded
+             channel in the frontend goes stale silently — no test can catch a
+             string that merely became untrue.
+             Keep this a plain block comment: a brace-wrapped JSX comment is only
+             valid in child position, and here we are in expression position — the
+             brace would be parsed as an object literal and the build would fail. */
+          <Badge status="inactive">Fallback</Badge>
         )}
       </div>
 

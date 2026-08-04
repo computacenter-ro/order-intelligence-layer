@@ -41,10 +41,19 @@ _EXPLAIN_SYSTEM = (
 # updates the list automatically and silently leaves this block stale. Keep the two
 # in sync by hand.
 #
-# The load-bearing distinction is backend vs general: "the code misbehaved" vs "the
+# The load-bearing distinction is backend vs business: "the code misbehaved" vs "the
 # code behaved correctly and rejected the order". Without it the model routes on
 # surface association (log came from a service -> services are code -> backend), which
 # put every business-rule rejection on the backend team's queue as phantom work.
+#
+# 'business' was called 'general' until the department was renamed. The meaning is
+# unchanged and the wording below is deliberately the same wording — but a prompt
+# change is never behaviour-preserving, so the label itself may shift routing at the
+# margins. The new name should help rather than hurt: 'general' was semantically
+# empty and the prose had to fight it ("the answer is general, whatever the log
+# level"), whereas 'business' says what the verdict IS. Verify after deploying with
+# GET /alerts?department=business — if that list is thin while 'backend' grew, this
+# wording regressed.
 _DEPARTMENT_GUIDE = (
     "- networking: connectivity between services — timeouts, unreachable hosts, "
     "HTTP transport failures, a downstream service not answering.\n"
@@ -53,7 +62,7 @@ _DEPARTMENT_GUIDE = (
     "- database: persistence failures — DB timeouts, connection pools, SQL errors.\n"
     "- backend: an application code or integration DEFECT — the service itself "
     "behaved wrongly (unexpected exception, bad payload it produced, broken logic).\n"
-    "- general: NOT an engineering fault. The pipeline worked exactly as designed "
+    "- business: NOT an engineering fault. The pipeline worked exactly as designed "
     "and correctly REJECTED an order because of a business rule, user-supplied "
     "data, reference data, or account configuration. Nobody needs to change any "
     "code. Route here even though the log came from a service, is level=ERROR, "
@@ -61,20 +70,20 @@ _DEPARTMENT_GUIDE = (
 )
 
 # Examples are taken verbatim from the emitters' real message shapes so they match
-# at inference. Deliberately paired: each business-rule 'general' case sits next to a
-# genuine technical failure that looks similar on the surface, because the contrast
-# is what teaches the boundary — a list of general-only examples would just bias the
-# model toward general.
+# at inference. Deliberately paired: each business-rule 'business' case sits next to
+# a genuine technical failure that looks similar on the surface, because the contrast
+# is what teaches the boundary — a list of business-only examples would just bias the
+# model toward business.
 _ROUTE_EXAMPLES = (
     "Examples:\n"
     'message=Margin check FAILED for order ORD-6042: overall margin 8.10% below '
-    'threshold 12.00% -> {"department": "general", "severity": "medium"}  '
+    'threshold 12.00% -> {"department": "business", "severity": "medium"}  '
     "(the checker worked; the order is simply unprofitable)\n"
     "message=Validation failed: mandatory UDF 'costCenter' missing on line 2 -> "
-    '{"department": "general", "severity": "medium"}  '
+    '{"department": "business", "severity": "medium"}  '
     "(user-supplied data is incomplete; no defect)\n"
     "message=Authentication failed for user RFLORIA: account disabled in JAM -> "
-    '{"department": "general", "severity": "medium"}  '
+    '{"department": "business", "severity": "medium"}  '
     "(access administration, not code)\n"
     "message=Order processing aborted for order ORD-6108: SPT price list service "
     'unavailable after 3 attempt(s) -> {"department": "networking", "severity": '
@@ -85,7 +94,7 @@ _ROUTE_EXAMPLES = (
     # connectivity fault. Without this pair the model routes 403s to networking on
     # the strength of "HTTP/1.1" alone.
     "message=[JamClient#getUserProfileWithPrivilegesBySamAccountName] <--- "
-    'HTTP/1.1 403 (250ms) -> {"department": "general", "severity": "medium"}  '
+    'HTTP/1.1 403 (250ms) -> {"department": "business", "severity": "medium"}  '
     "(the call SUCCEEDED and was refused — an access "
     "decision; a 4xx authorization refusal is never a networking fault, whereas a "
     "timeout or connection error is)\n"
@@ -104,7 +113,7 @@ _ROUTE_SYSTEM = (
     "   Before choosing, ask: is anything actually BROKEN? If the service executed "
     "its logic correctly and the order was rejected on business grounds — margin "
     "thresholds, missing or invalid user input, disabled accounts, unmapped "
-    "products — the answer is general, whatever the log level and whichever "
+    "products — the answer is business, whatever the log level and whichever "
     "service emitted it. ERROR means the order stopped, not that code is at fault. "
     "Reserve backend for an actual defect.\n"
     f"2. Rate its technical severity as one of: {_SEVERITIES}. Judge how urgent "

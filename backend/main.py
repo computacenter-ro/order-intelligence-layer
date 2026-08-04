@@ -37,6 +37,7 @@ from backend.api import router as api_router
 from backend.auth import router as auth_router
 from backend.auth_entra import router as entra_router
 from backend.consumers import run_consumers
+from backend.report import report_loop
 from backend.ws import manager as hub
 from backend.ws import router as ws_router
 
@@ -109,15 +110,32 @@ async def lifespan(app: FastAPI):
     # Start the consumers + sweep as a background task. Events fan out to the WS
     # hub (the same one the /ws endpoint registers clients into) and to Teams —
     # API + WS + consumers share one hub in one process.
-    task = asyncio.create_task(_run_consumers_guarded())
+    #
+    # The twice-daily Teams report is a SEPARATE task, deliberately not part of
+    # run_consumers' gather and NOT wired to _fan_out:
+    #   * not in the gather, because that coroutine owns the RabbitMQ connection and
+    #     is torn down and retried whenever the broker blips — which would take the
+    #     reporter with it, exactly when a report still matters. It reads Postgres
+    #     and Redis and never the broker.
+    #   * not through _fan_out, because that also feeds the WebSocket hub and the
+    #     dashboard has no use for a report event (hence no `report.daily` in
+    #     backend/ws.py). The loop calls teams.notify directly.
+    tasks = [
+        asyncio.create_task(_run_consumers_guarded()),
+        asyncio.create_task(report_loop()),
+    ]
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+                print(f"[backend] background task failed on shutdown: {exc}", flush=True)
 
 
 def cors_allow_origins() -> list[str]:
@@ -168,3 +186,35 @@ app.include_router(ws_router)
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+def main() -> None:
+    """Run the ASGI app, so ``python -m backend.main`` works as CLAUDE.md documents.
+
+    Without this the module merely defined ``app`` and exited **silently** — zero
+    output, exit code 0 — so the documented dev command started no server, no
+    consumers and no report loop, while looking like it had done something. The
+    symptom is indistinguishable from "everything is fine but nothing happened",
+    which is the worst kind: the twice-daily Teams report simply never fired, and
+    the only clue was an unset ``teams:digest:last_sent`` watermark.
+
+    ``ai_service/main.py`` has always had this block, so the two services in the
+    same CLAUDE.md code block behaved differently under the same invocation shape.
+
+    Both compose files run ``uvicorn backend.main:app`` directly and are unaffected;
+    this is purely the local-dev entrypoint. Host and port stay env-driven so it
+    matches how the containers are configured rather than hardcoding :8000 twice.
+    """
+    import os
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.getenv("BACKEND_HOST", "127.0.0.1"),
+        port=int(os.getenv("BACKEND_PORT", "8000")),
+    )
+
+
+if __name__ == "__main__":
+    main()

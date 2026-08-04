@@ -13,6 +13,7 @@ import { FilterDropdown } from "@/components/alerts/FilterDropdown";
 import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
 import type { FilterOption } from "@/components/alerts/FilterDropdown";
 import { capitalize } from "@/lib/format";
+import { DEPARTMENTS } from "@/lib/alertFilters";
 import type { Department, Incident, IncidentStatus, WsEvent } from "@/lib/types";
 
 type StatusFilter = IncidentStatus | "all";
@@ -23,11 +24,11 @@ const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: "all", label: "All Statuses" },
 ];
 
-// Same 5 values as the Alert Feed's department filter (AlertFilterBar.tsx) —
-// kept as its own local list rather than importing from there, since that
-// constant isn't exported and duplicating five literals is cheaper than
-// exporting it purely to share.
-const DEPARTMENTS: Department[] = ["networking", "devops", "backend", "database", "general"];
+// The same 5 values as the Alert Feed's department filter, now IMPORTED rather
+// than duplicated. It used to be a local copy ("five literals are cheaper than
+// exporting it"), which the general -> business rename showed the cost of: the
+// copy has to be found and changed by hand, and missing it means this page offers
+// a filter value the enum-typed API rejects with a 422.
 const DEPARTMENT_OPTIONS: FilterOption[] = DEPARTMENTS.map((d) => ({
   value: d,
   label: capitalize(d),

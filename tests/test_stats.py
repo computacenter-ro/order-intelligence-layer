@@ -14,6 +14,7 @@ Three layers, no database and no broker:
   well-formed ``OverviewStats``.
 """
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -123,6 +124,75 @@ def test_incident_total_counts_incidents():
     assert "count(*)" in sql
     assert "FROM incidents" in sql
     assert "GROUP BY" not in sql
+
+
+# --- report query builders (used by backend/report.py, not /stats/insights) ---
+
+
+def test_unresolved_alerts_by_department_filters_and_groups():
+    sql = _compiled(stats.unresolved_alerts_by_department())
+    assert "FROM alerts" in sql
+    assert "GROUP BY alerts.department" in sql
+    # Only open alerts — the card is a backlog, not a history.
+    assert "alerts.is_resolved IS false" in sql
+    # The urgent column is a FILTERed aggregate in the SAME pass, so the two
+    # numbers cannot disagree under concurrent writes (journey_totals' pattern).
+    assert sql.count("count(*)") == 2
+    assert "FILTER (WHERE alerts.severity" in sql
+
+
+def test_urgent_counts_critical_only_and_is_not_widened():
+    """`urgent` == severity 'critical', deliberately. Critical is rare in this
+    corpus so the column often reads 0; including 'high' would make it a second
+    "everything" column and cost the word its meaning.
+
+    Asserted on the BOUND PARAMETERS, not the SQL text: the severity value is bound,
+    so a substring check against the statement would pass no matter what it compared
+    against."""
+    compiled = stats.unresolved_alerts_by_department().compile(
+        dialect=postgresql.dialect()
+    )
+    assert set(compiled.params.values()) == {"critical"}
+    assert "high" not in compiled.params.values()
+
+
+def test_alerts_created_in_window_bounds_emitted_at_half_open():
+    since = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 4, 6, 0, tzinfo=timezone.utc)
+    sql = _compiled(stats.alerts_created_in_window(since, until))
+    assert "count(*)" in sql
+    assert "FROM alerts" in sql
+    assert "alerts.emitted_at >=" in sql
+    assert "alerts.emitted_at <" in sql
+    assert "GROUP BY" not in sql
+
+
+def test_alerts_resolved_in_window_bounds_resolved_at_only():
+    """The definition the card's arithmetic depends on — see test_report.py for the
+    identity it makes true. Scoping by emitted_at too would drop yesterday's alert
+    triaged this morning, the commonest case of all."""
+    since = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 4, 6, 0, tzinfo=timezone.utc)
+    sql = _compiled(stats.alerts_resolved_in_window(since, until))
+    assert "alerts.resolved_at IS NOT NULL" in sql
+    assert "alerts.resolved_at >=" in sql
+    assert "alerts.resolved_at <" in sql
+    assert "emitted_at" not in sql
+
+
+def test_the_report_builders_do_not_change_the_insights_builders():
+    """The report deliberately did NOT retrofit since/until onto the eight existing
+    builders: nothing else needs a windowed breakdown, and an optional parameter
+    only one caller passes is a worse trade than two purpose-built queries."""
+    import inspect
+
+    for name in (
+        "journeys_by_status", "journeys_by_outcome", "alerts_by",
+        "alerts_resolution_counts", "alerts_cache_counts", "journey_totals",
+        "alert_total", "incidents_by_status",
+    ):
+        params = list(inspect.signature(getattr(stats, name)).parameters)
+        assert "since" not in params and "until" not in params, name
 
 
 def test_alerts_clustered_count_counts_alerts_with_an_incident():

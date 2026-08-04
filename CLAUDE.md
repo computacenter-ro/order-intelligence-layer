@@ -67,6 +67,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 ├── Caddyfile                     # prod reverse proxy + automatic TLS (one origin)
 ├── Dockerfile                    # one image for every Python service (differ only by command)
 ├── .github/workflows/            # ci.yml (dashboard build) + build-images.yml (GHCR push)
+│                                 #   + deploy.yml (manual Azure Container Apps redeploy — a SCAFFOLD)
 ├── alembic.ini                   # DB migrations config (backend/migrations)
 ├── pytest.ini                    # asyncio_mode=auto, testpaths=tests
 ├── requirements.txt              # includes pyyaml (doc frontmatter + service-map.yaml) — NOT optional
@@ -1668,6 +1669,12 @@ Connects to backend WS + REST. Feature contract:
   live on `incident.new` / `incident.updated`; the detail page lists member alerts
   grouped per order (`OrderGroupRow.tsx`) and offers Resolve
   (`IncidentActionsMenu.tsx`), which cascades to every member alert.
+  The **Status filter opens with nothing selected** (`""` = no filter, same contract
+  as the department multi-select) and is single-select: there is deliberately no
+  "All Statuses" row, because with two statuses it said what selecting neither
+  already says. `FilterDropdown`'s opt-in `clearable` prop supplies the
+  "Clear Status" row that gets you back to unfiltered; the Alert Feed's five
+  single-selects keep their explicit "All …" rows and are unaffected.
 - **Assistant panel** (`components/chat/ChatPanel.tsx` + `lib/chat.tsx`) — one
   drawer, mounted once in `AppShell`, opened from the side-nav, the alert drawer's
   "Ask about this", or a journey view. Opening it from a record passes a **scope**
@@ -1793,6 +1800,17 @@ Differences that matter:
   → `oil-app` for all Python services, `oil-dashboard` for Next.js); the VM only
   pulls. Building on the VM would need ~4 vCPUs for torch + the Next bundle and
   would put the private-registry npm token on the box.
+- **A second, separate target: `deploy.yml` (Azure Container Apps).** Unrelated to
+  the VM path above — it runs `az containerapp update` against five already-existing
+  container apps in `rg-internship-2026`, pinned to the `:prep-for-prod` image tag.
+  It is a **scaffold and does not run today**: trigger is `workflow_dispatch` only,
+  it creates no infrastructure (the first deploy is manual), and it needs an
+  `AZURE_CREDENTIALS` service-principal secret that is not yet set. Its header points
+  at `DEPLOY_STEP_BY_STEP.md`, which **does not exist anywhere in the repo** — so that
+  reference is dangling, not a file you have missed. Container Apps give the dashboard
+  and backend different hostnames, which is exactly the case `[5] Cross-site
+  deployment` covers: `CORS_ALLOW_ORIGINS`, `AUTH_COOKIE_SAMESITE=none` and
+  `AUTH_COOKIE_SECURE=true` must all change together.
 
 > ⚠ **Do not copy a development `.env` onto the VM.** Two services load it
 > wholesale via `env_file`, and `env_file` values **win** over the `environment:`

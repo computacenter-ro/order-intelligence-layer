@@ -92,6 +92,17 @@ export function LoginScreen() {
   const onPasswordStep = showPassword && (!bothAvailable || step === "password");
   const onChooserStep = !onPasswordStep && (showEntra || showPassword);
 
+  // Extracted only because two branches of the chooser now render this action (a
+  // quiet link when Entra is also available, the primary button when it is not).
+  // Behaviour is byte-for-byte what the inline handler did — one definition is what
+  // guarantees the two spellings cannot drift apart.
+  const goToPasswordStep = () => {
+    // Drop any Entra redirect error: it says nothing about the password form the
+    // user is about to see.
+    setAuthError(null);
+    setStep("password");
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (submitting) return;
@@ -118,8 +129,10 @@ export function LoginScreen() {
         background: "var(--cc-cloud-white)",
       }}
     >
-      {/* Left brand panel — light surface with the logo centered.
-          Hidden on narrow screens so the form takes the full width. */}
+      {/* Left brand panel — light surface with the logo above an ambient graphic
+          of an order flowing through the pipeline. Hidden below 768px by the media
+          query at the bottom of this file, which takes the graphic with it: one
+          breakpoint governs the whole panel. */}
       <aside
         className="login-brand-panel"
         style={{
@@ -127,17 +140,44 @@ export function LoginScreen() {
           background: "var(--cc-grey-six)",
           overflow: "hidden",
           display: "flex",
+          flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
+          gap: "40px",
         }}
       >
+        {/* Half the previous rendered size (was 258x132), keeping the asset's
+            aspect ratio so it is scaled, never redrawn: 132/258 x 150 ≈ 77. */}
         <Image
           src={ccLogoBlue}
           alt="Computacenter"
-          height={132}
-          width={258}
+          height={77}
+          width={150}
           priority
         />
+
+        {/* An order travelling through the pipeline: a track, four stage nodes and
+            two dots crossing it, the second offset half a cycle so the track is
+            never empty. BOTH dots are Heritage Blue — see the note on
+            `.login-pipeline-dot--trailing` for why neither is red.
+
+            NO LABELS on the nodes, deliberately. This page is reachable
+            unauthenticated, and naming internal pipeline stages here would be
+            needless disclosure; the shape alone says "something flows through
+            stages". aria-hidden for the same reason it has no text: it is ambient
+            brand illustration with nothing for a screen reader to announce.
+
+            CSS-only (no JS, no dependency, nothing for hydration to mismatch), and
+            fully stilled under prefers-reduced-motion — see the style block below. */}
+        <div className="login-pipeline" aria-hidden="true">
+          <span className="login-pipeline-track" />
+          <span className="login-pipeline-node" />
+          <span className="login-pipeline-node" />
+          <span className="login-pipeline-node" />
+          <span className="login-pipeline-node" />
+          <span className="login-pipeline-dot login-pipeline-dot--ok" />
+          <span className="login-pipeline-dot login-pipeline-dot--trailing" />
+        </div>
       </aside>
 
       {/* Right panel — the sign-in form, left-aligned, no card. */}
@@ -155,16 +195,21 @@ export function LoginScreen() {
           noValidate
           style={{ width: "100%", maxWidth: "440px" }}
         >
+          {/* Just the product name — a sign-in screen does not need to say
+              welcome, and at 32px inside a 440px column the greeting wrapped and
+              left "Dashboard" orphaned on its own line. `textWrap: balance` keeps
+              any future rewording splitting evenly instead of orphaning a word. */}
           <h1
             style={{
-              fontSize: "32px",
-              lineHeight: "44px",
+              fontSize: "40px",
+              lineHeight: "48px",
               fontWeight: 700,
               color: "var(--cc-heritage-blue)",
               margin: 0,
+              textWrap: "balance",
             }}
           >
-            Welcome to the IT Support Dashboard
+            IT Support Dashboard
           </h1>
           <p
             style={{
@@ -179,10 +224,17 @@ export function LoginScreen() {
           </p>
 
           {/* Step 1 — pick a method. Grid rather than flex: Button takes no
-              style/className prop, and grid items blockify, so both stretch to
-              the same full width. */}
+              style/className prop, and grid items blockify, so the primary
+              stretches to the full width.
+
+              The two methods are deliberately NOT peers any more. They used to be
+              equal-width buttons side by side, which made the password path look as
+              important as SSO when it is the escape hatch — and is meant to be
+              PASSWORD_LOGIN_ENABLED=false in any deployment. Entra keeps the single
+              full-width primary; the password option demotes to a quiet centred
+              text action. */}
           {onChooserStep && (
-            <div style={{ display: "grid", gap: "12px" }}>
+            <div style={{ display: "grid", gap: "16px" }}>
               {showEntra && (
                 <Button
                   variant="primary"
@@ -190,24 +242,43 @@ export function LoginScreen() {
                   type="button"
                   onClick={() => window.location.assign(entraLoginUrl())}
                 >
-                  Sign In With Microsoft
+                  Sign in with Microsoft
                 </Button>
               )}
-              {showPassword && (
-                <Button
-                  variant="hollow"
-                  size="md"
-                  type="button"
-                  onClick={() => {
-                    // Drop any Entra redirect error: it says nothing about the
-                    // password form the user is about to see.
-                    setAuthError(null);
-                    setStep("password");
-                  }}
-                >
-                  Sign In With Your Account
-                </Button>
-              )}
+              {showPassword &&
+                (showEntra ? (
+                  // Ghost is the palette's quiet text action (transparent, no
+                  // border, Heritage Blue text), so this reads as a link while
+                  // still coming from the shared Button — which is what keeps its
+                  // hover/pressed/focus/disabled states identical to every other
+                  // action in the app. Wrapped in a centring flex so it shrinks to
+                  // its label instead of blockifying to the grid's full width.
+                  <div style={{ display: "flex", justifyContent: "center" }}>
+                    <Button
+                      variant="ghost"
+                      size="compact"
+                      type="button"
+                      onClick={goToPasswordStep}
+                    >
+                      Sign in with your account
+                    </Button>
+                  </div>
+                ) : (
+                  // Password is the ONLY method: it is the primary action, so it
+                  // gets the primary full-width button rather than being left as a
+                  // small link on an otherwise empty screen. (Unreachable today —
+                  // the step logic skips the chooser when only one method is
+                  // enabled — but the chooser must not depend on that to stay
+                  // usable if the skip is ever removed.)
+                  <Button
+                    variant="primary"
+                    size="md"
+                    type="button"
+                    onClick={goToPasswordStep}
+                  >
+                    Sign in with your account
+                  </Button>
+                ))}
             </div>
           )}
 
@@ -258,7 +329,7 @@ export function LoginScreen() {
                   loading={submitting}
                   disabled={submitting || !email || !password}
                 >
-                  Sign In
+                  Sign in
                 </Button>
               </div>
             </>
@@ -299,6 +370,114 @@ export function LoginScreen() {
       <style>{`
         @media (max-width: 768px) {
           .login-brand-panel { display: none; }
+        }
+
+        /* --- the pipeline graphic -------------------------------------------
+           Sizes come from two custom properties so the travel distance is derived
+           rather than duplicated: the keyframes below compute it from --track and
+           --dot, which means changing the width here cannot leave the dots
+           overshooting or stopping short. Both are multiples of 4px. */
+        .login-pipeline {
+          --track: 240px;
+          --dot: 8px;
+          position: relative;
+          width: var(--track);
+          height: var(--dot);
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+        }
+
+        /* The line itself, behind the nodes. An operational grey, since it is a
+           divider rather than a signal. */
+        .login-pipeline-track {
+          position: absolute;
+          left: 0;
+          right: 0;
+          top: 50%;
+          height: 2px;
+          transform: translateY(-50%);
+          background: var(--cc-grey-four);
+        }
+
+        /* Four stage nodes, evenly spaced by the flex row. */
+        .login-pipeline-node {
+          position: relative;
+          width: var(--dot);
+          height: var(--dot);
+          border-radius: 9999px;
+          background: var(--cc-heritage-blue);
+          animation: login-pipeline-pulse 2.4s ease-in-out infinite;
+        }
+        /* Staggered so the row breathes in sequence instead of blinking as one. */
+        .login-pipeline-node:nth-child(2) { animation-delay: 0s; }
+        .login-pipeline-node:nth-child(3) { animation-delay: 0.3s; }
+        .login-pipeline-node:nth-child(4) { animation-delay: 0.6s; }
+        .login-pipeline-node:nth-child(5) { animation-delay: 0.9s; }
+
+        /* The travelling dots. translateX only — deliberately not offset-path,
+           which buys nothing here and carries compatibility caveats. */
+        .login-pipeline-dot {
+          position: absolute;
+          left: 0;
+          top: 50%;
+          width: var(--dot);
+          height: var(--dot);
+          margin-top: calc(var(--dot) / -2);
+          border-radius: 9999px;
+          /* 6s per pass: ambient, not attention-seeking. */
+          animation: login-pipeline-travel 6s linear infinite;
+        }
+        .login-pipeline-dot--ok {
+          background: var(--cc-heritage-blue);
+        }
+        /* Both dots are blue. A red one read as a warning on the sign-in screen —
+           the one place with no context to interpret it, before the user has even
+           authenticated. Two orders in flight say "steady traffic", which is the
+           honest ambient message here; alert colour belongs in the feed, where it
+           refers to something the reader can open. Half a cycle behind the first,
+           via a NEGATIVE delay so it is already mid-track on first paint instead of
+           leaving three dead seconds. */
+        .login-pipeline-dot--trailing {
+          background: var(--cc-heritage-blue);
+          animation-delay: -3s;
+        }
+
+        @keyframes login-pipeline-travel {
+          /* Fade in and out at the ends so a dot does not pop into or out of
+             existence at the edge of the track. */
+          0%   { transform: translateX(0); opacity: 0; }
+          8%   { opacity: 1; }
+          92%  { opacity: 1; }
+          100% { transform: translateX(calc(var(--track) - var(--dot))); opacity: 0; }
+        }
+
+        @keyframes login-pipeline-pulse {
+          0%, 100% { opacity: 0.35; transform: scale(1); }
+          50%      { opacity: 1; transform: scale(1.35); }
+        }
+
+        /* Reduced motion: stop everything and leave a STILL, legible graphic —
+           the track, four solid nodes, and the two dots parked at rest on it. Not
+           display:none, which would remove the illustration rather than calm it. */
+        @media (prefers-reduced-motion: reduce) {
+          .login-pipeline-node,
+          .login-pipeline-dot {
+            animation: none;
+          }
+          .login-pipeline-node {
+            opacity: 1;
+            transform: none;
+          }
+          .login-pipeline-dot {
+            opacity: 1;
+          }
+          .login-pipeline-dot--ok {
+            transform: translateX(calc((var(--track) - var(--dot)) * 0.35));
+          }
+          .login-pipeline-dot--trailing {
+            transform: translateX(calc((var(--track) - var(--dot)) * 0.7));
+          }
         }
       `}</style>
     </div>

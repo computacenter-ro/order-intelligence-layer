@@ -568,7 +568,7 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
       <aside
         role="dialog"
         aria-modal="true"
-        aria-label="Incident assistant"
+        aria-label="AI Assistant"
         style={{
           position: "fixed",
           top: 0,
@@ -622,11 +622,18 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           ) : (
             <div>
               <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
-                Incident Assistant
+                AI Assistant
               </div>
-              <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginTop: "4px" }}>
-                {contextLabel ? `Scoped to ${contextLabel}` : "Answers grounded in indexed incidents"}
-              </div>
+              {/* Only ever announces a SCOPE. Unscoped, the row is omitted entirely
+                  rather than filled with a description of how the assistant works:
+                  the subtitle's job is to tell you the answers are narrowed to one
+                  record, so text here when nothing is narrowed reads as a caveat and
+                  competes with the empty state, which already explains the grounding. */}
+              {contextLabel ? (
+                <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginTop: "4px" }}>
+                  Scoped to {contextLabel}
+                </div>
+              ) : null}
             </div>
           )}
           <button
@@ -671,7 +678,8 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           {turns.length === 0 && !busy && (
             <div style={{ color: "var(--cc-grey-three)", fontSize: "16px", lineHeight: "22px" }}>
               <p style={{ margin: "0 0 16px" }}>
-                Ask about past alerts and order journeys. Every answer cites the records it used.
+                Ask about past alerts and order journeys, or how a service works. Every
+                answer cites the sources it used.
               </p>
               <SectionLabel>Try</SectionLabel>
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -735,7 +743,10 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
             ref={inputRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder="Ask about an incident…"
+            // Deliberately open-ended: /chat grounds in BOTH incident history and
+            // the per-service documentation index, so naming either one narrows what
+            // people think to ask. The empty state spells out both.
+            placeholder="Ask something…"
             aria-label="Your question"
             disabled={busy}
             style={{

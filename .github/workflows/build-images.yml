@@ -29,6 +29,10 @@ on:
         description: "Base URL the dashboard bundle is built for (blank = relative /api and /ws, correct behind the reverse proxy)"
         required: false
         default: ""
+      ws_url:
+        description: "Absolute wss:// URL for the WebSocket (split-origin only)"
+        required: false
+        default: ""
 
 env:
   REGISTRY: ghcr.io
@@ -120,7 +124,7 @@ jobs:
           # for a split-origin deployment.
           build-args: |
             ${{ inputs.public_url && format('NEXT_PUBLIC_API_URL={0}', inputs.public_url) || '' }}
-            ${{ inputs.public_url && format('NEXT_PUBLIC_WS_URL={0}/ws', inputs.public_url) || '' }}
+            ${{ inputs.ws_url && format('NEXT_PUBLIC_WS_URL={0}', inputs.ws_url) || '' }}
           # The private @computacenter-ro/style-guide package needs a registry
           # token. Passed as a build SECRET (not an arg) so it never appears in
           # the build log or `docker history` — matches dashboard/Dockerfile's

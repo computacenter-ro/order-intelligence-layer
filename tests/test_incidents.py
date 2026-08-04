@@ -283,6 +283,116 @@ def _causal(message: str, *, embedding=None) -> CausalCandidate:
 
 
 # --- build_title ----------------------------------------------------------------
+# --- TRANSIENT_FAILURE: recovered journeys get their OWN cluster ---------------
+# A dependency that flapped and recovered (scenario 18) must be grouped so its
+# alerts are collapsible, WITHOUT being merged into the failure incident for the
+# same service — the orders in that incident actually broke; this one shipped.
+
+
+def _spt_signature(subtype):
+    from backend.incidents import build_signature
+
+    return build_signature(
+        subtype,
+        "c.c.orderengine.client.SptClient",
+        "cc-order-engine",
+        "[SptClient#getSptPriceListCode] <--- ERROR java.net.SocketTimeoutException",
+    )
+
+
+def test_transient_and_enrichment_signatures_never_collide():
+    """THE guard: a blip and an outage on the SAME service are different causes.
+
+    If these hashed equal, scenario 18's shipped order would land in the
+    ENRICHMENT_FAILED — SPT incident and inflate its journey_count past the
+    orders that actually failed.
+    """
+    from backend.journeys import TRANSIENT_FAILURE
+
+    outage = _spt_signature("ENRICHMENT_FAILED")
+    blip = _spt_signature(TRANSIENT_FAILURE)
+    assert outage.failing_service == blip.failing_service == "SPT"
+    assert outage.digest != blip.digest
+
+
+def test_transient_failure_is_infra_so_flapping_orders_merge():
+    """Several orders blipping on one service are ONE story, not one each."""
+    from backend.incidents import classify_infra_or_order_specific
+    from backend.journeys import TRANSIENT_FAILURE
+
+    assert classify_infra_or_order_specific(TRANSIENT_FAILURE, "connect timed out") == "infra"
+
+
+def test_transient_incident_has_a_readable_title():
+    from backend.incidents import build_title
+    from backend.journeys import TRANSIENT_FAILURE
+
+    assert build_title(_spt_signature(TRANSIENT_FAILURE)) == "TRANSIENT_FAILURE — SPT"
+
+
+# --- eligibility ---------------------------------------------------------------
+
+
+def test_a_clean_success_never_clusters():
+    """The gate that keeps every healthy order out: no error, no incident."""
+    from backend.incidents import is_eligible_for_clustering
+    from backend.journeys import JourneyStatus
+
+    assert is_eligible_for_clustering(JourneyStatus.SUCCESS, False) is False
+
+
+def test_a_recovered_success_is_eligible():
+    from backend.incidents import is_eligible_for_clustering
+    from backend.journeys import JourneyStatus
+
+    assert is_eligible_for_clustering(JourneyStatus.SUCCESS, True) is True
+
+
+@pytest.mark.parametrize("status_name", ["FAILED", "TIMED_OUT"])
+def test_failed_and_timed_out_stay_eligible(status_name):
+    """Unchanged behaviour — widening the gate must not narrow it elsewhere."""
+    from backend.incidents import is_eligible_for_clustering
+    from backend.journeys import JourneyStatus
+
+    assert is_eligible_for_clustering(JourneyStatus[status_name], False) is True
+
+
+# --- subtype derivation --------------------------------------------------------
+
+
+def test_recovered_success_derives_transient_not_its_outcome():
+    """The ONE place the subtype is not the journey's outcome.
+
+    Passing SUCCESS through would hash a meaningless "SUCCESS:SPT" and title an
+    incident "SUCCESS — SPT".
+    """
+    from backend.incidents import incident_subtype_for
+    from backend.journeys import JourneyStatus, TRANSIENT_FAILURE
+
+    assert incident_subtype_for(JourneyStatus.SUCCESS, "SUCCESS", True) == TRANSIENT_FAILURE
+
+
+def test_recognized_failure_subtype_is_unchanged():
+    from backend.incidents import incident_subtype_for
+    from backend.journeys import JourneyStatus
+
+    assert incident_subtype_for(
+        JourneyStatus.FAILED, "ENRICHMENT_FAILED", False
+    ) == "ENRICHMENT_FAILED"
+
+
+@pytest.mark.parametrize(
+    "status_name,outcome",
+    [("FAILED", "UNRECOGNIZED_FAILURE"), ("TIMED_OUT", "TIMED_OUT")],
+)
+def test_novel_path_still_yields_no_subtype(status_name, outcome):
+    """digest is None <=> the embedding path — must survive this change."""
+    from backend.incidents import incident_subtype_for
+    from backend.journeys import JourneyStatus
+
+    assert incident_subtype_for(JourneyStatus[status_name], outcome, False) is None
+
+
 def test_build_title_uses_subtype_and_service():
     sig = Signature(
         failure_subtype="ENRICHMENT_FAILED", failing_service="SPT",
@@ -414,6 +524,7 @@ async def test_order_specific_never_searches_always_creates():
 from backend.journeys import Completion, JourneyStatus
 from backend.incidents import process_completion
 from backend.stitching import StitchedJourney
+from shared.models import LogLine
 
 
 def _completion(status: JourneyStatus, journey_id: str = "j1") -> Completion:
@@ -436,10 +547,100 @@ class _RowResult:
 _MISSING = object()
 
 
-async def test_success_journey_is_ineligible_and_returns_none():
+async def test_clean_success_journey_is_ineligible_and_returns_none():
+    """A success with NO errors never clusters — the common case, and it must
+    stay free: the journey's in-memory logs answer it with no query at all.
+
+    (A success that carried a RECOVERED error IS eligible now and clusters as
+    TRANSIENT_FAILURE — covered by the transient tests above and the
+    _has_recovered_error tests below.)
+    """
+    completion = _completion(JourneyStatus.SUCCESS)
+    completion.journey.logs.append(
+        LogLine(
+            log_id="ok-1", timestamp=NOW, app_name="cc-inbound-service", level="INFO",
+            logger="c.c.inbound.listener.OrderListener", host="H", process_id="1",
+            thread="t", message="Received order_created: order processing complete",
+        )
+    )
     session = _FakeSession([])  # no query should even run
+    result = await process_completion(session, completion)
+    assert result is None
+
+
+async def test_a_success_with_no_logs_at_all_is_ineligible():
+    """Defensive: an empty journey has no ERROR to recover from.
+
+    Takes the sweep path (no in-memory logs), so it does query journey_events —
+    and finds nothing, which is still ineligible rather than a crash.
+    """
+    session = _FakeSession([_FakeResult(rows=[])])
     result = await process_completion(session, _completion(JourneyStatus.SUCCESS))
     assert result is None
+
+
+def _spt_blip_logs():
+    """Scenario 18's SPT window: timeout ERROR, retry WARN, recovery INFO."""
+    client = "c.c.orderengine.client.SptClient"
+    def mk(i, level, msg, logger=client):
+        return LogLine(
+            log_id=f"blip-{i}", timestamp=NOW + timedelta(seconds=i),
+            app_name="cc-order-engine", level=level, logger=logger,
+            host="H", process_id="1", thread="t", message=msg,
+        )
+    return [
+        mk(1, "ERROR", "[SptClient#getSptPriceListCode] <--- ERROR "
+                       "java.net.SocketTimeoutException: connect timed out (10014ms)"),
+        mk(2, "WARN", "Retrying SPT price list call for account 81036533 (attempt 2/3)"),
+        mk(3, "INFO", "SPT price list call for account 81036533 succeeded on attempt 2/3"),
+    ]
+
+
+async def test_recovered_success_clusters_as_transient_failure():
+    """Scenario 18 end to end through process_completion.
+
+    The journey stays SUCCESS; the INCIDENT records that SPT flapped. Without
+    this the journey's alerts would keep incident_id NULL forever and no bulk
+    action could ever clear them.
+    """
+    from backend.journeys import TRANSIENT_FAILURE
+
+    completion = _completion(JourneyStatus.SUCCESS)
+    completion.journey.logs.extend(_spt_blip_logs())
+    candidates = _FakeResult(items=[
+        Alert(alert_id="e1", emitted_at=NOW, log_id="blip-1", level="ERROR",
+              app_name="cc-order-engine", logger="c.c.orderengine.client.SptClient",
+              message="[SptClient#getSptPriceListCode] <--- ERROR "
+                      "java.net.SocketTimeoutException: connect timed out (10014ms)",
+              source="ai"),
+    ])
+    session = _FakeSession([
+        _RowResult(None),          # journey not yet clustered
+        candidates,                # causal candidates
+        _FakeResult(rows=[]),      # no open incident to match -> create
+        _FakeResult(items=[]),     # journey's alerts to link
+        _FakeResult(items=[]),     # update Journey.incident_id
+    ])
+    incident = await process_completion(session, completion)
+    assert incident is not None
+    assert incident.failure_subtype == TRANSIENT_FAILURE
+    assert incident.failing_service == "SPT"
+    assert incident.title == "TRANSIENT_FAILURE — SPT"
+
+
+async def test_a_recovered_journey_never_joins_the_outage_incident():
+    """The separation guard, at the signature level.
+
+    An open ENRICHMENT_FAILED—SPT incident must NOT be matched by a recovered
+    journey: different digests, so the signature lookup cannot find it.
+    """
+    from backend.journeys import TRANSIENT_FAILURE
+    from backend.incidents import build_signature
+
+    logger, app = "c.c.orderengine.client.SptClient", "cc-order-engine"
+    outage = build_signature("ENRICHMENT_FAILED", logger, app, "timeout")
+    blip = build_signature(TRANSIENT_FAILURE, logger, app, "timeout")
+    assert outage.digest != blip.digest
 
 
 async def test_already_clustered_journey_is_a_noop():

@@ -415,7 +415,7 @@ export function PipelineDiagram() {
         width="100%"
         height="100%"
         role="img"
-        aria-label="Architecture diagram of the simulated order pipeline. Orders arrive from B2B and Salesforce through SAP BTP into the Inbound service, pass by RabbitMQ to the Order Engine, which persists to the BM database and calls the SPT, RSM, SOLR, Settings, JAM, Checker, Validator, Avalara and Track and Trace services, then submits through Outbound OSW to SAP Fulfilment."
+        aria-label="Architecture diagram of the simulated order pipeline. Orders arrive from B2B and Salesforce through SAP BTP into the Inbound service, which calls Settings, JAM and SOLR before the order exists, then ping-pongs with the Order Engine over RabbitMQ: order init, order data ready, order approval. The Order Engine persists to the BM database, registers Track and Trace, calls SPT, RSM, Validator, Avalara and Checker, publishes order create sap to RabbitMQ for Outbound OSW to submit to SAP Fulfilment, and answers order created back to Inbound, where the flow ends."
       >
         <defs>
           {/* One marker per stroke colour: SVG markers don't inherit the path's

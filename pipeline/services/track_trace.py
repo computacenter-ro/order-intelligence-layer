@@ -1,8 +1,12 @@
-"""cc-track-trace emitter block (CLAUDE.md [1]) — success terminal.
+"""cc-track-trace emitter block (CLAUDE.md [1]) — order tracking registration.
 
-The ``register`` block registers the order for tracking. Its message
-("Registered order ... for tracking") is the SUCCESS terminal that the
-backend's journey assembler matches on — treat the text as an API.
+The ``register`` block registers the order for tracking. It runs MID-FLOW,
+immediately after creation and BEFORE the checks (the documented step-11
+position) — it is **no longer the success terminal**, and the backend's
+journey assembler must NOT treat "Registered order ... for tracking" as one
+(a journey can carry this line and still fail at SPT, the validator, the
+checker or SAP). The SUCCESS terminal is Inbound's order_created close
+(``pipeline/services/inbound.py``).
 """
 from __future__ import annotations
 
@@ -26,4 +30,4 @@ async def register_order(baton: Baton, emit: EmitFn) -> bool:
         message=f"Registered order {ctx.orderId} for tracking, SAP ref: {sap_ref}",
         ids=phase2_ids(ctx),
     )
-    return True  # terminal; runner sees chain complete
+    return True  # forward to the order engine's enrichment leg

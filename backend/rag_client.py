@@ -229,7 +229,8 @@ async def ask(
     # self_grounded says "the query already carries the record's own text", so the
     # AI service composes even when retrieval finds nothing similar. Without it a
     # scoped question about a NOVEL failure — the case most worth asking about —
-    # comes back as "no related incidents found, run the backfill".
+    # comes back as "no related incidents found ... no sources found in official
+    # documentation either".
     body = {
         "query": query,
         "k": k,

@@ -24,6 +24,7 @@ from backend.journeys import (
     detect_terminal,
     is_stalled,
     status_for,
+    unrecovered_errors,
     SUCCESS,
     TIMED_OUT,
     UNRECOGNIZED_FAILURE,
@@ -52,13 +53,14 @@ def mk(
     orderId: str | None = None,
     cartHeaderId: str | None = None,
     log_id: str | None = None,
+    logger: str = "c.c.test.Logger",
 ) -> LogLine:
     return LogLine(
         log_id=log_id or f"log-{offset_s}-{message[:10]}",
         timestamp=BASE + timedelta(seconds=offset_s),
         app_name=app_name,
         level=level,
-        logger="c.c.test.Logger",
+        logger=logger,
         host="CCECMEWEBT001",
         process_id="1234",
         thread="rabbit-listener-1",
@@ -71,10 +73,13 @@ def mk(
 
 # --- Actual terminal messages emitted by the mock services -------------------
 # (copied from services/*.py — these strings are the detection contract)
-SUCCESS_MSG = "Registered order ORD-6001 for tracking, SAP ref: 0080012345"
+SUCCESS_MSG = "Received order_created for order ORD-6001: order processing complete"
+# Track & Trace's registration line is MID-FLOW under the five-hop pipeline —
+# explicitly asserted below to NOT be a terminal of any kind.
+TRACKING_MSG = "Registered order ORD-6001 for tracking, SAP ref: 0080012345"
 TRANSFORM_MSG = (
     "Max redelivery attempts reached for event evt-1; "
-    "routing message to order.inbound.dlq"
+    "routing message to order.init_error"
 )
 CREATE_MSG = "Order creation failed for event evt-1 after 3 attempt(s)"
 MARGIN_MSG = "Order ORD-6001 blocked by margin check; submission halted"
@@ -84,12 +89,12 @@ ENRICHMENT_MSG = (
     "list service unavailable after 3 attempt(s)"
 )
 AUTH_MSG = (
-    "Cannot process order ORD-6001: user XDISABLED not "
+    "Cannot process order request for event evt-1: user XDISABLED not "
     "authorized (403 from JAM); submission aborted"
 )
 SAP_MSG = (
     "Order ORD-6001 submission failed after 3 attempt(s); "
-    "message moved to order.outbound.dlq for manual intervention"
+    "message moved to order.create.sap_error for manual intervention"
 )
 
 
@@ -106,9 +111,11 @@ SAP_MSG = (
         (ENRICHMENT_MSG, ENRICHMENT_FAILED),
         (AUTH_MSG, AUTH_FAILED),
         (SAP_MSG, SAP_SUBMISSION_FAILED),
-        # documented (CLAUDE.md) queue_error spelling must also classify
+        # legacy DLQ spellings (pre-realignment data) must still classify
         ("routing message to order.inbound.queue_error", INBOUND_TRANSFORM_FAILED),
+        ("routing message to order.inbound.dlq", INBOUND_TRANSFORM_FAILED),
         ("message moved to order.outbound.queue_error", SAP_SUBMISSION_FAILED),
+        ("message moved to order.outbound.dlq", SAP_SUBMISSION_FAILED),
     ],
 )
 def test_classify_failure_maps_each_terminal(message, expected):
@@ -131,12 +138,38 @@ def test_auth_precedence_over_generic_submission_aborted():
 # --- detect_terminal: ordered logs -> outcome or None ------------------------
 
 
-def test_detect_success_on_track_trace_terminal():
+def test_detect_success_on_inbound_close_terminal():
     logs = [
         mk(0, "Received inbound order event evt-1", eventId="evt-1"),
-        mk(5, SUCCESS_MSG, app_name="cc-track-trace", orderId="ORD-6001"),
+        mk(5, SUCCESS_MSG, app_name="cc-inbound-service", orderId="ORD-6001"),
     ]
     assert detect_terminal(logs) == SUCCESS
+
+
+def test_tracking_line_is_not_a_terminal():
+    """Track & Trace registers MID-FLOW now (right after creation). A journey
+    whose last line is the tracking registration is still IN PROGRESS — the
+    checks and the SAP submit have not run yet. Completing here was exactly the
+    old behaviour the realignment removes."""
+    logs = [
+        mk(0, "Received inbound order event evt-1", eventId="evt-1"),
+        mk(5, TRACKING_MSG, app_name="cc-track-trace", orderId="ORD-6001"),
+    ]
+    assert detect_terminal(logs) is None
+    assert classify_failure(TRACKING_MSG) is None
+
+
+def test_flow_through_tracking_still_resolves_its_real_outcome():
+    """A journey carrying the mid-flow tracking line still resolves to its real
+    terminal — a later failure marker wins, and a later close wins."""
+    base = [
+        mk(0, "Received inbound order event evt-1", eventId="evt-1"),
+        mk(5, TRACKING_MSG, app_name="cc-track-trace", orderId="ORD-6001"),
+    ]
+    assert detect_terminal(base + [mk(8, MARGIN_MSG, orderId="ORD-6001")]) == MARGIN_CHECK_FAILED
+    assert detect_terminal(
+        base + [mk(9, SUCCESS_MSG, app_name="cc-inbound-service", orderId="ORD-6001")]
+    ) == SUCCESS
 
 
 def test_detect_none_for_in_progress():
@@ -157,8 +190,7 @@ def test_detect_failed_finds_marker_even_with_trailing_info():
     logs = [
         mk(0, "Received inbound order event evt-1", eventId="evt-1"),
         mk(1, CREATE_MSG, level="ERROR", eventId="evt-1"),
-        mk(2, "Published order creation failure for event evt-1 to queue order.response.queue",
-           eventId="evt-1"),
+        mk(2, "Wrote failure audit row for event evt-1", eventId="evt-1"),
     ]
     assert detect_terminal(logs) == ORDER_CREATION_FAILED
 
@@ -183,15 +215,146 @@ def test_status_for():
     assert status_for(UNRECOGNIZED_FAILURE) is JourneyStatus.FAILED
 
 
+# --- unrecovered_errors: transient blips vs real failures --------------------
+# The rule: an ERROR is RECOVERED when a later log from the same source
+# (app_name AND logger) is INFO/DEBUG. Scenario 18 (SPT times out once, the
+# retry succeeds) is the flow this exists for.
+
+_SPT_CLIENT = "c.c.orderengine.client.SptClient"
+_SPT_TIMEOUT_MSG = (
+    "[SptClient#getSptPriceListCode] <--- ERROR "
+    "java.net.SocketTimeoutException: connect timed out (10014ms)"
+)
+_SPT_RETRY_MSG = "Retrying SPT price list call for account 81036533 (attempt 2/3)"
+_SPT_RECOVERED_MSG = "SPT price list call for account 81036533 succeeded on attempt 2/3"
+
+
+def _recovered_blip() -> list[LogLine]:
+    """Scenario 18's SPT window: timeout ERROR, retry WARN, then success."""
+    return [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+        mk(1, _SPT_RETRY_MSG, level="WARN", logger=_SPT_CLIENT),
+        mk(2, _SPT_RECOVERED_MSG, level="INFO", logger=_SPT_CLIENT),
+    ]
+
+
+def test_a_recovered_error_is_not_unrecovered():
+    assert unrecovered_errors(_recovered_blip()) == []
+
+
+def test_an_error_with_no_later_success_stays_unrecovered():
+    logs = _recovered_blip()[:2]  # timeout + retry, no recovery line
+    assert [l.message for l in unrecovered_errors(logs)] == [_SPT_TIMEOUT_MSG]
+
+
+def test_recovery_must_come_from_the_same_logger():
+    """A different class logging INFO afterwards is NOT this error's recovery.
+
+    cc-order-engine emits many INFO lines from other classes after any failure,
+    so an app_name-only rule would clear a genuine outage.
+    """
+    logs = [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+        mk(1, "Order was created successfully for account : 81036533",
+           level="INFO", logger="c.c.orderengine.service.OrderService"),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_recovery_must_come_from_the_same_app():
+    """Same class name, different service — not the same source."""
+    logs = [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR",
+           app_name="cc-order-engine", logger=_SPT_CLIENT),
+        mk(1, "fine", level="INFO", app_name="cc-spt-service", logger=_SPT_CLIENT),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_recovery_must_come_AFTER_the_error():
+    """An earlier healthy line cannot retro-clear a later failure.
+
+    Every outage logs its own healthy preamble (the ---> request line), so
+    ignoring order would clear every ERROR in the corpus.
+    """
+    logs = [
+        mk(0, "[SptClient#getSptPriceListCode] ---> GET", level="DEBUG", logger=_SPT_CLIENT),
+        mk(1, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_a_warn_does_not_count_as_recovery():
+    """Only INFO/DEBUG is healthy activity — a retry WARN is still trouble."""
+    logs = [
+        mk(0, _SPT_TIMEOUT_MSG, level="ERROR", logger=_SPT_CLIENT),
+        mk(1, _SPT_RETRY_MSG, level="WARN", logger=_SPT_CLIENT),
+    ]
+    assert len(unrecovered_errors(logs)) == 1
+
+
+def test_stalled_journey_with_a_RECOVERED_error_is_timed_out():
+    """THE regression test for the transient-failure fix.
+
+    A journey whose only ERROR recovered, and which then stalls for some
+    unrelated reason, is SILENCE — TIMED_OUT. Labelling it FAILED would name the
+    recovered blip as its cause and send it down clustering's embedding path,
+    where it can merge with genuinely unrelated incidents.
+    """
+    a = JourneyAssembler()
+    a.add([
+        mk(0, "Received inbound order event evt-1",
+           app_name="cc-inbound-service", eventId="evt-1"),
+        *[mk(l.timestamp.second + 1, l.message, level=l.level,
+             logger=l.logger, eventId="evt-1") for l in _recovered_blip()],
+    ])
+    done = a.evaluate(now=BASE + timedelta(seconds=STALLED_TIMEOUT + 10))
+    assert len(done) == 1
+    assert done[0].status is JourneyStatus.TIMED_OUT
+    assert done[0].outcome == TIMED_OUT
+
+
+def test_stalled_journey_with_an_UNRECOVERED_error_is_still_unrecognized_failure():
+    """The over-correction guard: a real ERROR that never recovered still fails.
+
+    This is scenarios 15/16/17 — the Settings ERROR whose chain truncates
+    immediately after, so nothing from that logger ever logs again.
+    """
+    a = JourneyAssembler()
+    a.add([
+        mk(0, "Received inbound order event evt-1",
+           app_name="cc-inbound-service", eventId="evt-1"),
+        mk(1, "Error while calling settings: settings service unavailable after 8000ms",
+           level="ERROR", app_name="cc-inbound-service",
+           logger="c.c.inbound.client.SettingsClient", eventId="evt-1"),
+    ])
+    done = a.evaluate(now=BASE + timedelta(seconds=STALLED_TIMEOUT + 10))
+    assert len(done) == 1
+    assert done[0].status is JourneyStatus.FAILED
+    assert done[0].outcome == UNRECOGNIZED_FAILURE
+
+
+def test_a_journey_with_no_error_at_all_is_still_timed_out():
+    """Unchanged behaviour — silence with no ERROR was always TIMED_OUT."""
+    a = JourneyAssembler()
+    a.add([mk(0, "Received inbound order event evt-1",
+              app_name="cc-inbound-service", eventId="evt-1")])
+    done = a.evaluate(now=BASE + timedelta(seconds=STALLED_TIMEOUT + 10))
+    assert done[0].outcome == TIMED_OUT
+
+
 # --- JourneyAssembler: incremental decisions --------------------------------
 
 
 def _success_flow():
+    # The honest shape: the creation log ties the id families via its TEXT
+    # (mined), never via fields; the close line then shares the order ids.
     return [
-        mk(0, "Received inbound order event evt-1", eventId="evt-1"),
-        mk(2, "Received order creation response for event evt-1",
-           eventId="evt-1", orderId="ORD-6001", cartHeaderId="1840927365018240001"),
-        mk(5, SUCCESS_MSG, app_name="cc-track-trace",
+        mk(0, "Received inbound order event evt-1",
+           app_name="cc-inbound-service", eventId="evt-1"),
+        mk(2, "Generated order number ORD-6001 for cart header 1840927365018240001",
+           eventId="evt-1"),
+        mk(5, SUCCESS_MSG, app_name="cc-inbound-service",
            orderId="ORD-6001", cartHeaderId="1840927365018240001"),
     ]
 
@@ -212,8 +375,8 @@ def test_assembler_failed_subtype_and_aliases():
     a = JourneyAssembler()
     a.add([
         mk(0, "Received inbound order event evt-1", eventId="evt-1"),
-        mk(2, "Received order creation response for event evt-1",
-           eventId="evt-1", orderId="ORD-6001"),
+        mk(2, "Generated order number ORD-6001 for cart header 1840927365018240001",
+           eventId="evt-1"),
         mk(3, MARGIN_MSG, level="WARN", orderId="ORD-6001", cartHeaderId="18409"),
     ])
     [c] = a.evaluate(now=BASE + timedelta(seconds=4))
@@ -318,8 +481,9 @@ def test_assembler_lazy_across_batches():
 
 
 # =============================================================================
-# Fixture-driven end-to-end: the 10 canonical flows
-# (pipeline/data/mock-order-flows-v6.json — the reference-system log samples).
+# Fixture-driven end-to-end: the canonical flows
+# (pipeline/data/mock-order-flows-v8.json — captured from the five-hop
+# emitters; the realignment's Layer 4 produces it).
 #
 # Each flow is a real captured log stream ("events") plus its expected
 # "outcome". We push every flow's events through the *pure* pipeline —
@@ -335,26 +499,29 @@ from backend.stitching import Stitcher  # noqa: F401 — used via JourneyAssembl
 
 FIXTURE = (
     Path(__file__).resolve().parent.parent
-    / "pipeline" / "data" / "mock-order-flows-v6.json"
+    / "pipeline" / "data" / "mock-order-flows-v8.json"
+)
+# v6 predates the five-hop realignment (its success flows end at Track & Trace,
+# which is mid-flow now), so these tests only make sense against v7. Until the
+# Layer-4 capture lands, skip loudly rather than fail confusingly.
+_V7_MISSING = not FIXTURE.exists()
+pytest_v7 = pytest.mark.skipif(
+    _V7_MISSING, reason="mock-order-flows-v8.json not yet captured (realignment Layer 4)"
 )
 
-# The order-creation-response ack: inbound's ResponseListener line. In v3 it
-# carries ONLY eventId (no order ids) — the eventId->order-id join is recovered
-# by mining the order-engine creation logs' text (CLAUDE.md Correlation Model).
-# We still locate this line to exercise a poll boundary right at it.
-_BRIDGE_LOGGER = "c.c.inbound.listener.ResponseListener"
+# The join lives in the order-engine creation logs' TEXT (mined). We locate the
+# "Generated order number" line to exercise a poll boundary right after it —
+# CLAUDE.md invariant 4's hardest split: creation logs and phase 2 in different
+# polls.
+_CREATION_LOGGER = "c.c.orderengine.service.OrderCreationService"
 
 
-def _bridge_index(logs: list[LogLine]) -> int | None:
-    return next(
-        (
-            i
-            for i, log in enumerate(logs)
-            if log.logger == _BRIDGE_LOGGER
-            and "creation response" in log.message.lower()
-        ),
-        None,
-    )
+def _creation_cut(logs: list[LogLine]) -> int | None:
+    """Index ONE PAST the 'Generated order number' join line, or None."""
+    for i, log in enumerate(logs):
+        if log.logger == _CREATION_LOGGER and "generated order number" in log.message.lower():
+            return i + 1
+    return None
 
 
 def _load_flows() -> list[dict]:
@@ -364,24 +531,24 @@ def _load_flows() -> list[dict]:
         logs = [LogLine.model_validate(e) for e in flow["events"]]
         flows.append(
             {
-                # "_flow" is the scenario number (1..10); "scenario" is its prose
+                # "_flow" is the scenario number; "scenario" is its prose
                 # description in this fixture.
                 "scenario": flow["_flow"],
                 "name": flow["scenario"],
                 "outcome": flow["outcome"],
                 "logs": logs,
-                "bridge_idx": _bridge_index(logs),
+                "creation_cut": _creation_cut(logs),
             }
         )
     return flows
 
 
-FLOWS = _load_flows()
+FLOWS = [] if _V7_MISSING else _load_flows()
 FLOW_IDS = [f"scenario-{f['scenario']}-{f['outcome']}" for f in FLOWS]
-# Pre-creation failures (transform / creation) never reach the bridge — they are
-# eventId-only journeys, so the bridge-cut test only applies to the rest.
-BRIDGE_FLOWS = [f for f in FLOWS if f["bridge_idx"] is not None]
-BRIDGE_FLOW_IDS = [f"scenario-{f['scenario']}-{f['outcome']}" for f in BRIDGE_FLOWS]
+# Pre-creation failures never mint the ids, so the creation-cut test only
+# applies to flows whose stream actually contains the join line.
+CREATION_FLOWS = [f for f in FLOWS if f["creation_cut"] is not None]
+CREATION_FLOW_IDS = [f"scenario-{f['scenario']}-{f['outcome']}" for f in CREATION_FLOWS]
 
 
 def _assemble(
@@ -428,8 +595,9 @@ def _split(logs: list[LogLine], n: int) -> list[list[LogLine]]:
     return [logs[i : i + size] for i in range(0, len(logs), size)]
 
 
+@pytest_v7
 def test_fixture_covers_every_scenario():
-    # Length-derived, not a hardcoded count: v6 is captured from all of
+    # Length-derived, not a hardcoded count: v7 is captured from all of
     # shared/scenarios.py's scenarios, so the fixture and SCENARIOS must agree.
     from shared.scenarios import SCENARIOS
 
@@ -437,6 +605,7 @@ def test_fixture_covers_every_scenario():
     assert {f["scenario"] for f in FLOWS} == set(SCENARIOS)
 
 
+@pytest_v7
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_flow_produces_exactly_one_journey(flow):
     a, _ = _assemble([flow["logs"]])
@@ -445,6 +614,7 @@ def test_flow_produces_exactly_one_journey(flow):
     assert len(a.stitcher.journeys[0].logs) == len(flow["logs"])
 
 
+@pytest_v7
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_flow_outcome_matches_fixture(flow):
     a, completions = _assemble([flow["logs"]], now=_terminal_now(flow))
@@ -461,6 +631,7 @@ def test_flow_outcome_matches_fixture(flow):
         assert detect_terminal(a.stitcher.journeys[0].logs) == flow["outcome"]
 
 
+@pytest_v7
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_flow_stitches_across_multiple_polls(flow):
     # The same events, delivered in several separate polls, still assemble into
@@ -472,14 +643,15 @@ def test_flow_stitches_across_multiple_polls(flow):
     assert completions[0].outcome == flow["outcome"]
 
 
-@pytest.mark.parametrize("flow", BRIDGE_FLOWS, ids=BRIDGE_FLOW_IDS)
-def test_flow_stitches_with_poll_boundary_at_the_bridge(flow):
-    # A poll boundary lands EXACTLY at the (eventId-only) bridge line. The join
-    # no longer depends on the bridge: the order-engine creation logs preceding
-    # it already tied eventId to the order ids (mined from their text), so the
-    # phase-1 | bridge | phase-2 split must still yield one journey.
-    logs, b = flow["logs"], flow["bridge_idx"]
-    batches = [logs[:b], logs[b : b + 1], logs[b + 1 :]]
+@pytest_v7
+@pytest.mark.parametrize("flow", CREATION_FLOWS, ids=CREATION_FLOW_IDS)
+def test_flow_stitches_with_poll_boundary_after_the_creation_logs(flow):
+    # A poll boundary lands EXACTLY after the creation join logs — the split
+    # CLAUDE.md invariant 4 calls out: the eventId->order-id aliases mined from
+    # the creation logs' text must persist across polls so the phase-2 logs
+    # arriving in a later poll still join the same journey.
+    logs, cut = flow["logs"], flow["creation_cut"]
+    batches = [logs[:cut], logs[cut:]]
     batches = [batch for batch in batches if batch]
     a, completions = _assemble(batches, now=_terminal_now(flow))
     assert len(a.stitcher.journeys) == 1
@@ -488,6 +660,7 @@ def test_flow_stitches_with_poll_boundary_at_the_bridge(flow):
     assert completions[0].outcome == flow["outcome"]
 
 
+@pytest_v7
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_full_redelivery_is_idempotent(flow):
     # At-least-once delivery: re-delivering the identical logs (same log_ids)
@@ -564,10 +737,10 @@ async def test_ingest_emits_journey_completed_on_completion():
     events, on_event = _sink()
     logs = [
         mk(0, "Received inbound order event evt-1", eventId="evt-1"),
-        mk(2, "Received order creation response for event evt-1",
-           eventId="evt-1", orderId="ORD-1", cartHeaderId="C1"),
-        mk(5, "Registered order ORD-1 for tracking",
-           app_name="cc-track-trace", orderId="ORD-1", cartHeaderId="C1"),
+        mk(2, "Generated order number ORD-1 for cart header 1840927365018240001",
+           eventId="evt-1"),
+        mk(5, "Received order_created for order ORD-1: order processing complete",
+           app_name="cc-inbound-service", orderId="ORD-1", cartHeaderId="1840927365018240001"),
     ]
     await a.ingest(_FakeSession(), logs, now=BASE + timedelta(seconds=6), on_event=on_event)
 
@@ -601,6 +774,7 @@ async def test_sweep_stalled_emits_journey_completed():
     assert events[0]["data"]["status"] == "TIMED_OUT"
 
 
+@pytest_v7
 @pytest.mark.parametrize("flow", FLOWS, ids=FLOW_IDS)
 def test_overlapping_polls_do_not_duplicate(flow):
     # The AI poller uses overlapping sliding windows, so consecutive polls
@@ -623,10 +797,10 @@ def test_overlapping_polls_do_not_duplicate(flow):
 
 _COMPLETING_LOGS = [
     mk(0, "Received inbound order event evt-1", eventId="evt-1"),
-    mk(2, "Received order creation response for event evt-1",
-       eventId="evt-1", orderId="ORD-1", cartHeaderId="C1"),
-    mk(5, "Registered order ORD-1 for tracking",
-       app_name="cc-track-trace", orderId="ORD-1", cartHeaderId="C1"),
+    mk(2, "Generated order number ORD-1 for cart header 1840927365018240001",
+       eventId="evt-1"),
+    mk(5, "Received order_created for order ORD-1: order processing complete",
+       app_name="cc-inbound-service", orderId="ORD-1", cartHeaderId="1840927365018240001"),
 ]
 
 

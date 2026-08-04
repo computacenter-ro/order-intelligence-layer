@@ -2,7 +2,10 @@
 
 Failure variant (``fail_at=sap``, scenario 10): the SAP RFC partner is
 unreachable → RFC_COMMUNICATION_FAILURE ×3 → the message is moved to the
-outbound DLQ. The chain stops.
+``order.create.sap_error`` DLQ (the ``_error`` terminator is the DLQ naming
+convention; the queue itself is the ``order.create.sap`` routing key the order
+engine dispatches on). The chain stops — the success-path ``order_created``
+close back to Inbound never happens for this flow.
 """
 from __future__ import annotations
 
@@ -64,6 +67,6 @@ async def _sap_failed(baton: Baton, emit: EmitFn) -> bool:
     await emit_line(emit, _PROF, logger=_LOG_SUBMISSION, level="ERROR",
                     message=(
                         f"Order {ctx.orderId} submission failed after 3 attempt(s); "
-                        f"message moved to order.outbound.dlq for manual intervention"
+                        f"message moved to order.create.sap_error for manual intervention"
                     ), ids=ids)
     return False  # fatal

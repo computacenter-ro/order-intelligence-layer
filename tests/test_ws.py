@@ -293,11 +293,11 @@ async def test_on_event_journey_completed_on_finalize():
     a = JourneyAssembler()
     logs = [
         _log(message="Received inbound order event evt-1", eventId="evt-1"),
-        _log(message="Received order creation response for event evt-1",
-             ts=BASE + timedelta(seconds=2), eventId="evt-1", orderId="ORD-1", cartHeaderId="C1"),
-        _log(message="Registered order ORD-1 for tracking",
-             ts=BASE + timedelta(seconds=5), app_name="cc-track-trace",
-             orderId="ORD-1", cartHeaderId="C1"),
+        _log(message="Generated order number ORD-1 for cart header 1840927365018240001",
+             ts=BASE + timedelta(seconds=2), eventId="evt-1"),
+        _log(message="Received order_created for order ORD-1: order processing complete",
+             ts=BASE + timedelta(seconds=5), app_name="cc-inbound-service",
+             orderId="ORD-1", cartHeaderId="1840927365018240001"),
     ]
     await a.ingest(_FakeSession(), logs, now=BASE + timedelta(seconds=6), on_event=on_event)
 

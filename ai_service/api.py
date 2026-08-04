@@ -89,8 +89,9 @@ class ChatRequest(BaseModel):
     # from" are the same fact — true when the index was the only grounding channel,
     # false once a caller can supply its own. The failure it fixes: click a NOVEL
     # failure (nothing similar indexed, which is exactly when you need help), ask
-    # "what does this mean?", and get "No related incidents found — run the
-    # backfill" while the alert's full text sits in this very request.
+    # "what does this mean?", and get "No related incidents found ... No sources
+    # found in official documentation either" while the alert's full text sits in
+    # this very request.
     self_grounded: bool = False
 
 
@@ -191,8 +192,7 @@ AI_COMPOSED = "ai"
 
 NO_RESULTS_ANSWER = (
     "No related incidents found in the indexed history for that question. "
-    "The index may not yet contain matching alerts or journeys — "
-    "run the backfill (python -m backend.scripts.backfill_rag) if it looks empty."
+    "No sources found in official documentation either."
 )
 
 

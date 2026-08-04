@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -340,6 +342,134 @@ def test_route_prompt_examples_cover_business_and_technical_routes():
 
     for dept in ("business", "networking", "database", "devops"):
         assert f'"department": "{dept}"' in _ROUTE_EXAMPLES
+
+
+# The few-shot examples are only worth anything if they look like what the
+# emitters actually produce. v7 is captured from the emitters, so it is the
+# oracle: an example whose shape has drifted out of the corpus is teaching the
+# model a line the pipeline no longer emits, and it drifts SILENTLY — nothing
+# else in the suite reads the prompt against the fixture. Two real staleness bugs
+# motivated this: a DLQ example still naming "order.inbound.dlq" (renamed to
+# "<queue>_error" by the realignment) and a creation-failure example inventing a
+# fused "DB_TIMEOUT — no order was created" line no emitter ever wrote.
+_FIXTURE = Path(__file__).resolve().parent.parent / "pipeline" / "data" / "mock-order-flows-v8.json"
+
+
+def _alertable_messages() -> list[str]:
+    """Every WARN/ERROR message in the captured corpus.
+
+    The fixture is a list of flow objects, each holding its lines under ``events``.
+    """
+    flows = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    return [
+        log["message"]
+        for flow in flows
+        for log in flow.get("events", [])
+        if log.get("level") in ("WARN", "ERROR")
+    ]
+
+
+def _mask_ids(text: str) -> str:
+    """Mask the volatile values so an example matches the corpus by SHAPE.
+
+    The three id shapes the stitcher mines and semcache normalizes — the examples
+    carry their own illustrative ids (ORD-6042, evt-1a2b), which will never equal
+    a captured one.
+
+    Plus two values the EMITTERS randomize per run: the computed margin
+    percentage (checker.py) and Feign call latencies. They are not ids, so
+    semcache deliberately leaves them alone, but here they would make an example
+    match only the one capture it was copied from — which is why re-capturing the
+    fixture used to "break" a prompt that had not changed. The threshold is NOT
+    masked: it is fixed, and it is the part of the sentence that carries meaning.
+    """
+    for pattern, token in (
+        (r"evt-[0-9a-f-]{8,}", "<EVT>"),
+        (r"\bORD-\d+\b", "<ORD>"),
+        (r"\b\d{19}\b", "<CART>"),
+        (r"\b\d{8}\b", "<ACC>"),
+        (r"margin \d+\.\d+%", "margin <PCT>%"),
+        (r"\(\d+ms\)", "(<MS>)"),
+    ):
+        text = re.sub(pattern, token, text)
+    return text
+
+
+@pytest.mark.skipif(not _FIXTURE.exists(), reason="mock-order-flows-v8.json not captured")
+def test_route_prompt_examples_match_the_fixture_corpus():
+    """Every `message=` in the few-shot must exist in the fixture, up to volatile values.
+
+    Failing here means either the prompt drifted or an emitter's message changed —
+    both need a human, because the examples are what steer the routing.
+    """
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    corpus = {_mask_ids(m) for m in _alertable_messages()}
+    assert corpus, "fixture produced no WARN/ERROR logs"
+
+    # Each example line is `message=<text> -> {json}`; take the text between them.
+    examples = re.findall(r"message=(.*?) -> \{", _ROUTE_EXAMPLES, re.DOTALL)
+    assert len(examples) >= 10, f"expected the full example set, found {len(examples)}"
+
+    stale = [ex for ex in examples if _mask_ids(ex.strip()) not in corpus]
+    assert not stale, (
+        "few-shot examples no longer match any message the emitters produce "
+        f"(update them from {_FIXTURE.name}): {stale}"
+    )
+
+
+@pytest.mark.skipif(not _FIXTURE.exists(), reason="mock-order-flows-v8.json not captured")
+def test_route_prompt_covers_the_corpus_frequent_alert_types():
+    """The recurring alert types must each be represented in the few-shot.
+
+    Not every type needs an example — the prompt's fallback rule handles novel
+    logs (the Settings anomalies deliberately have none). But a type that recurs
+    and is genuinely ambiguous should be pinned, or a prompt edit can quietly drop
+    the one example holding a whole class in the right department.
+    """
+    from ai_service.nodes import _ROUTE_EXAMPLES
+
+    # Distinctive fragments of the classes most often misrouted, and why.
+    required = {
+        "margin": "below threshold",              # business rejection, not a defect
+        "udf": "mandatory UDF",                   # user data, not a defect
+        "sku": "No internal SKU mapping",         # reference data, not a defect
+        "jam-403": "HTTP/1.1 403",                # authorization, not networking
+        "spt-timeout": "SocketTimeoutException",  # transport fault
+        "sap-rfc": "RFC_COMMUNICATION_FAILURE",   # transport, not integration logic
+        "db": "SQLTimeoutException",              # persistence
+        "dlq-init": "order.init_error",           # queue plumbing
+        "dlq-sap": "order.create.sap_error",      # queue plumbing
+        "retry": "(attempt 2/3)",                 # in-flight retry -> low severity
+    }
+    missing = [name for name, frag in required.items() if frag not in _ROUTE_EXAMPLES]
+    assert not missing, f"few-shot lost coverage of: {missing}"
+
+
+def test_route_prompt_states_the_severity_ladder():
+    """Retry WARNs must not inherit the abort's severity.
+
+    A single SPT outage emits two retry WARNs and an abort ERROR as three separate
+    alerts; without the ladder they all rate high and one fault reads as three
+    criticals in the feed.
+    """
+    from ai_service.nodes import _ROUTE_SYSTEM
+
+    assert "Severity ladder" in _ROUTE_SYSTEM
+    assert "retry still in flight" in _ROUTE_SYSTEM
+
+
+def test_explain_prompt_grounds_business_rejections():
+    """The explainer must agree with the router about what a rejection is.
+
+    The router sends margin/UDF/account rejections to `general` ("nobody changes
+    code"); an explainer calling the same log a system error puts a contradiction
+    on one alert card.
+    """
+    from ai_service.nodes import _EXPLAIN_SYSTEM
+
+    assert "correctly rejected" in _EXPLAIN_SYSTEM
+    assert "do not name services it does not mention" in _EXPLAIN_SYSTEM
 
 
 async def test_router_tolerates_code_fence_and_prose():

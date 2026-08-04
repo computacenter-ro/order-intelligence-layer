@@ -1,9 +1,13 @@
-"""cc-solr-service emitter block (CLAUDE.md [1]) — product search / id resolution.
+"""cc-solr-service emitter block (CLAUDE.md [1]) — catalogue-line matching.
 
-SOLR is a first-class enrichment satellite: the order engine calls it after RSM
-and before JAM to resolve the order's vendor product ids against the search
-index. Its ``serve`` block is the satellite's server-side log during enrichment,
-the same shape as ``rsm.py``'s.
+SOLR is the LAST stop on **Inbound's pre-creation enrichment leg**. NOTE ON
+PROVENANCE: no Computacenter document mentions SOLR at all — its position here
+is INFERRED (catalogue-line matching is demonstrably Inbound's job), per the
+realignment spec. Do not cite this placement as documented fact.
+
+Its logs are phase 1 — eventId only; the order (and its ids) does not exist
+yet. Its ``serve`` block is the satellite's server-side log, the same shape as
+``rsm.py``'s.
 
 **Success path only, by design.** No scenario fails at SOLR — there is no
 ``fail_at="solr"`` in ``shared/scenarios.py`` and none should be invented here.
@@ -12,7 +16,7 @@ block never runs.
 """
 from __future__ import annotations
 
-from pipeline.services.blocklib import emit_line, phase2_ids
+from pipeline.services.blocklib import emit_line, phase1_ids
 from pipeline.services.profiles import profile
 from pipeline.services.registry import EmitFn, register
 from shared.models import Baton
@@ -25,7 +29,7 @@ _LOG_INDEX = "c.c.solr.service.SolrIndexService"
 @register("solr", "serve")
 async def serve(baton: Baton, emit: EmitFn) -> bool:
     ctx = baton.ctx
-    ids = phase2_ids(ctx)
+    ids = phase1_ids(ctx)
     product_ids = ", ".join(line.productId for line in ctx.lines)
     n = len(ctx.lines)
 

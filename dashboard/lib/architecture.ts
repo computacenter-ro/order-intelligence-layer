@@ -5,15 +5,38 @@
  * production system") expressed as data so the SVG renderer stays dumb: it
  * draws whatever is listed here and knows nothing about order management.
  *
+ * The topology is the FIVE-HOP ping-pong between Inbound and the Order
+ * Engine (per the Computacenter service docs the realignment spec cites):
+ *
+ *   1  Inbound ── order.init ──► Order Engine (first turn: defaults only)
+ *   2  Order Engine ── order_data_ready ──► Inbound
+ *   3  Inbound ── order.approval ──► Order Engine (second turn: CREATE)
+ *   4  Order Engine ── order.create.sap ──► Outbound OSW ─► SAP Fulfilment
+ *   5  Order Engine ── order_created ──► Inbound   (closes the loop)
+ *
+ * Inbound owns the PRE-creation satellites (Settings → JAM → SOLR; SOLR's
+ * ownership is inferred, not documented — see shared/scenarios.py). The Order
+ * Engine owns the POST-creation ones: Track & Trace right after creation,
+ * then SPT → RSM → Validator → Avalara (US) → Checker.
+ *
+ * The Inbound↔Engine hops all ride the same control queues, so they are drawn
+ * as the two BIDIRECTIONAL spine edges through RabbitMQ with the routing keys
+ * as labels, rather than as duplicate parallel return lines — the connector
+ * geometry anchors both directions to the same two points, so a literal
+ * second edge would draw exactly on top of the first. The journey replay
+ * still walks the return legs visibly (it traverses these edges in reverse).
+ *
  * Deliberately EXCLUDED from the source diagram: "SAP Master Data" and the
  * "ETL Feeds" that populate SPT/RSM/SOLR. They are not simulated by this
  * project, and drawing them would imply the mock services consume them.
  *
- * Coordinates are hand-placed in a fixed 1240x760 design space rather than
- * computed by a layout engine — the topology is static and known, and a
- * hand-tuned layout reads far better than anything auto-routing would produce
- * at this size. The renderer fits this box to the container, so the numbers
- * are a unitless design grid, not pixels on screen.
+ * Coordinates are hand-placed in a fixed design space rather than computed by
+ * a layout engine — the topology is static and known, and a hand-tuned layout
+ * reads far better than anything auto-routing would produce at this size. The
+ * renderer fits this box to the container, so the numbers are a unitless
+ * design grid, not pixels on screen. The grid's reading: the pre-creation
+ * world (entry + Inbound's satellites) clusters on the LEFT, creation and the
+ * post-creation checks sit centre/RIGHT.
  */
 
 /** Drives shape and colour. One accent per category, all design-system tokens. */
@@ -42,8 +65,8 @@ export interface ArchEdge {
   bidirectional?: boolean;
   /**
    * Where the line leaves `from` and enters `to`. Explicit rather than derived:
-   * the satellite fan-out and the Track & Trace return leg need specific sides
-   * to stay orthogonal and un-crossed.
+   * the satellite fan-outs need specific sides to stay orthogonal and
+   * un-crossed.
    */
   fromSide?: Side;
   toSide?: Side;
@@ -67,20 +90,20 @@ const NODE_W = 128;
 const NODE_H = 50;
 
 /**
- * Layout: a faithful transcription of the project's source architecture
- * diagram (`ways-of-working/razvan/order_engine_architecture.png`), minus the
- * deliberately excluded "SAP Master Data" and "ETL Feeds" boxes.
+ * Layout: one horizontal SPINE at mid-height — Inbound → RabbitMQ → Order
+ * Engine → RabbitMQ → Outbound OSW → SAP Fulfilment — with everything else
+ * hanging off it:
  *
- * The source is organised around one horizontal SPINE at mid-height —
- * Inbound → RabbitMq → Order Engine → Outbound OSW → SAP Fulfilment — with
- * everything else hanging off it:
- *
+ *   - INBOUND's satellites (Settings / JAM / SOLR) in a column BELOW-LEFT of
+ *     it, top-to-bottom in call order, reached leftward from Inbound's left
+ *     edge (the same fan grammar the engine uses for its own satellites).
+ *     Salesforce Settings sits above that column, pushing into Settings.
  *   - BM DB directly ABOVE the engine, UI Order Engine and the login actor
  *     directly BELOW it, so the engine sits at a four-way crossing.
- *   - SPT / RSM / SOLR upper-LEFT, called back leftward from a vertical bus
- *     that rises out of the spine just right of the engine.
- *   - The six remaining satellites in a right-hand COLUMN, each reached from a
- *     single vertical bus that drops (and rises) from the spine.
+ *   - SPT / RSM upper-LEFT of the engine, called back leftward.
+ *   - The engine's four remaining satellites in a right-hand COLUMN —
+ *     Validator, Avalara, Checker in the documented auto-approval order, then
+ *     Track & Trace — each reached from a single vertical bus off the spine.
  *   - SAP BTP bottom-left with Orders B2B/SF beside it; "Create Order" runs
  *     UPWARD into Inbound, and the three dashed reference lookups run right
  *     from SAP BTP and turn up into the spine.
@@ -91,9 +114,11 @@ const COL = {
   ordersSrc: 84,
   btp: 288,
   inbound: 288,
+  /** Inbound's satellite column (pre-creation leg), below-left of Inbound. */
+  inboundSat: 84,
   queueIn: 452,
   engine: 660,
-  /** The upper-left satellites (SPT / RSM / SOLR). */
+  /** The upper-left satellites (SPT / RSM). */
   upperSat: 358,
   /** Label channel + vertical bus feeding the right-hand satellite column. */
   rightBus: 940,
@@ -108,7 +133,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Orders B2B / SF",
     category: "external",
     description:
-      "Incoming orders from B2B customers and Salesforce — the source of every order event.",
+      "Where orders come from — B2B customer channels and Salesforce. Every order in the pipeline starts here.",
     // Sits below-left of SAP BTP in the source, angling up into it.
     x: COL.ordersSrc,
     y: 736,
@@ -120,7 +145,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "SAP BTP",
     category: "external",
     description:
-      "SAP Business Technology Platform — the integration entry point where orders arrive; simulated by the injector.",
+      "SAP's integration layer — the bridge between the external order sources and the internal order pipeline.",
     x: COL.btp,
     y: 706,
     w: 124,
@@ -133,7 +158,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Inbound",
     category: "service",
     description:
-      "cc-inbound-service: receives the raw order event, transforms it and maps vendor product IDs to internal SKUs, then publishes to order.inbound.queue.",
+      "The pipeline's front door — receives incoming orders, prepares them, and hands them to the Order Engine.",
     x: COL.inbound,
     y: SPINE_Y,
     w: NODE_W,
@@ -144,7 +169,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "RabbitMQ",
     category: "queue",
     description:
-      "order.inbound.queue — carries the transformed order from Inbound to the Order Engine; failed deliveries dead-letter to _error.",
+      "Message broker carrying the back-and-forth between Inbound and the Order Engine — orders travel through the pipeline as queue messages, not direct calls.",
     x: COL.queueIn,
     y: SPINE_Y,
     w: NODE_W,
@@ -155,7 +180,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Order Engine",
     category: "service",
     description:
-      "cc-order-engine: the central orchestrator. Creates the order (persists the cart header to BM DB, generates the order number) and enriches it by calling the satellite services.",
+      "The heart of the pipeline — creates the order, runs the checks, and decides whether it can go to SAP.",
     x: COL.engine,
     y: SPINE_Y,
     w: 156,
@@ -165,7 +190,7 @@ export const ARCH_NODES: ArchNode[] = [
     id: "outbound",
     label: "Outbound OSW",
     category: "service",
-    description: "cc-outbound-osw: submits the order to SAP fulfilment via RFC (Submit).",
+    description: "Sends completed orders on to SAP for fulfilment.",
     x: COL.farRight - 66,
     y: SPINE_Y,
     w: 132,
@@ -176,7 +201,7 @@ export const ARCH_NODES: ArchNode[] = [
     id: "sap_ful",
     label: "SAP Fulfilment",
     category: "external",
-    description: "SAP ECC fulfilment system that receives the submitted order.",
+    description: "Where the order goes once the pipeline is done with it — SAP takes over delivery and invoicing.",
     x: COL.farRight + 76,
     y: SPINE_Y,
     w: 74,
@@ -189,7 +214,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "BM DB",
     category: "datastore",
     description:
-      "Business-master database where the Order Engine persists the cart header at order creation.",
+      "The order database — the Order Engine writes each order here at creation, and the order's identifiers exist from this point on.",
     x: COL.engine,
     y: 92,
     w: 104,
@@ -200,7 +225,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "UI Order Engine (Angular)",
     category: "ui",
     description:
-      "The Angular UI an agent uses to interact with the Order Engine (not part of the simulation).",
+      "The screen agents use to view, edit, approve or reject orders in the Order Engine. Not part of this simulation.",
     x: COL.engine,
     y: 566,
     w: 140,
@@ -210,19 +235,65 @@ export const ARCH_NODES: ArchNode[] = [
     id: "oe_user",
     label: "OE Login User",
     category: "actor",
-    description: "The support agent who signs into the Order Engine UI.",
+    description: "The person behind the screen — a Computacenter agent working orders through the UI.",
     x: COL.engine,
     y: 714,
     w: 128,
     h: 64,
   },
 
-  // ── Upper-left satellites, called back leftward ───────────────────────────
+  // ── Inbound's pre-creation satellites, below-left in call order ───────────
+  {
+    id: "sf_settings",
+    label: "Salesforce Settings",
+    category: "external",
+    description: "Where customer configuration is maintained — pushed from Salesforce into the Settings service the pipeline reads.",
+    x: COL.inboundSat,
+    y: 356,
+    w: 132,
+    h: 58,
+  },
+  {
+    id: "settings",
+    label: "Settings",
+    category: "service",
+    description:
+      "Serves per-customer configuration — account settings and business thresholds the pipeline consults before an order is created.",
+    x: COL.inboundSat,
+    y: 470,
+    w: NODE_W,
+    h: 46,
+  },
+  {
+    id: "jam",
+    label: "JAM",
+    category: "service",
+    description:
+      "The authentication and privileges service — confirms the ordering user's identity and rights; a blocked account stops the order before it's created.",
+    x: COL.inboundSat,
+    y: 550,
+    w: NODE_W,
+    h: 46,
+  },
+  {
+    id: "solr",
+    label: "SOLR",
+    category: "service",
+    description:
+      "The product-search service — finds the catalogue item behind each order line so the order references real products.",
+    x: COL.inboundSat,
+    y: 630,
+    w: NODE_W,
+    h: 46,
+  },
+
+  // ── The engine's upper-left satellites ────────────────────────────────────
   {
     id: "spt",
     label: "SPT",
     category: "service",
-    description: "cc-spt-service: pricing — returns the account's price lists (Get Prices).",
+    description:
+      "The pricing service — supplies the account's price lists so the order's lines get their costs.",
     x: COL.upperSat,
     y: 84,
     w: NODE_W,
@@ -233,32 +304,33 @@ export const ARCH_NODES: ArchNode[] = [
     label: "RSM",
     category: "service",
     description:
-      "cc-rsm-service: rebate scheme manager — computes rebates / PVC rates (Get Rebates).",
+      "Provides rebate and PVC information.",
     x: COL.upperSat,
     y: 176,
     w: NODE_W,
     h: 46,
   },
+
+  // ── Right-hand satellite column (documented auto-approval order) ──────────
   {
-    id: "solr",
-    label: "SOLR",
+    id: "validator",
+    label: "Validator",
     category: "service",
-    description: "cc-solr-service — product search / ID resolution during enrichment.",
-    x: COL.upperSat,
-    y: 286,
+    description:
+      "Runs the business validation rules — required fields, addresses, quantities, dates — and reports anything wrong with the order.",
+    x: COL.rightSat,
+    y: 104,
     w: NODE_W,
     h: 46,
   },
-
-  // ── Right-hand satellite column ───────────────────────────────────────────
   {
-    id: "settings",
-    label: "Settings",
+    id: "avalara",
+    label: "Avalara",
     category: "service",
     description:
-      "cc-settings-service: margin thresholds and account settings, SQL-backed and pushed from Salesforce (Get Settings).",
+      "Verifies US shipping addresses (US orders only).",
     x: COL.rightSat,
-    y: 104,
+    y: 200,
     w: NODE_W,
     h: 46,
   },
@@ -267,18 +339,7 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Checker",
     category: "service",
     description:
-      "cc-checker-service: margin check — can block the order when the line margin is below the configured threshold.",
-    x: COL.rightSat,
-    y: 200,
-    w: NODE_W,
-    h: 46,
-  },
-  {
-    id: "validator",
-    label: "Validator",
-    category: "service",
-    description:
-      "cc-validator-service: runs validation strategies before dispatch; rejects on missing UDFs (e.g. costCenter).",
+      "The margin check — verifies the order meets its margin rules; an order below threshold is held for a person to review.",
     x: COL.rightSat,
     y: 288,
     w: NODE_W,
@@ -289,55 +350,27 @@ export const ARCH_NODES: ArchNode[] = [
     label: "Track & Trace",
     category: "service",
     description:
-      "cc-track-trace: registers the order for tracking — the success terminal event of a journey.",
+      "Registers the newly created order for tracking so its progress is visible to the customer from this point on.",
     x: COL.rightSat,
     y: 490,
     w: NODE_W,
     h: 50,
   },
-  {
-    id: "jam",
-    label: "JAM",
-    category: "service",
-    description:
-      "cc-jam-service: user authentication and privileges; issues a JWT. A disabled account blocks the order (403).",
-    x: COL.rightSat,
-    y: 578,
-    w: NODE_W,
-    h: 46,
-  },
-  {
-    id: "avalara",
-    label: "Avalara",
-    category: "service",
-    description:
-      "US ship-to address verification, US orders only, before dispatch.",
-    x: COL.rightSat,
-    y: 668,
-    w: NODE_W,
-    h: 46,
-  },
-  // Feeds Settings from the far right, top corner — as in the source.
-  {
-    id: "sf_settings",
-    label: "Salesforce Settings",
-    category: "external",
-    description: "Salesforce source that pushes settings into the Settings service.",
-    x: COL.farRight + 90,
-    y: 100,
-    w: 132,
-    h: 58,
-  },
 
-  // The outbound queue sits ABOVE Outbound OSW in the source.
+  // ON the spine between the engine and Outbound OSW — the same grammar as
+  // rmq_in: the order's path runs THROUGH the queue, never past it. (The
+  // source sketch parks this queue above Outbound OSW, but an off-path queue
+  // reads as optional, and routing the publish leg up to it would either
+  // cross the right-hand satellite bus or overlap the consume leg.)
   {
     id: "rmq_out",
     label: "RabbitMQ",
     category: "queue",
     description:
-      "order.outbound.queue — carries the validated order to Outbound OSW; failed deliveries dead-letter to _error.",
-    x: COL.farRight - 66,
-    y: 254,
+      "Message queue on the way out — approved orders wait here until Outbound OSW picks them up for SAP.",
+    // Midpoint of the gap between the engine's right edge and Outbound's left.
+    x: 983,
+    y: SPINE_Y,
     w: NODE_W,
     h: 50,
   },
@@ -348,12 +381,30 @@ export const ARCH_EDGES: ArchEdge[] = [
   { from: "orders_src", to: "sap_btp", fromSide: "right", toSide: "left" },
   { from: "sap_btp", to: "inbound", label: "Create Order", fromSide: "top", toSide: "bottom" },
 
-  // ── The spine itself ──────────────────────────────────────────────────────
-  { from: "inbound", to: "rmq_in", fromSide: "right", toSide: "left" },
+  // ── The spine: the five hops' request/response pairs ──────────────────────
+  // Both spine edges are bidirectional: order.init and order.approval travel
+  // rightward, order_data_ready and order_created travel leftward — the same
+  // queues carry all four, so one line per segment with heads at both ends is
+  // the honest drawing (see the header comment).
+  {
+    from: "inbound",
+    to: "rmq_in",
+    label: "order.init · order.approval",
+    bidirectional: true,
+    fromSide: "right",
+    toSide: "left",
+    // ABOVE the spine. The run here is only ~36px (Inbound's right edge to
+    // RabbitMQ's left edge) but the label is ~150px, so centred on the line it
+    // spills into both boxes — and edges paint UNDER nodes, so it vanished
+    // entirely. Its sibling edge drops below the spine (labelDy: 44); this one
+    // goes up so the two adjacent labels don't land on top of each other.
+    labelDy: -30,
+  },
   {
     from: "rmq_in",
     to: "order_engine",
-    label: "Inbounded Order Data",
+    label: "order_data_ready · order_created",
+    bidirectional: true,
     fromSide: "right",
     toSide: "left",
     // Below the spine, as in the source — the run between these two adjacent
@@ -361,9 +412,22 @@ export const ARCH_EDGES: ArchEdge[] = [
     labelDx: -4,
     labelDy: 44,
   },
-  { from: "order_engine", to: "outbound", label: "Submit", fromSide: "right", toSide: "left" },
+  // Hop 4 rides a queue like every other hop: the engine PUBLISHES
+  // order.create.sap — its responsibility ends there (order-engine.md §9.3,
+  // §9 row 10) — and Outbound OSW consumes it. A direct engine → outbound
+  // edge would assert a synchronous handoff that does not exist.
+  {
+    from: "order_engine",
+    to: "rmq_out",
+    label: "order.create.sap",
+    fromSide: "right",
+    toSide: "left",
+    // Above the line: the run's midpoint sits on the satellite bus's elbows
+    // at x≈814, and the label halo would knock them out of the drawing.
+    labelDy: -26,
+  },
+  { from: "rmq_out", to: "outbound", fromSide: "right", toSide: "left" },
   { from: "outbound", to: "sap_ful", fromSide: "right", toSide: "left" },
-  { from: "rmq_out", to: "outbound", fromSide: "bottom", toSide: "top" },
 
   // ── Above / below the engine ──────────────────────────────────────────────
   {
@@ -377,11 +441,42 @@ export const ARCH_EDGES: ArchEdge[] = [
   { from: "ui_oe", to: "order_engine", fromSide: "top", toSide: "bottom" },
   { from: "oe_user", to: "ui_oe", fromSide: "top", toSide: "bottom" },
 
-  // ── Upper-left satellites: the engine calls back leftward into them ───────
+  // ── Inbound's satellites: called back leftward, downward fan ──────────────
+  // Same fan grammar as the engine's: leave the caller's LEFT edge, enter the
+  // satellite's right edge. Lane assignment avoids crossings: the DEEPEST
+  // target takes the lane closest to Inbound (largest x), so no approach run
+  // ever crosses a longer lane.
+  {
+    from: "inbound",
+    to: "settings",
+    label: "Get Settings",
+    fromSide: "left",
+    toSide: "right",
+    bend: 0.5,
+  },
+  {
+    from: "inbound",
+    to: "jam",
+    label: "Authenticate",
+    fromSide: "left",
+    toSide: "right",
+    bend: 0.34,
+  },
+  {
+    from: "inbound",
+    to: "solr",
+    label: "Products Ids",
+    fromSide: "left",
+    toSide: "right",
+    bend: 0.18,
+  },
+  { from: "sf_settings", to: "settings", label: "push settings", fromSide: "bottom", toSide: "top" },
+
+  // ── The engine's upper-left satellites, called back leftward ──────────────
   // Each leaves the engine's LEFT edge and enters the satellite's right edge,
   // so the arrowheads point left exactly as in the source. Leaving from the top
   // would drive them straight through BM DB, which sits directly above.
-  // Distinct lanes keep the three vertical legs apart.
+  // Distinct lanes keep the vertical legs apart.
   {
     from: "order_engine",
     to: "spt",
@@ -398,55 +493,16 @@ export const ARCH_EDGES: ArchEdge[] = [
     toSide: "right",
     bend: 0.34,
   },
-  {
-    from: "order_engine",
-    to: "solr",
-    label: "Products Ids",
-    fromSide: "left",
-    toSide: "right",
-    bend: 0.5,
-  },
 
   // ── Right-hand satellite column, from a shared vertical bus ───────────────
-  // All six leave the engine's right edge and enter their satellite's left
+  // All four leave the engine's right edge and enter their satellite's left
   // edge on a common lane, reproducing the source's single vertical bus with
-  // horizontal spurs.
-  {
-    from: "order_engine",
-    to: "settings",
-    label: "Get Settings",
-    fromSide: "right",
-    toSide: "left",
-    bend: 0.22,
-  },
-  {
-    from: "order_engine",
-    to: "checker",
-    label: "Marging Check",
-    fromSide: "right",
-    toSide: "left",
-    bend: 0.22,
-  },
+  // horizontal spurs. Top-to-bottom: the documented auto-approval order
+  // (Validator → Avalara → Checker), then Track & Trace.
   {
     from: "order_engine",
     to: "validator",
     label: "Validate",
-    fromSide: "right",
-    toSide: "left",
-    bend: 0.22,
-  },
-  {
-    from: "order_engine",
-    to: "track_trace",
-    label: "Track Order",
-    fromSide: "right",
-    toSide: "left",
-    bend: 0.22,
-  },
-  {
-    from: "order_engine",
-    to: "jam",
-    label: "Authenticate",
     fromSide: "right",
     toSide: "left",
     bend: 0.22,
@@ -459,7 +515,22 @@ export const ARCH_EDGES: ArchEdge[] = [
     toSide: "left",
     bend: 0.22,
   },
-  { from: "sf_settings", to: "settings", label: "push settings", fromSide: "left", toSide: "right" },
+  {
+    from: "order_engine",
+    to: "checker",
+    label: "Margin Check",
+    fromSide: "right",
+    toSide: "left",
+    bend: 0.22,
+  },
+  {
+    from: "order_engine",
+    to: "track_trace",
+    label: "Track Order",
+    fromSide: "right",
+    toSide: "left",
+    bend: 0.22,
+  },
 
   // ── Dashed reference lookups: right out of SAP BTP, up into the spine ─────
   // All three share the same endpoints, so they draw as one line with the

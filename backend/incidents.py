@@ -196,6 +196,11 @@ _INFRA_SUBTYPES = frozenset({
     "ENRICHMENT_FAILED",        # a dependency (SPT/RSM/...) never responded
     "ORDER_CREATION_FAILED",    # BM-DB connection timeout
     "SAP_SUBMISSION_FAILED",    # SAP RFC not reached
+    # A dependency that flapped and recovered is infrastructure BY DEFINITION —
+    # the order itself was fine (it succeeded). INFRA is also what makes several
+    # flapping orders merge into ONE incident rather than one per order, which is
+    # the entire point: a service blipping on 30 orders is one story.
+    "TRANSIENT_FAILURE",
 })
 _ORDER_SPECIFIC_SUBTYPES = frozenset({
     "MARGIN_CHECK_FAILED",      # this order's margin
@@ -343,6 +348,103 @@ def build_title(signature: Signature, suggested_label: str | None = None) -> str
             return f"{cleaned} — {signature.failing_service}"
     subtype = signature.failure_subtype or "Unrecognized failure"
     return f"{subtype} — {signature.failing_service}"
+
+
+def incident_subtype_for(status, outcome: str, has_recovered_error: bool) -> str | None:
+    """The ``failure_subtype`` an incident should carry, or ``None`` for the
+    novel/embedding path. Returns ``False``-y only via ``None``; ineligibility
+    is decided by :func:`is_eligible_for_clustering`, not here.
+
+    Three cases, and the third is the one that is NOT the journey's outcome:
+
+    * ``FAILED`` with a recognized subtype -> that subtype (unchanged).
+    * ``FAILED``/``UNRECOGNIZED_FAILURE`` or ``TIMED_OUT`` -> ``None``, the
+      novel path (unchanged).
+    * ``SUCCESS`` carrying a RECOVERED error -> ``TRANSIENT_FAILURE``.
+
+    That last case deliberately breaks the "subtype is the journey's OWN
+    outcome, never re-derived" rule stated in :func:`build_signature`, and the
+    exception is principled rather than convenient: for a failure the journey's
+    outcome IS the cause, but a recovered journey's outcome (``SUCCESS``)
+    describes the ORDER while the incident describes the DEPENDENCY. They are
+    different facts about the same flow. Passing ``SUCCESS`` through would hash
+    a meaningless ``SUCCESS:<service>`` signature and title an incident
+    "SUCCESS — SPT"; forcing it to ``ENRICHMENT_FAILED`` would be worse still,
+    merging a shipped order into the outage incident and inflating that
+    incident's ``journey_count`` beyond the orders that actually broke.
+    ``TRANSIENT_FAILURE`` hashes distinctly from every failure subtype, so the
+    two can never collide.
+    """
+    from backend.journeys import JourneyStatus, TRANSIENT_FAILURE, UNRECOGNIZED_FAILURE
+
+    if status is JourneyStatus.SUCCESS and has_recovered_error:
+        return TRANSIENT_FAILURE
+    if status is JourneyStatus.FAILED and outcome != UNRECOGNIZED_FAILURE:
+        return outcome
+    return None
+
+
+async def _has_recovered_error(session, completion) -> bool:
+    """Did this journey carry an ERROR that later recovered?
+
+    Reads the journey's LOGS when the completion carries them (the live
+    ``raw.events`` path, where the stitched journey is in memory) and falls back
+    to the persisted ``journey_events`` rows when it does not — which is the
+    case on the ``retry_unclustered_completions`` sweep, where the completion is
+    rebuilt from the ``journeys`` table with an EMPTY log list. Without that
+    fallback a recovered journey whose completion outran its alerts would be
+    permanently skipped: the sweep would see no logs, conclude "no recovered
+    error", and never cluster it — exactly the silent-skip class of bug the
+    sweep itself exists to fix.
+    """
+    from sqlalchemy import select
+    from backend.db import JourneyEvent
+    from backend.journeys import unrecovered_errors
+    from shared.models import LogLine
+
+    logs = list(completion.journey.logs)
+    if logs:
+        # Live path: the stitched journey is in memory, so decide without a query.
+        # The overwhelmingly common case here is a CLEAN success — no ERROR at
+        # all — and it must cost nothing, since every healthy order reaches this.
+        if not any(log.level == "ERROR" for log in logs):
+            return False
+        return not unrecovered_errors(logs)
+
+    # Sweep path only: the completion was rebuilt from the ``journeys`` table
+    # with an EMPTY log list, so the logs must come from ``journey_events``.
+    # Without this a recovered journey whose completion outran its alerts would
+    # be skipped forever — the silent-skip class of bug the sweep exists to fix.
+    result = await session.execute(
+        select(JourneyEvent.raw)
+        .where(JourneyEvent.journey_id == completion.journey_id)
+        .order_by(JourneyEvent.ts)
+    )
+    for (raw,) in result.all():
+        try:
+            logs.append(LogLine.model_validate(raw))
+        except Exception:  # noqa: BLE001 — a corrupt row must not break clustering
+            continue
+    if not any(log.level == "ERROR" for log in logs):
+        return False
+    return not unrecovered_errors(logs)
+
+
+def is_eligible_for_clustering(status, has_recovered_error: bool) -> bool:
+    """Whether a completed journey may form/join an incident at all.
+
+    ``FAILED`` and ``TIMED_OUT`` are eligible as they always were. ``SUCCESS`` is
+    eligible ONLY when the journey carried an error that recovered — i.e. a
+    dependency flapped mid-flow (scenario 18). A clean success has no causal line
+    to anchor on and must never cluster, which is why this is gated on the
+    recovered-error flag rather than on ``SUCCESS`` alone: without that gate every
+    healthy order would attempt to cluster on every run.
+    """
+    from backend.journeys import JourneyStatus
+
+    if status in (JourneyStatus.FAILED, JourneyStatus.TIMED_OUT):
+        return True
+    return status is JourneyStatus.SUCCESS and has_recovered_error
 
 
 # --- assign_incident: match-or-create (DB) --------------------------------------
@@ -508,11 +610,19 @@ async def process_completion(session, completion, *, now: datetime | None = None
     """
     from sqlalchemy import select, update
     from backend.db import Alert, Journey
-    from backend.journeys import JourneyStatus, UNRECOGNIZED_FAILURE
+    from backend.journeys import JourneyStatus, unrecovered_errors
 
     now = now or _utcnow()
 
-    if completion.status not in (JourneyStatus.FAILED, JourneyStatus.TIMED_OUT):
+    # A SUCCESS journey is eligible only when a dependency flapped and recovered
+    # mid-flow: it has ERROR logs, but every one of them was followed by healthy
+    # activity from the same source. A CLEAN success (no errors at all) is
+    # therefore still ineligible and never clusters.
+    has_recovered_error = False
+    if completion.status is JourneyStatus.SUCCESS:
+        has_recovered_error = await _has_recovered_error(session, completion)
+
+    if not is_eligible_for_clustering(completion.status, has_recovered_error):
         return None
 
     result = await session.execute(
@@ -531,16 +641,15 @@ async def process_completion(session, completion, *, now: datetime | None = None
     if completion.status is JourneyStatus.TIMED_OUT and causal.level != "ERROR":
         return None  # TIMED_OUT needs a real ERROR (Eligibility, above)
 
-    # subtype from the journey's OWN classification — recognized only when
+    # Subtype from the journey's OWN classification — recognized only when
     # FAILED with a NAMED subtype. UNRECOGNIZED_FAILURE is a real FAILED
-    # status but not a specific cause, so it's normalized to None here too —
-    # otherwise every unrelated unrecognized failure from the same service
-    # would hash-merge by service name alone, losing the cosine path's
-    # message-content precision.
-    failure_subtype = (
-        completion.outcome
-        if completion.status is JourneyStatus.FAILED and completion.outcome != UNRECOGNIZED_FAILURE
-        else None
+    # status but not a specific cause, so it's normalized to None — otherwise
+    # every unrelated unrecognized failure from the same service would
+    # hash-merge by service name alone, losing the cosine path's
+    # message-content precision. A RECOVERED journey is the one case where the
+    # subtype is not the outcome; see incident_subtype_for.
+    failure_subtype = incident_subtype_for(
+        completion.status, completion.outcome, has_recovered_error
     )
     signature = build_signature(
         failure_subtype, causal.logger, causal.app_name, causal.message
@@ -598,11 +707,19 @@ async def retry_unclustered_completions(session, now: datetime | None = None, on
     not by the unit tests, which always hand-fed already-linked alerts).
 
     This is the catch-up: on the same periodic cadence as the other sweeps,
-    find every terminal (``FAILED``/``TIMED_OUT``) journey with no
-    ``incident_id`` yet and call ``process_completion`` again. Safe to call
-    repeatedly — ``process_completion`` re-checks ``Journey.incident_id``
-    itself, and a journey that still has no causal alert simply no-ops again
-    until a later sweep catches it.
+    find every completed journey with no ``incident_id`` yet and call
+    ``process_completion`` again. Safe to call repeatedly —
+    ``process_completion`` re-checks ``Journey.incident_id`` itself, and a
+    journey that still has no causal alert simply no-ops again until a later
+    sweep catches it.
+
+    ``SUCCESS`` is in the candidate set alongside ``FAILED``/``TIMED_OUT``
+    because a RECOVERED journey (scenario 18) clusters as ``TRANSIENT_FAILURE``
+    and is just as vulnerable to completion outrunning its alerts. The vast
+    majority of those rows are clean successes, which ``process_completion``
+    rejects immediately via :func:`_has_recovered_error` — a cheap no-op, and
+    the honest place for the check, since only it can see whether the errors
+    recovered.
     """
     from sqlalchemy import select
     from backend.db import Journey
@@ -611,7 +728,11 @@ async def retry_unclustered_completions(session, now: datetime | None = None, on
 
     result = await session.execute(
         select(Journey).where(
-            Journey.status.in_([JourneyStatus.FAILED.value, JourneyStatus.TIMED_OUT.value]),
+            Journey.status.in_([
+                JourneyStatus.FAILED.value,
+                JourneyStatus.TIMED_OUT.value,
+                JourneyStatus.SUCCESS.value,
+            ]),
             Journey.incident_id.is_(None),
         )
     )

@@ -83,15 +83,14 @@ Nothing here touches production — all services, hosts, and data are simulated.
 │   │   ├── registry.py            # (service, block) -> handler registry
 │   │   ├── blocklib.py  profiles.py
 │   │   ├── inbound.py  order_engine.py  spt.py  rsm.py  jam.py
-│   │   ├── settings.py  checker.py  validator.py
+│   │   ├── settings.py  solr.py  checker.py  validator.py  avalara.py
 │   │   ├── outbound_osw.py  track_trace.py
 │   │   └── run_all.py             # starts every service in one command
 │   ├── injector/inject.py        # starts flows (stands in for "Orders B2B / SF")
 │   ├── mock_es/app.py             # [2] Log Collector, FastAPI :9200
 │   ├── scripts/capture_flow.py   # dev harness: fire a scenario, dump captured logs to JSON
 │   │   dump_backend.py           # dev harness: dump backend DB state to JSON
-│   └── data/                     # reference fixtures — **v6 is current** (captured from the
-│                                 #   emitters, read by the tests); v2–v5 kept for history
+│   └── data/                     # reference fixtures (v8 = current; v2..v7 kept for history)
 ├── ai_service/                   # [3] :8100
 │   ├── main.py  poller.py  graph.py  nodes.py  breaker.py  publisher.py  api.py
 │   ├── settings.py  llm.py        # config + the ONE provider-wiring module
@@ -125,43 +124,59 @@ Nothing here touches production — all services, hosts, and data are simulated.
 
 ## The simulated production system (what the logs imitate)
 
-A microservice order pipeline. One order's path in the real system:
+A microservice order pipeline. The real system is **Inbound and the Order
+Engine ping-ponging over RabbitMQ five times**, and the order is not persisted
+until the Order Engine's *second* turn:
 
-1. Orders arrive (B2B / Salesforce) into SAP BTP — simulated by
-   `pipeline/injector/inject.py`.
-2. **cc-inbound-service** receives the raw order event, transforms it (maps
-   vendor product ids to internal SKUs), publishes to RabbitMQ
-   `order.inbound.queue`.
-3. **cc-order-engine** (central orchestrator) consumes it, **creates the
-   order** (persists cart header to BM DB, generates the order number), and
-   publishes a **creation response** to `order.response.queue`, which inbound
-   reads (→ *bridge event*, see Correlation Model).
-4. cc-order-engine then enriches the order via HTTP/Feign calls, in **this
-   exact order** (`ENRICH_SATELLITES` in `shared/scenarios.py` — ground truth):
+```
+1  Orders B2B/SF → SAP BTP → Inbound            (HTTP POST /api/v1/create)
+2  Inbound: write audit row, transform, SKU map → eventId born here
+3  Inbound → RabbitMQ → Order Engine            [order.init]
+4  Order Engine: assemble DEFAULT ORDER DATA    → NOTHING PERSISTED
+5  Order Engine → RabbitMQ → Inbound            [order_data_ready]
+6  Inbound → Settings                           (account settings / thresholds)
+7  Inbound → JAM                                (auth + privileges → JWT)
+8  Inbound → SOLR                               (catalogue-line matching)
+9  Inbound → RabbitMQ → Order Engine            [order.approval]
+10 Order Engine → BM DB                         ← cartHeaderId + orderId born, order INACTIVE
+11 Order Engine → Track & Trace                 (mid-flow — BEFORE the checks)
+12 Order Engine → SPT                           (prices)
+13 Order Engine → RSM                           (rebates / PVC)
+14 Order Engine → Validator                     ← auto-approval rule 1
+15 Order Engine → Avalara                       ← still rule 1, US ship-to only
+16 Order Engine → Checker                       ← auto-approval rule 3
+17 Order Engine → RabbitMQ → Outbound OSW → SAP Fulfilment   [order.create.sap]
+18 Order Engine → RabbitMQ → Inbound            [order_created]  ← closes the loop
+```
 
-   ```
-   Settings → SPT → RSM → SOLR → JAM → Checker → Avalara (US only, last)
-   ```
+Provenance (per the realignment spec's reading of the Computacenter service
+docs): every hop, the two-turn Order Engine, Inbound owning Settings and JAM,
+BM DB at step 10, Track & Trace *before* the checks, and the Validator →
+Avalara → Checker order (auto-approval rules 1, 1 and 3, stopping at the first
+failure) are **documented**. Two placements are **inferred, not documented** —
+SPT/RSM at steps 12–13 (they sit before Checker only because a margin check
+needs a price to judge) and SOLR at step 8 (no document mentions SOLR;
+catalogue-line matching is demonstrably Inbound's job). The code comments mark
+both as inferred; do not promote either to fact.
 
-   **Settings is FIRST**: the engine reads the account's margin thresholds and
-   settings before it prices anything. Then **SPT** (pricing/price lists),
-   **RSM** (rebates/PVC), **SOLR** (product search / id resolution), **JAM**
-   (user auth/privileges → JWT), **Checker** (margin check — can block the
-   order), and finally **Avalara** (US ship-to address verification, **US orders
-   only**, the last enrichment step before dispatch).
+Two consequences that look like regressions and are not:
 
-   All seven are **standalone services with their own emitters** and their own
-   `serve` block. SOLR and Avalara used to be folded in elsewhere (SOLR inside
-   the order engine, Avalara inside cc-validator-service); they are now
-   first-class, and the validator no longer emits Avalara lines, so the ship-to
-   verification appears exactly once.
-5. **cc-validator-service** runs validation strategies; then RabbitMQ
-   `order.outbound.queue` → **cc-outbound-osw** submits to SAP fulfilment
-   (RFC) → **cc-track-trace** registers the order for tracking
-   (= success terminal event).
+* **Settings and JAM failures are PRE-creation failures** — steps 6–7 run
+  before the order exists, so those journeys die with `eventId` only and no
+  order ids at all (correlation-model invariant #3, not a data gap).
+* **Track & Trace is mid-flow** — its "Registered order ... for tracking" line
+  appears in every journey that survives creation, including ones that later
+  fail at SPT/validation/margin/SAP. It is NOT a terminal of anything; the
+  SUCCESS terminal is Inbound's step-18 `order_created` close.
 
-Failed queue deliveries go to `_error` dead-letter queues
-(`order.inbound.queue_error`, `order.outbound.queue_error`). The real system's
+The two enrichment legs are ground truth in `shared/scenarios.py`:
+`INBOUND_SATELLITES = [Settings, JAM, SOLR]` (pre-creation, Inbound's) and
+`ENRICH_SATELLITES = [SPT, RSM, Validator, Checker]` (post-creation, the
+engine's), with **Avalara inserted between Validator and Checker for US orders
+only**. All satellites are standalone services with their own emitters.
+
+Failed queue deliveries go to `<queue>_error` dead-letter queues
+(`order.init_error`, `order.create.sap_error`). The real system's
 Angular UI and the ETL feeds (SAP Master Data → SPT/RSM/SOLR) are not simulated.
 
 **In this project none of that business flow physically happens** — the mock
@@ -189,21 +204,22 @@ Every log line is one JSON object:
 | `accountNumber` | string | all phases | **Never use for correlation** — not unique per journey. |
 | `message` | string | **yes** | Free text. Terminal detection AND id mining match on it — treat as an API. |
 
-Example of a real sequence (phase 1 → creation join → bridge ack → phase 2) —
-note exactly which id **fields** appear on each line, and that the join lives in
-the creation-log **text**, not on any single line's fields:
+Example of a real sequence (phase 1 → return-leg ack → creation join →
+phase 2) — note exactly which id **fields** appear on each line, and that the
+join lives in the creation-log **text**, not on any single line's fields:
 
 ```json
 {"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.OrderListener",
  "eventId":"evt-372656a7-...","accountNumber":"81036533",
  "message":"Received inbound order event evt-372656a7-... for account 81036533"}
-   ... transform + SKU-mapping logs, eventId field only ...
+   ... audit + transform + SKU-mapping logs, eventId field only ...
+{"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.OrderDataReadyListener",
+ "eventId":"evt-372656a7-...",
+ "message":"Received order_data_ready for event evt-372656a7-...: default order data assembled"}   ← RETURN-LEG ACK (eventId ONLY — nothing to link yet)
+   ... Inbound's Settings/JAM/SOLR leg + order.approval, eventId field only ...
 {"app_name":"cc-order-engine","logger":"c.c.orderengine.service.OrderCreationService",
  "eventId":"evt-372656a7-...",
  "message":"Generated order number ORD-6001 for cart header 1840927365018240001"}   ← THE JOIN (eventId field + order ids MINED from text)
-{"app_name":"cc-inbound-service","logger":"c.c.inbound.listener.ResponseListener",
- "eventId":"evt-372656a7-...",
- "message":"Received order creation response for event evt-372656a7-...: status=CREATED"}   ← BRIDGE ACK (eventId ONLY — links nothing)
 {"app_name":"cc-order-engine","logger":"c.c.orderengine.service.OrderService",
  "orderId":"ORD-6001","cartHeaderId":"1840927365018240001",
  "message":"Get order by Order Number:ORD-6001"}                                ← phase 2, no eventId
@@ -216,24 +232,28 @@ the creation-log **text**, not on any single line's fields:
 An order's logs form a **journey**. There is **no single id present on every
 log of a journey** — the identifier *changes over the journey's lifetime*:
 
-- **Phase 1 — pre-creation.** Inbound receive → transform → publish →
-  order-engine consume/create: logs carry **ONLY `eventId`** as a field
-  (plus `accountNumber`). No `orderId`, no `cartHeaderId` — they don't exist yet.
+- **Phase 1 — pre-creation.** Everything up to and including the order
+  engine's `create` block: Inbound receive → the engine's defaults-only first
+  turn (`init`) → the `order_data_ready` return ack → **Inbound's whole
+  Settings/JAM/SOLR enrichment leg** → `order.approval` → create. Logs carry
+  **ONLY `eventId`** as a field (plus `accountNumber`). No `orderId`, no
+  `cartHeaderId` — they don't exist yet; the pre-creation satellites are
+  consulted about an order that has never been persisted.
   **Exception (the join, see below):** the order-engine `create` block's own
   logs carry `eventId` as a field **and expose the freshly minted order ids in
-  their message *text*** (`"Created cart header <19-digit>"`, `"Generated order
-  number ORD-N for cart header <19-digit>"`).
-- **Bridge event.** Order-engine publishes the creation response to
-  `order.response.queue`; inbound logs it (logger
-  `c.c.inbound.listener.ResponseListener`, message
-  `"Received order creation response for event evt-...: status=CREATED"`). This
-  log carries **`eventId` ONLY** — no `orderId`/`cartHeaderId`, neither as
-  fields nor in its text. **It no longer links the id families** (historically
-  it did; that convenience was removed deliberately). It is kept as a realistic
-  ack line, not a correlation hinge.
+  their message *text*** (`"Created cart header <19-digit> with status
+  INACTIVE"`, `"Generated order number ORD-N for cart header <19-digit>"`).
+- **The return-leg ack.** The engine's first turn publishes
+  `order_data_ready`; Inbound logs consuming it (logger
+  `c.c.inbound.listener.OrderDataReadyListener`). This log carries **`eventId`
+  ONLY** — there are no order ids in existence to link. (The historical
+  "bridge" creation-response ack is GONE: under the five-hop flow nothing is
+  published back after creation until the terminal `order_created`. The
+  `ctx.bridge_ids` knob survives on the baton schema but is fully inert.)
 - **Phase 2 — post-creation.** `eventId` disappears. All downstream logs
-  (enrichment, checker, validator, outbound, track-trace) carry **both
-  `orderId` and `cartHeaderId`** as fields.
+  (track-trace, SPT/RSM enrichment, validator, avalara, checker, dispatch,
+  outbound, and Inbound's own `order_created` close) carry **both `orderId`
+  and `cartHeaderId`** as fields.
 
 **The join — id mining.** Because no single line carries both id families as
 *fields*, the `eventId`→order-id join is recovered by **mining ids from
@@ -247,10 +267,11 @@ exactly like structured-field ids (registering them in the same alias map):
 | `cartHeaderId` | `\b\d{19}\b` |
 
 The order-engine `create` logs (eventId field + order ids in text) close the
-join **before** the bridge line even appears. Those creation-log texts are
-therefore **load-bearing for correlation** — exactly like the terminal messages
-are load-bearing for journey completion. Changing them requires updating the
-mining patterns and their tests together. Mining is scoped to the three id
+join the moment the ids are born — every later phase-2 log then shares an
+already-known order id. Those creation-log texts are therefore **load-bearing
+for correlation** — exactly like the terminal messages are load-bearing for
+journey completion. Changing them requires updating the mining patterns and
+their tests together. Mining is scoped to the three id
 families only; `accountNumber` is never mined, and a stray 19-digit number in
 unrelated prose only ever aliases the journey of the line it appears on (it
 never crosses journeys, because that line already belongs to exactly one).
@@ -265,24 +286,33 @@ never crosses journeys, because that line already belongs to exactly one).
    logs tie `eventId` to the order ids, and every later phase-2 log shares an
    order id already known. **Test: the honest corpus where no line links both
    families as fields still yields exactly one journey per flow.**
-3. Journeys failing before creation (transform failure, creation DB failure)
-   **never get order ids** — complete, valid journeys identified only by
-   `eventId`. Correct behavior, not a data gap.
+3. Journeys failing before creation **never get order ids** — complete, valid
+   journeys identified only by `eventId`. Under the five-hop flow that is
+   transform (4) and creation-DB (5) failures **plus the Inbound-leg failures:
+   JAM 403 (9) and the Settings anomalies (15/16/17)**. Correct behavior, not
+   a data gap.
 4. Logs of one journey can be split across polls — assembly must be
    incremental ("lazy"): a journey grows as future polls deliver more of it.
    The alias map (including mined ids) persists across polls, so a split
    between the creation logs and phase 2 still joins.
 
 Stitching lives in **`backend/stitching.py`** (see [5]). The AI service does
-NOT stitch — it processes individual logs. The reference fixture reflecting the
-honest bridge is **`pipeline/data/mock-order-flows-v6.json`** — the current
-reference fixture, and the one the tests read. It is **captured from the
-emitters** (never hand-written), so it always reflects what the services
-actually produce: the Settings-first enrichment order, `cc-solr-service` events
-in every flow that reaches SOLR, and `cc-avalara-service` events in the US
-success flow. v2–v5 are retained for history (v5 still shows the older
-SPT-first order and has no SOLR/Avalara events; v3 was the first to reflect the
-honest bridge).
+NOT stitch — it processes individual logs. The reference fixture reflecting
+the five-hop flow is **`pipeline/data/mock-order-flows-v8.json`** — the
+current reference fixture, and the one the tests read. It is **captured from
+the emitters** (never hand-written) by
+**`python -m pipeline.scripts.capture_fixture --out pipeline/data/mock-order-flows-vN.json`**,
+which drives every scenario's compiled chain in-process (no broker, no
+collector), so it always reflects what the services actually produce: Inbound's
+pre-creation Settings/JAM/SOLR leg, the mid-flow Track & Trace registration, the
+Validator→Avalara→Checker rule order, and the `order_created` close. v8 adds
+scenario 18's transient SPT blip; v2–v7 are retained for history (v6 still shows
+the single-turn engine with its bridge ack and Track & Trace as the terminal).
+
+When you re-capture, remember the fixture holds **randomized** values (margins,
+Feign latencies) as well as minted ids — a test that compares against it must
+mask both, or it will fail on the next capture without anything having changed
+(`tests/test_ai_service.py::_mask_ids`).
 
 ---
 
@@ -298,9 +328,12 @@ tells the next service "your turn to emit", carrying the flow context.
 {
   "flow_id": "internal-uuid",
   "scenario": 6,
-  "steps": [["inbound","receive"],["order_engine","create"],["inbound","bridge"],
-            ["order_engine","enrich_settings_call"],["settings","serve"],
-            ["order_engine","enrich_settings_resp"],["order_engine","enrich_spt_call"], "..."],
+  "steps": [["inbound","receive"],["order_engine","init"],
+            ["inbound","enrich_settings_call"],["settings","serve"],
+            ["inbound","enrich_settings_resp"],["inbound","enrich_jam_call"], "...",
+            ["inbound","request_create"],["order_engine","create"],
+            ["track_trace","register"],["order_engine","enrich_spt_call"], "...",
+            ["order_engine","dispatch"],["outbound_osw","submit"],["inbound","close"]],
   "cursor": 3,
   "ctx": {
     "eventId": "evt-...",
@@ -323,24 +356,28 @@ tells the next service "your turn to emit", carrying the flow context.
   loop once; each service only defines its log blocks.
 - **Step chains are compiled from `shared/scenarios.py`** — the scenario
   defines the exact (service, block) sequence, including satellite
-  interleaving during enrichment (OE client log → satellite server log → OE
-  response log) and early termination on failures.
-  - Satellite ORDER comes from `ENRICH_SATELLITES` =
-    `[SETTINGS, SPT, RSM, SOLR, JAM, CHECKER]`. Nothing hardcodes it: the order
-    engine derives which satellite owns the one-off orchestration preamble from
-    `ENRICH_SATELLITES[0]`, so reordering the list moves the preamble with it.
-  - **AVALARA is deliberately NOT in that list.** It is US-only, so the chain
-    compiler appends its call→serve→resp trio conditionally on
-    `ctx.country == "US"`, after CHECKER, as the last enrichment step. Its
-    order-engine handlers are still registered unconditionally, or a US chain
-    would dispatch to a missing block.
-  - A scenario that fails **at Settings** (15/16/17) now fails at the *first*
-    enrichment step, so its flow contains **no other satellite**. That is
-    correct, not a truncation bug.
-  - SOLR needs no special-casing per scenario: it is included automatically in
-    every flow that reaches it (successes and failures that fail later — JAM,
-    margin, validation, SAP) and absent from those that die earlier (transform,
-    create, Settings failure, SPT-down, RSM).
+  interleaving on both enrichment legs (caller client log → satellite server
+  log → caller response log) and early termination on failures.
+  - Satellite ORDER comes from TWO lists, each the sole authority for its leg:
+    `INBOUND_SATELLITES = [SETTINGS, JAM, SOLR]` (Inbound's pre-creation leg)
+    and `ENRICH_SATELLITES = [SPT, RSM, VALIDATOR, CHECKER]` (the engine's
+    post-creation leg). Nothing hardcodes an order: each caller derives which
+    satellite owns its one-off preamble (the `order_data_ready` ack for
+    Inbound, the orchestration preamble for the engine) from `LIST[0]`, so
+    reordering a list moves the preamble with it. The validator's satellite
+    block is `validate` (not `serve`) via `satellite_block()`.
+  - **AVALARA is deliberately NOT in either list.** It is US-only, so the
+    chain compiler inserts its call→serve→resp trio conditionally on
+    `ctx.country == "US"`, **between VALIDATOR and CHECKER** (the documented
+    rule-1 → rule-3 position). Its order-engine handlers are still registered
+    unconditionally, or a US chain would dispatch to a missing block.
+  - A scenario that fails **at Settings** (15/16/17) fails at the *first* stop
+    on Inbound's leg — pre-creation — so its flow contains **no other
+    satellite and no order ids**. That is correct, not a truncation bug.
+  - SOLR needs no special-casing per scenario: as the last stop on Inbound's
+    leg it is included automatically in every flow that survives JAM —
+    including ones that die later at create (5) or SPT (8/11/12) — and absent
+    from those that die earlier (transform, Settings failure, JAM).
 - **Timing:** a service sleeps 10–110 ms (random) between its log lines, and
   the baton hop adds natural delay — so timestamps (always real `utcnow`)
   interleave realistically across concurrently running flows.
@@ -348,13 +385,17 @@ tells the next service "your turn to emit", carrying the flow context.
   - `ctx.orderId`/`ctx.cartHeaderId` start null; **only order_engine's
     `create` block fills them**.
   - A service must only put into its logs the id **fields** present in `ctx`
-    *at that moment* — phase-1 blocks therefore physically cannot log order-id
-    fields. (The `create` block's messages still *print* the minted ids in
-    their text — that text is the correlation join; see the Correlation Model.)
-  - The `inbound.bridge` block logs **`eventId` only** (message ends
-    `": status=CREATED"`). `ctx.bridge_ids` is now **inert** — retained on the
-    baton/scenario for schema stability but ignored by the emitter.
+    *at that moment* — phase-1 blocks (steps 1–9 of the flow, i.e. everything
+    through `create`, including Inbound's whole Settings/JAM/SOLR leg)
+    therefore physically cannot log order-id fields. (The `create` block's
+    messages still *print* the minted ids in their text — that text is the
+    correlation join; see the Correlation Model.)
+  - The `order_data_ready` ack (start of Inbound's leg) logs **`eventId`
+    only**. There is no creation-response bridge block anymore;
+    `ctx.bridge_ids` is **inert** — retained on the baton/scenario for schema
+    stability but read by nothing.
   - Phase-2 blocks log `orderId` + `cartHeaderId` fields, **never** `eventId`.
+    That includes Inbound's own `close` block — the success terminal.
 - **Failures:** `ctx.fail_at` names the block that must emit its failure
   variant (ERROR/WARN lines, retries, DLQ message) and **stop the chain** —
   the baton is not forwarded past a fatal failure.
@@ -363,18 +404,18 @@ tells the next service "your turn to emit", carrying the flow context.
 
 | Service | app_name | host | Blocks / notable logs |
 |---|---|---|---|
-| inbound | cc-inbound-service | CCECMETLT001 | `receive` (transform + SKU mapping, publish log), `bridge` (creation-response ack — **`eventId` only**, `": status=CREATED"`; no longer links the id families). Fail `transform`: unknown product → 3 redeliveries → `"routing message to order.inbound.queue_error"`. |
-| order_engine | cc-order-engine | CCECMEWEBT001 | `create` (fills ids; creation-response publish log), `enrich` (client `--->`/`<---` Feign-style logs around each satellite), `dispatch` (publish to order.outbound.queue log). Fail `create`: BM-DB timeout ×3 → failure response (still eventId-only). |
+| inbound | cc-inbound-service | CCECMETLT001 | `receive` (audit row + transform + SKU mapping, publish `order.init`), `enrich_{settings,jam,solr}_call/_resp` (the pre-creation leg; the first call block emits the **`order_data_ready` ack** — `eventId` only), `request_create` (publish `order.approval`), `close` (**the SUCCESS terminal**: `"Received order_created for order ORD-N: order processing complete"`, phase 2). Fail `transform`: unknown product → 3 redeliveries → `"routing message to order.init_error"`. |
+| order_engine | cc-order-engine | CCECMEWEBT001 | `init` (FIRST turn: default order data, persists **nothing**, publishes `order_data_ready`), `create` (SECOND turn: persists to BM DB — order INACTIVE — and fills ids; its message texts are the correlation join), `enrich_{spt,rsm,validator,avalara,checker}_call/_resp` (client `--->`/`<---` logs; checker and validator have no client lines), `dispatch` (publish `order.create.sap`). Fail `create`: BM-DB timeout ×3 → `"Order creation failed for event ..."` (still eventId-only; nothing published back). |
 | spt | cc-spt-service | CCECMSRVT001 | price list lookup logs. Fail `spt`: OE logs timeouts ×3 → `"Order processing aborted"`. |
 | rsm | cc-rsm-service | CCECMSRVT001 | rebates / PVC rates logs. |
-| solr | cc-solr-service | CCECMSRVT001 | `serve`: product search / id resolution logs. Standalone satellite (after RSM, before JAM). Success-path only — no failure variant. |
-| jam | cc-jam-service | CCECMSRVT001 | auth + privileges + JWT logs. Fail `jam`: 403 account disabled → abort. |
-| settings | cc-settings-service | CCECMSRVT002 | margin threshold settings; Hibernate-style SQL log. |
-| checker | cc-checker-service | CCECMSRVT002 | per-line margin logs. Fail `margin`: below threshold → `"blocked by margin check"`. |
-| avalara | cc-avalara-service | CCECMSRVT002 | `serve`: US ship-to address verification (**US flows only**), the last enrichment step, after Checker. Standalone satellite — the validator no longer emits these lines. Success-path only — no failure variant. |
-| validator | cc-validator-service | CCECMSRVT002 | strategy logs incl. benign `"Not implemented"` WARNs (the ship-to strategy is one, for every country — the real Avalara call moved to `cc-avalara-service`). Fail `udf`: missing `costCenter` UDF → 422 → abort. |
-| outbound_osw | cc-outbound-osw | CCECMEWEBT002 | SAP submission logs. Fail `sap`: RFC failure ×3 → `"moved to order.outbound.queue_error"`. |
-| track_trace | cc-track-trace | CCECMEWEBT002 | `"Registered order ... for tracking"` (**success terminal**). |
+| solr | cc-solr-service | CCECMSRVT001 | `serve`: catalogue-line matching, **last stop on Inbound's pre-creation leg** (placement inferred — no doc mentions SOLR). Phase-1 logs (eventId only). Success-path only — no failure variant. |
+| jam | cc-jam-service | CCECMSRVT001 | auth + privileges logs, **on Inbound's pre-creation leg**. Fail `jam`: 403 account disabled → Inbound-identity abort (`"not authorized (403 from JAM); submission aborted"`) — a PRE-creation failure, eventId-only journey. |
+| settings | cc-settings-service | CCECMSRVT002 | margin threshold settings; Hibernate-style SQL log. **First stop on Inbound's pre-creation leg.** Failure variants (15/16/17) are Inbound-identity `SettingsClient` ERRORs — deliberately unrecognized (the anomaly / embedding path), pre-creation. |
+| checker | cc-checker-service | CCECMSRVT002 | per-line margin logs — auto-approval **rule 3**, last of the engine's checks. Fail `margin`: below threshold → `"blocked by margin check"`. |
+| avalara | cc-avalara-service | CCECMSRVT002 | `serve`: US ship-to address verification (**US flows only**), **between Validator and Checker** (still rule 1). Success-path only — no failure variant. |
+| validator | cc-validator-service | CCECMSRVT002 | `validate`: strategy logs incl. benign `"Not implemented"` WARNs — auto-approval **rule 1**, first of the engine's checks. Fail `udf`: missing `costCenter` UDF → 422 → abort. |
+| outbound_osw | cc-outbound-osw | CCECMEWEBT002 | SAP submission logs. Fail `sap`: RFC failure ×3 → `"moved to order.create.sap_error"`. |
+| track_trace | cc-track-trace | CCECMEWEBT002 | `register`: `"Registered order ... for tracking"` — **mid-flow**, immediately after creation, before the checks. **NOT a terminal.** |
 
 ### The scenarios (`shared/scenarios.py` — ground truth for tests)
 
@@ -382,27 +423,40 @@ tells the next service "your turn to emit", carrying the flow context.
 "the corpus" means these ten.
 
 The **Satellites** column is derived, not configured — it is what the chain
-compiler produces. `SOLR` appears in every flow that reaches it; `Avalara` only
-in the US flow that gets all the way to the end of enrichment.
+compiler produces. The `‖` marks the creation boundary: everything left of it
+is Inbound's pre-creation leg (eventId-only logs), everything right of it the
+engine's post-creation leg. `bridge_ids` no longer appears — it is inert.
+Every flow that crosses `‖` also registers with Track & Trace right after
+creation, even ones that fail later.
 
-| # | Outcome | fail_at | bridge_ids | Satellites reached |
-|---|---|---|---|---|
-| 1 | `SUCCESS` (UK, 3 lines) | — | both | settings → spt → rsm → **solr** → jam → checker |
-| 2 | `SUCCESS` (DE via Salesforce) | — | order | settings → spt → rsm → **solr** → jam → checker |
-| 3 | `SUCCESS` (US, Avalara runs) | — | cart | settings → spt → rsm → **solr** → jam → checker → **avalara** |
-| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (never created) | — (dies in phase 1) |
-| 5 | `ORDER_CREATION_FAILED` | create | — (never created) | — (dies in phase 1) |
-| 6 | `MARGIN_CHECK_FAILED` | margin | order | settings → spt → rsm → **solr** → jam → checker |
-| 7 | `VALIDATION_FAILED` | udf | both | settings → spt → rsm → **solr** → jam → checker |
-| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | cart | settings → spt (no solr — dies here) |
-| 9 | `AUTH_FAILED` (JAM 403) | jam | order | settings → spt → rsm → **solr** → jam |
-| 10 | `SAP_SUBMISSION_FAILED` | sap | both | settings → spt → rsm → **solr** → jam → checker |
+Two knobs drive abnormal behaviour, and they are **not interchangeable**:
+`fail_at` means "emit the failure variant AND stop" — `compile_steps` truncates
+the chain at it — while **`flaky_at`** (scenario 18) means "fail once, then
+recover", so the compiler deliberately **ignores** it and the flow runs the full
+chain. Expressing recovery through `fail_at` would truncate the chain and the
+journey could never complete; a test pins that the compiler never reads
+`flaky_at`.
+
+| # | Outcome | fail_at | Satellites reached |
+|---|---|---|---|
+| 1 | `SUCCESS` (UK, 3 lines) | — | settings → jam → solr ‖ spt → rsm → validator → checker |
+| 2 | `SUCCESS` (DE via Salesforce) | — | settings → jam → solr ‖ spt → rsm → validator → checker |
+| 3 | `SUCCESS` (US, Avalara runs) | — | settings → jam → solr ‖ spt → rsm → validator → **avalara** → checker |
+| 4 | `INBOUND_TRANSFORM_FAILED` | transform | — (dies at receive) |
+| 5 | `ORDER_CREATION_FAILED` | create | settings → jam → solr (dies AT create — still eventId-only) |
+| 6 | `MARGIN_CHECK_FAILED` | margin | settings → jam → solr ‖ spt → rsm → validator → checker |
+| 7 | `VALIDATION_FAILED` | udf | settings → jam → solr ‖ spt → rsm → validator |
+| 8 | `ENRICHMENT_FAILED` (SPT down) | spt | settings → jam → solr ‖ spt |
+| 9 | `AUTH_FAILED` (JAM 403) | jam | settings → jam (PRE-creation — no order ids) |
+| 10 | `SAP_SUBMISSION_FAILED` | sap | settings → jam → solr ‖ spt → rsm → validator → checker |
+| 18 | `SUCCESS` (SPT blips, recovers) | — (`flaky_at=spt`) | settings → jam → solr ‖ spt → rsm → validator → checker |
 
 Scenarios 11–17 (clustering / novel-failure cases, also in `shared/scenarios.py`)
-follow the same rules: 11/12 are SPT-down (settings → spt only, and 12 is US but
-never reaches Avalara — country alone is not sufficient), 13 is a margin failure
-(reaches solr), 14 is SAP-down (reaches solr), and 15/16/17 fail **at Settings**,
-so they reach `settings` and nothing else.
+follow the same rules: 11/12 are SPT-down (like 8 — and 12 is US but never
+reaches Avalara: country alone is not sufficient), 13 is a margin failure
+(like 6), 14 is SAP-down (like 10), and 15/16/17 fail **at Settings** — the
+first stop on Inbound's leg — so they reach `settings` and nothing else, and
+die **pre-creation** with eventId only.
 
 **11–17 exist to exercise incident clustering** (see [5] Incident Clustering) —
 they add no new failure *modes*, they put SEVERAL orders through the same one so
@@ -422,6 +476,32 @@ you can watch clustering merge or refuse to:
 currently emits flow 15's exact message, so until `pipeline/services/settings.py`
 gains a differently-worded variant, 15 and 16 are byte-identical rather than
 "same meaning, different wording".
+
+**18 is the TRANSIENT failure** — the only scenario that fails and recovers.
+1–17 either succeed cleanly or fail terminally (every retry loop in
+`pipeline/services/` exhausts), which models only the terminal tail of the real
+system: `ai_service/knowledge/inbound-order.md` §7.2 documents Feign clients
+retrying 4× with backoff on 5xx, so a downstream blip recovering is the NORMAL
+case. SPT times out once, the retry succeeds, and the flow completes as
+`SUCCESS`. Three things make that work, all load-bearing:
+
+* the recovery variant emits the SAME timeout ERROR and retry WARN as the outage
+  (a blip and an outage are indistinguishable until the retry lands) but **never**
+  the fatal `"Order processing aborted"` line — the only line in SPT's failure
+  path `_FAILURE_RULES` matches;
+* the recovery marker comes from the **same logger** as the timeout
+  (`SptClient`), which is what `backend/journeys.py`'s `unrecovered_errors`
+  reads;
+* the journey therefore carries a real ERROR **and** resolves SUCCESS — which is
+  the point: an ERROR alone must not condemn a journey.
+
+This is the first flow to attach WARN/ERROR **alerts to a SUCCESS journey**. On
+the dashboard it reads as an order that succeeded while showing red alerts —
+which is honest: the blip really happened, and a service flapping is worth
+seeing. Those alerts DO cluster, into a `TRANSIENT_FAILURE` incident of their own
+(see [5] Incident Clustering, Eligibility) — separate from the outage incident
+for the same service, so the failure incident's blast radius stays truthful while
+the recovered alerts remain bulk-resolvable.
 
 ### Injector (`pipeline/injector/inject.py`)
 Mints **only** `eventId` (= `evt-<uuid>`) — per the correlation model the order
@@ -845,8 +925,8 @@ anything indexed. Without it, "retrieval found nothing" and "there is nothing to
 answer from" are the same fact, which was true only while the index was the sole
 channel. The failure it fixes: click a NOVEL failure (nothing similar is indexed —
 exactly when you need help), ask "what does this mean?", and get *"No related
-incidents found — run the backfill"* while the alert's full text sits in that very
-request. The original guard still holds for the case it was written for: a bare
+incidents found ... no sources found in official documentation either"* while the
+alert's full text sits in that very request. The original guard still holds for the case it was written for: a bare
 question that matched nothing composes nothing.
 
 **Record ids never appear in the answer prose.** They identify rows the reader
@@ -988,14 +1068,27 @@ journey that *did* log a real ERROR resolves to:
 
 | Condition | Journey outcome |
 |---|---|
-| Last event = track-trace `"Registered order ... for tracking"` | `SUCCESS` |
-| A dead-letter routing marker (`order.inbound.queue_error` / `order.outbound.queue_error` — the emitters actually write the `.dlq` spelling, which is also matched) or a fatal abort (`"Order creation failed for event"`, `"Order processing aborted"`, `"submission aborted"`, `"blocked by margin check"`, JAM `"not authorized"` 403, `"Max redelivery attempts reached"`) | `FAILED` (subtype from the message, via `_FAILURE_RULES`) |
-| Stalled (no new event for the journey's ids for **90s**, `STALLED_TIMEOUT`) **and** a real ERROR was logged that no `_FAILURE_RULES` marker matched | `FAILED` / **`UNRECOGNIZED_FAILURE`** |
-| Stalled with **no** ERROR signal at all | `TIMED_OUT` |
+| Last event = Inbound's `order_created` close (`"Received order_created for order ... : order processing complete"` — BOTH markers). **NOT** Track & Trace: `"Registered order ... for tracking"` is mid-flow and terminates nothing. | `SUCCESS` |
+| A dead-letter routing marker (message contains `order.init_error` / `order.create.sap_error`, or the legacy `order.inbound.queue_error`/`.dlq` / `order.outbound.queue_error`/`.dlq` spellings) or a fatal abort ERROR (`"Order creation failed for event"`, `"Order processing aborted"`, `"submission aborted"`, `"blocked by margin check"`, JAM `"not authorized"` 403, `"Max redelivery attempts reached"`) | `FAILED` (subtype from the message, via `_FAILURE_RULES`) |
+| Stalled (no new event for the journey's ids for **90s**, `STALLED_TIMEOUT`) **and** an **UNRECOVERED** ERROR was logged that no `_FAILURE_RULES` marker matched | `FAILED` / **`UNRECOGNIZED_FAILURE`** |
+| Stalled with **no** ERROR signal at all, **or only recovered ones** | `TIMED_OUT` |
+
+**"Unrecovered" is the load-bearing word** (`unrecovered_errors` in
+`backend/journeys.py`). An ERROR counts as *recovered* when a LATER log in the
+same journey comes from the same source — same `app_name` **and** same `logger`
+— at INFO/DEBUG: the client that just failed went on to log healthy activity,
+which is exactly what a Feign retry succeeding looks like (scenario 18). The
+condition used to be "any ERROR anywhere", which labelled a journey with a
+recovered blip `FAILED` and named that blip as its apparent cause — sending it
+down clustering's embedding path, where it could merge with unrelated incidents.
+Both halves of the pair matter: `app_name` alone would let any later
+`cc-order-engine` INFO clear a genuine outage, and only lines strictly *after*
+the ERROR count, or an outage's own healthy preamble would retro-clear it.
 
 `UNRECOGNIZED_FAILURE` is deliberately distinct from `TIMED_OUT`: "something broke
 and we don't recognize it" is a different fact from "it went quiet". It is the
-trigger for incident clustering's embedding path (below).
+trigger for incident clustering's embedding path (below) — and it is what the
+Settings failures (15/16/17) resolve to.
 
 On journey completion: persist outcome → request LLM summary from AI service
 (`POST /summarize-journey`, whose `suggested_label` is stored on
@@ -1046,10 +1139,38 @@ DB-touching layer over them.
    divergence-guard idea as the semantic cache. Ids are masked before comparing, or
    two identical failures from different orders would read as "diverged" purely
    because their order numbers differ.
-5. **Eligibility.** `FAILED` and `TIMED_OUT` journeys only, and a `TIMED_OUT` one
+5. **Eligibility.** `FAILED` and `TIMED_OUT` journeys, and a `TIMED_OUT` one
    additionally needs a real linked **ERROR** alert (there is no terminal marker to
    anchor a "timed out because X" story on otherwise). Idempotent on `journey_id`:
    a journey whose `incident_id` is set is a no-op.
+
+   **Plus `SUCCESS` journeys that carried a RECOVERED error** (scenario 18) — a
+   dependency flapped mid-flow and the order still shipped. These cluster under a
+   subtype of their own, **`TRANSIENT_FAILURE`**, and that name is the whole
+   mechanism: `sha256("TRANSIENT_FAILURE:SPT")` cannot collide with
+   `sha256("ENRICHMENT_FAILED:SPT")`, so a recovered order can **never** land in
+   the outage incident and inflate a `journey_count` past the orders that actually
+   broke. It is classed INFRA, so several flapping orders merge into ONE incident.
+   Without this the journey's alerts kept `incident_id = NULL` forever and no bulk
+   action could clear them — `PATCH /incidents/{id}/resolve` cascades on
+   `incident_id`, so an alert outside every incident is only ever resolvable one
+   click at a time.
+
+   `TRANSIENT_FAILURE` is **never a journey outcome** — it is not written to
+   `journeys.outcome` and `status_for` never returns it. The journey stays
+   `SUCCESS` because the ORDER succeeded; only the incident records that the
+   DEPENDENCY misbehaved. This is the ONE place the incident subtype is not the
+   journey's own outcome (`incident_subtype_for`), and the exception is
+   deliberate: passing `SUCCESS` through would hash a meaningless `SUCCESS:<svc>`
+   and title an incident "SUCCESS — SPT".
+
+   A **clean** success (no ERROR at all) is still ineligible and never clusters —
+   gated on the recovered-error flag, not on `SUCCESS`, and answered from the
+   journey's in-memory logs so the common healthy path costs no query. The
+   `retry_unclustered_completions` sweep now includes `SUCCESS` rows in its
+   candidate set for the same reason it includes the others (completion outruns
+   alert persistence); on that path the logs are re-read from `journey_events`,
+   since the swept completion is rebuilt with an empty log list.
 6. **Lifecycle: manual close only.** `PATCH /incidents/{id}/resolve` is the only
    way an incident closes — there is deliberately no automatic mechanism. Resolving
    **cascades to every linked alert** (an incident is a collapsed *view* of those
@@ -1744,11 +1865,13 @@ reads no longer fetch, so there is nothing to expire.
 
 ## Testing
 
-- **Correlation invariants**: phase-1 logs never contain order-id *fields*; the
-  bridge ack carries `eventId` only; phase-2 logs never contain `eventId`; **no
-  single line links both id families as fields**; the eventId→order-id join is
-  mined from the order-engine creation logs' text; pre-creation failures produce
-  eventId-only journeys; a stray 19-digit number in prose never merges journeys.
+- **Correlation invariants**: phase-1 logs (through `create`, incl. Inbound's
+  whole Settings/JAM/SOLR leg and the `order_data_ready` ack) never contain
+  order-id *fields*; phase-2 logs never contain `eventId`; **no single line
+  links both id families as fields**; the eventId→order-id join is mined from
+  the order-engine creation logs' text; pre-creation failures (4, 5, 9,
+  15/16/17) produce eventId-only journeys; a stray 19-digit number in prose
+  never merges journeys.
 - **Cross-poll assembly**: split one flow's logs across ≥3 polls (including a
   split between the creation logs and phase 2) → exactly one journey, correct
   outcome.
@@ -1774,9 +1897,10 @@ reads no longer fetch, so there is nothing to expire.
   meaning-flip (`succeeded` vs `failed`) → miss; hit/miss counters increment;
   fallbacks are never cached.
 - **Journey rules**: each canonical scenario (1–10) ends with its expected
-  outcome; killing the chain mid-flow (drop the baton) produces `TIMED_OUT` after
-  90s; a stalled journey that DID log an unrecognized ERROR is
-  `FAILED`/`UNRECOGNIZED_FAILURE`, not `TIMED_OUT`.
+  outcome; a journey whose LAST line is Track & Trace's `"Registered order ...
+  for tracking"` is still IN PROGRESS (never SUCCESS); killing the chain mid-flow
+  (drop the baton) produces `TIMED_OUT` after 90s; a stalled journey that DID log
+  an unrecognized ERROR is `FAILED`/`UNRECOGNIZED_FAILURE`, not `TIMED_OUT`.
 - **Incident clustering**: one order's many alerts collapse to ONE incident;
   scenarios 8+11+12 merge into one INFRA incident (`journey_count=3`) while 6+13
   stay separate (order-specific never merges); `AUTH_FAILED` classifies
@@ -1821,23 +1945,29 @@ reads no longer fetch, so there is nothing to expire.
   `limit` rows still reports `next_cursor`; the last page reports `None`; rows
   inserted between requests neither skip nor repeat.
 - **End-to-end**: `injector --all` → one journey per scenario with the exact
-  outcomes above, alerts visible on WS, journey completions with summaries,
-  incidents formed with the merge/separate pattern in the scenario table.
+  outcomes above (9 and 15/16/17 as eventId-only journeys), alerts visible on WS,
+  journey completions with summaries, incidents formed with the merge/separate
+  pattern in the scenario table.
 
 ## Gotchas / rules for future changes
 
 - **Never** correlate by `accountNumber`.
 - **Never** assume `orderId` exists at the start of a journey — pre-creation
-  failures live and die with only `eventId`.
-- The bridge ack carries `eventId` only and links nothing — do NOT reintroduce
-  order-id fields on it. The eventId→order-id join comes from mining the
-  order-engine creation logs' message text (`backend/stitching.py`).
+  failures live and die with only `eventId`. Under the five-hop flow that
+  includes the Settings (15/16/17) and JAM (9) failures, not just transform
+  and creation.
+- There is **no creation-response bridge** — do NOT reintroduce one, and do
+  not add order ids (fields or text) to the `order_data_ready` ack. The
+  eventId→order-id join comes ONLY from mining the order-engine creation
+  logs' message text (`backend/stitching.py`).
 - Message texts are load-bearing in **two** ways: journey terminal detection
   matches on them (`backend/journeys.py`) AND id mining extracts eventId/orderId/
   cartHeaderId from them (`backend/stitching.py`). Changing a service block's
-  message — especially the order-engine `create` logs or any terminal line —
-  requires updating the detection rules, the mining patterns, and their tests
-  together.
+  message — especially the order-engine `create` logs, Inbound's `close`
+  terminal, or any fatal-abort line — requires updating the detection rules,
+  the mining patterns, and their tests together. Track & Trace's
+  `"Registered order ... for tracking"` must never become a terminal again —
+  it fires before the checks have run.
 - Mock services stay hollow: they emit logs and forward the baton — nothing
   else. The baton `ctx` id rules are what keep the Correlation Model honest;
   never bypass them.
@@ -1873,6 +2003,17 @@ reads no longer fetch, so there is nothing to expire.
   and dumps every recognized failure onto the novel path.
 - **Unknown clustering shapes default to order-specific, never INFRA.** A wrong
   fragment is noisy; a wrong merge asserts a shared root cause that doesn't exist.
+- **A recovered journey clusters as `TRANSIENT_FAILURE`, never as the failure
+  subtype for the same service.** The distinct subtype is what keeps the digests
+  apart; reusing `ENRICHMENT_FAILED` for a blip would merge a shipped order into
+  the outage incident and make every `journey_count` on the dashboard mean
+  "orders that touched a broken service" instead of "orders that broke". And
+  `TRANSIENT_FAILURE` must stay OUT of `journeys.outcome` — the order succeeded;
+  only the incident says a dependency flapped.
+- **Clean successes must never cluster.** `SUCCESS` eligibility is gated on the
+  journey having an ERROR that RECOVERED, not on `SUCCESS` itself — otherwise
+  every healthy order would attempt to cluster on every run and find no causal
+  line. Keep that check answerable from the in-memory logs on the live path.
 - **`UNRECOGNIZED_FAILURE` ≠ `TIMED_OUT`.** The first means a real ERROR nothing
   matched; the second means silence. Clustering treats them differently
   (`TIMED_OUT` needs a linked ERROR to be eligible at all), and collapsing the two

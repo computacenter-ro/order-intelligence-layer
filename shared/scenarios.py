@@ -1,6 +1,6 @@
-"""The 10 canonical scenarios + step-chain compiler — single source of truth.
+"""The canonical scenarios + step-chain compiler — single source of truth.
 
-This module is *declarative*: it defines the ten canonical order flows
+This module is *declarative*: it defines the canonical order flows
 (CLAUDE.md "[1] ... The 10 canonical scenarios") and compiles each into the
 ordered ``(service, block)`` step chain a Baton carries. It writes **no log
 text** and mints **no ids** — the service blocks emit logs from the Baton
@@ -15,11 +15,26 @@ Consumers:
 * tests — ``Scenario`` metadata (``outcome``, ``reaches_creation``,
   ``terminal``) is the ground truth for outcome / correlation-invariant tests.
 
+The pipeline shape (see CLAUDE.md "The simulated production system"): the real
+system is Inbound and the Order Engine ping-ponging over RabbitMQ five times,
+and the order is not persisted until the Order Engine's SECOND turn:
+
+    Inbound receive ── order.init ──► OE first turn (defaults, persists NOTHING)
+        ◄── order_data_ready ── Inbound enrichment leg (Settings → JAM → SOLR)
+    Inbound ── order.approval ──► OE second turn: CREATE (ids born, order INACTIVE)
+        → Track & Trace → SPT → RSM → Validator → [Avalara, US] → Checker
+        → dispatch ── order.create.sap ──► Outbound OSW → SAP
+    OE ── order_created ──► Inbound close   (the SUCCESS terminal)
+
 Correlation model (why the chain order matters — CLAUDE.md "THE CORRELATION
-MODEL"): every step before ``order_engine/create`` is phase 1 and can only
-carry ``eventId``; ``inbound/bridge`` exposes the new order id(s) per
-``bridge_ids``; every step after it is phase 2 and carries both order ids. The
-id lifecycle is therefore *emergent from the compiled step order* — this module
+MODEL"): every step up to and including ``order_engine/create`` is phase 1 and
+can only carry ``eventId`` — that now includes the WHOLE Inbound enrichment leg
+(Settings/JAM/SOLR are consulted before the order exists). There is no
+creation-response "bridge" ack anymore: the only return hop after creation is
+the terminal ``order_created`` close. The eventId→order-id join still lives
+solely in the ``create`` block's message text (mined by backend/stitching.py).
+Every step after ``create`` is phase 2 and carries both order ids. The id
+lifecycle is therefore *emergent from the compiled step order* — this module
 just guarantees that order (and, via ``fail_at``, whether creation is reached
 at all).
 """
@@ -50,25 +65,33 @@ TRACK_TRACE = "track_trace"
 # This is the contract with services/ and runner.py: each service must register
 # a handler for every block name that can appear against it in a step chain.
 #
-# Enrichment uses the *fine-grained* encoding: for each satellite the order
-# engine emits a client "--->" call block, the satellite emits its "serve"
-# block, then the order engine emits the "<---" response block. That trio maps
-# 1:1 onto the real Feign-style log sequence, so the runner stays dumb.
+# Enrichment uses the *fine-grained* encoding: for each satellite the CALLER
+# (Inbound for its leg, the order engine for its own) emits a client "--->"
+# call block, the satellite emits its server block, then the caller emits the
+# "<---" response block. That trio maps 1:1 onto the real Feign-style log
+# sequence, so the runner stays dumb.
 class BLOCKS:
     # phase 1 — pre-creation (eventId only)
-    RECEIVE = "receive"          # inbound: receive + transform + SKU map + publish
-    CREATE = "create"            # order_engine: create order, fill ids, publish response
-    # bridge — the one log where eventId coexists with the new order id(s)
-    BRIDGE = "bridge"            # inbound: logs the creation response
+    RECEIVE = "receive"          # inbound: receive + audit + transform + SKU map + publish order.init
+    INIT = "init"                # order_engine FIRST turn: assemble DEFAULT ORDER
+    #                              DATA, persist NOTHING, publish order_data_ready
+    REQUEST_CREATE = "request_create"  # inbound: publish order.approval → OE 2nd turn
+    CREATE = "create"            # order_engine SECOND turn: persist to BM DB,
+    #                              mint ids into ctx (order INACTIVE)
     # phase 2 — post-creation (orderId + cartHeaderId)
-    #   enrichment satellite trio (per satellite): call -> serve -> resp
-    ENRICH_CALL = "enrich_{sat}_call"    # order_engine client ---> log
+    #   enrichment satellite trio (per satellite): call -> serve/validate -> resp
+    ENRICH_CALL = "enrich_{sat}_call"    # caller-side ---> log
     SERVE = "serve"                      # satellite server-side log
-    ENRICH_RESP = "enrich_{sat}_resp"    # order_engine client <--- log
-    VALIDATE = "validate"        # validator: strategy logs (incl. benign WARNs)
-    DISPATCH = "dispatch"        # order_engine: publish to order.outbound.queue
+    ENRICH_RESP = "enrich_{sat}_resp"    # caller-side <--- log
+    VALIDATE = "validate"        # validator: strategy logs (incl. benign WARNs);
+    #                              its serve-equivalent inside the OE trio
+    DISPATCH = "dispatch"        # order_engine: publish order.create.sap
     SUBMIT = "submit"            # outbound_osw: SAP submission
-    REGISTER = "register"        # track_trace: success terminal
+    REGISTER = "register"        # track_trace: registration — MID-FLOW now,
+    #                              right after create; NOT the success terminal
+    CLOSE = "close"              # inbound: order_created received — THE SUCCESS
+    #                              TERMINAL (its message text is load-bearing for
+    #                              backend/journeys.py's terminal detection)
 
 
 def _enrich_call(sat: str) -> str:
@@ -79,32 +102,44 @@ def _enrich_resp(sat: str) -> str:
     return BLOCKS.ENRICH_RESP.format(sat=sat)
 
 
-# --- Enrichment satellite order ----------------------------------------------
-# The order the order engine calls each satellite during enrich:
+def satellite_block(sat: str) -> str:
+    """The satellite-side block name inside an enrichment trio.
+
+    Every satellite emits ``serve`` except the validator, whose server-side
+    block keeps its historical ``validate`` name (its strategy logs predate the
+    trio encoding and the emitter/test vocabulary keys off it).
+    """
+    return BLOCKS.VALIDATE if sat == VALIDATOR else BLOCKS.SERVE
+
+
+# --- Satellite ordering — the ONLY places the call order is written down ------
 #
-#   SETTINGS -> SPT -> RSM -> SOLR -> JAM -> CHECKER   (+ AVALARA, US only)
 #
-# **SETTINGS IS FIRST.** The order engine reads the account's margin thresholds
-# and settings before it prices anything, so Settings is the first call it makes
-# when the order comes back from inbound. This supersedes the older
-# SPT -> RSM -> SETTINGS order captured in data/mock-order-flows-v5.json; the
-# current reference capture is data/mock-order-flows-v6.json.
+# * Inbound owns Settings and JAM: DOCUMENTED. Inbound calls them after the
+#   order engine's first (defaults-only) turn, BEFORE the order is created.
+# * SOLR on Inbound's leg: INFERRED, not documented — no document mentions SOLR
+#   at all; catalogue-line matching is demonstrably Inbound's job, so it sits
+#   at the end of Inbound's leg. Do not cite this as documented fact.
+# * Validator → Avalara → Checker on the order engine's leg: DOCUMENTED
+#   (auto-approval rules 1, 1 and 3 — processing stops at the first failure).
+# * SPT and RSM at the head of the order engine's leg: INFERRED, not documented
+#   — no document places them; they sit before Checker only because a margin
+#   check needs a price to judge. Do not cite this as documented fact.
 #
-# A consequence worth stating, because it looks like a gap: a scenario that
-# fails AT Settings (15/16/17) now fails at the FIRST enrichment step, so its
-# flow contains NO other satellite. That is correct, not a truncation bug.
-#
-# SOLR and AVALARA are now first-class standalone satellites with their own
-# emitters (pipeline/services/solr.py, pipeline/services/avalara.py) and their
-# own `serve` blocks — superseding the previous note here that they were
-# deliberately NOT standalone (SOLR folded into the order engine, Avalara into
-# cc-validator-service). Avalara's lines were removed from validator.py when it
-# became a real service, so they are emitted exactly once.
-#
-# AVALARA is deliberately NOT in this list: it runs for US orders only, so
-# ``_full_chain`` appends its trio conditionally on ``ctx.country == "US"``
-# rather than unconditionally here.
-ENRICH_SATELLITES: list[str] = [SETTINGS, SPT, RSM, SOLR, JAM, CHECKER]
+# A consequence worth stating, because it looks like a regression: Settings and
+# JAM failures are now PRE-CREATION failures. A scenario failing at Settings
+# (15/16/17) or JAM (9) dies with eventId only and NO order ids — exactly
+# CLAUDE.md invariant #3, not a data gap.
+
+# Inbound's enrichment leg, called between the OE's two turns (phase 1).
+INBOUND_SATELLITES: list[str] = [SETTINGS, JAM, SOLR]
+
+# The order engine's post-creation enrichment leg (phase 2). AVALARA is
+# deliberately NOT in this list: it runs for US orders only, so ``_full_chain``
+# inserts its trio conditionally on ``ctx.country == "US"`` — at its documented
+# position immediately BEFORE the Checker (rule 1 runs before rule 3), anchored
+# on CHECKER so reordering this list keeps Avalara ahead of the margin check.
+ENRICH_SATELLITES: list[str] = [SPT, RSM, VALIDATOR, CHECKER]
 
 
 # --- Scenario definition ------------------------------------------------------
@@ -121,11 +156,29 @@ class Scenario:
     user: str
     accountNumber: str
     lines: list[OrderLine]
-    bridge_ids: BridgeIds = "both"
-    fail_at: str | None = None          # block name that fails, or None
+    bridge_ids: BridgeIds = "both"      # INERT — kept only for schema stability
+    fail_at: str | None = None          # block name that fails FATALLY, or None
+    # A block that fails once and RECOVERS on retry — the normal case in the real
+    # system (inbound-order.md §7.2: Feign clients retry 4x with backoff on 5xx,
+    # so Settings/JAM/Salesforce blips recover routinely; we used to model only
+    # the terminal tail of that).
+    #
+    # DELIBERATELY NOT ``fail_at``: that knob means "emit the failure variant AND
+    # stop", and ``compile_steps`` truncates the chain at it (``_failing_step``).
+    # A recovering flow must run to completion, so the compiler below reads
+    # ``flaky_at`` NOWHERE — a flaky scenario compiles to the full success chain,
+    # byte-identical to scenario 1's. The knob is consumed only by the emitter
+    # block, which emits its retry lines and then forwards the baton.
+    #
+    # The two are mutually exclusive: setting both would truncate at ``fail_at``
+    # before the flaky block ever ran. Pinned by a test rather than enforced at
+    # runtime.
+    flaky_at: str | None = None
 
     # test ground-truth (derived-but-explicit, so tests key off one place)
-    reaches_creation: bool = True       # False for pre-creation failures (4, 5)
+    reaches_creation: bool = True       # False for pre-creation failures
+    #                                     (4, 5, 9, 15, 16, 17 — Settings/JAM
+    #                                     failures die before the order exists)
     terminal: tuple[str, str] | None = None  # last (service, block) of the chain
 
     def context_seed(self) -> dict:
@@ -142,6 +195,7 @@ class Scenario:
             "lines": list(self.lines),
             "bridge_ids": self.bridge_ids,
             "fail_at": self.fail_at,
+            "flaky_at": self.flaky_at,
         }
 
 
@@ -153,34 +207,46 @@ def _full_chain(scenario: Scenario) -> list[tuple[str, str]]:
     """
     steps: list[tuple[str, str]] = []
 
-    # phase 1 — pre-creation
+    # phase 1 — pre-creation, hop 1: Inbound receives, audits, transforms,
+    # publishes order.init.
     steps.append((INBOUND, BLOCKS.RECEIVE))
-    steps.append((ORDER_ENGINE, BLOCKS.CREATE))
-    # bridge
-    steps.append((INBOUND, BLOCKS.BRIDGE))
+    # hop 2: the order engine's FIRST turn — default order data only, nothing
+    # persisted; publishes order_data_ready back to Inbound.
+    steps.append((ORDER_ENGINE, BLOCKS.INIT))
 
-    # phase 2 — enrichment (fine-grained satellite trio each), in the
-    # ENRICH_SATELLITES order: SETTINGS first, then SPT -> RSM -> SOLR -> JAM ->
-    # CHECKER.
-    for sat in ENRICH_SATELLITES:
-        steps.append((ORDER_ENGINE, _enrich_call(sat)))
+    # Inbound's enrichment leg (still phase 1 — the order does not exist yet),
+    # in the INBOUND_SATELLITES order: Settings → JAM → SOLR.
+    for sat in INBOUND_SATELLITES:
+        steps.append((INBOUND, _enrich_call(sat)))
         steps.append((sat, BLOCKS.SERVE))
+        steps.append((INBOUND, _enrich_resp(sat)))
+
+    # hop 3: Inbound requests creation (order.approval on the auto-approval
+    # path), then the order engine's SECOND turn persists and mints the ids.
+    steps.append((INBOUND, BLOCKS.REQUEST_CREATE))
+    steps.append((ORDER_ENGINE, BLOCKS.CREATE))
+
+    # Track & Trace registration happens IMMEDIATELY after creation — mid-flow,
+    # before the checks. Its "Registered order ..." line is therefore no longer
+    # a terminal event of any kind.
+    steps.append((TRACK_TRACE, BLOCKS.REGISTER))
+
+    # phase 2 — the order engine's enrichment leg, in the ENRICH_SATELLITES
+    # order (SPT → RSM → Validator → Checker), with Avalara's trio inserted
+    # before Checker for US orders only (documented rule order 1 → 1 → 3).
+    oe_sats = list(ENRICH_SATELLITES)
+    if scenario.country == "US":
+        oe_sats.insert(oe_sats.index(CHECKER), AVALARA)
+    for sat in oe_sats:
+        steps.append((ORDER_ENGINE, _enrich_call(sat)))
+        steps.append((sat, satellite_block(sat)))
         steps.append((ORDER_ENGINE, _enrich_resp(sat)))
 
-    # Avalara — US ship-to address verification, the LAST enrichment step and
-    # US-only, which is why it is appended here rather than sitting in
-    # ENRICH_SATELLITES (that list is unconditional). Emitted by the standalone
-    # cc-avalara-service; the validator no longer emits these lines.
-    if scenario.country == "US":
-        steps.append((ORDER_ENGINE, _enrich_call(AVALARA)))
-        steps.append((AVALARA, BLOCKS.SERVE))
-        steps.append((ORDER_ENGINE, _enrich_resp(AVALARA)))
-
-    # validation → dispatch → SAP submit → tracking (success terminal)
-    steps.append((VALIDATOR, BLOCKS.VALIDATE))
+    # hop 4: dispatch to SAP (order.create.sap) → Outbound OSW submits.
     steps.append((ORDER_ENGINE, BLOCKS.DISPATCH))
     steps.append((OUTBOUND, BLOCKS.SUBMIT))
-    steps.append((TRACK_TRACE, BLOCKS.REGISTER))
+    # hop 5: order_created back to Inbound — closes the loop; SUCCESS terminal.
+    steps.append((INBOUND, BLOCKS.CLOSE))
     return steps
 
 
@@ -201,6 +267,7 @@ def _failing_step(fail_at: str, chain: list[tuple[str, str]]) -> int:
         case "spt":
             target = (SPT, BLOCKS.SERVE)
         case "jam":
+            # Inbound's leg now — a PRE-creation failure (eventId-only journey).
             target = (JAM, BLOCKS.SERVE)
         case "margin":
             target = (CHECKER, BLOCKS.SERVE)
@@ -209,6 +276,7 @@ def _failing_step(fail_at: str, chain: list[tuple[str, str]]) -> int:
         case "sap":
             target = (OUTBOUND, BLOCKS.SUBMIT)
         case "settings":
+            # Inbound's leg now — a PRE-creation failure (eventId-only journey).
             target = (SETTINGS, BLOCKS.SERVE)
         case "settings_rejected":
             target = (SETTINGS, BLOCKS.SERVE)
@@ -228,6 +296,10 @@ def compile_steps(scenario: Scenario) -> list[tuple[str, str]]:
     Success scenarios return the full chain; failure scenarios truncate the
     chain *inclusive* of the failing block, so nothing runs past a fatal
     failure (CLAUDE.md: "the baton is not forwarded past a fatal failure").
+
+    ``scenario.flaky_at`` is deliberately NOT consulted: a transient failure
+    recovers, so its flow runs the complete chain exactly like a success
+    scenario. Only ``fail_at`` truncates.
     """
     chain = _full_chain(scenario)
     if scenario.fail_at is None:
@@ -260,7 +332,7 @@ SCENARIOS: dict[int, Scenario] = {
             _line("5001914", "SKU-GPU-H100-80GB"),
         ],
         bridge_ids="both",
-        terminal=(TRACK_TRACE, BLOCKS.REGISTER),
+        terminal=(INBOUND, BLOCKS.CLOSE),
     ),
     2: Scenario(
         id=2,
@@ -271,7 +343,7 @@ SCENARIOS: dict[int, Scenario] = {
         accountNumber="62011948",
         lines=[_line("3652269", "SKU-GPU-A100-80GB")],
         bridge_ids="order",
-        terminal=(TRACK_TRACE, BLOCKS.REGISTER),
+        terminal=(INBOUND, BLOCKS.CLOSE),
     ),
     3: Scenario(
         id=3,
@@ -285,7 +357,7 @@ SCENARIOS: dict[int, Scenario] = {
             _line("4788230", "SKU-APC-UPS-3000VA"),
         ],
         bridge_ids="cart",
-        terminal=(TRACK_TRACE, BLOCKS.REGISTER),
+        terminal=(INBOUND, BLOCKS.CLOSE),
     ),
     4: Scenario(
         id=4,
@@ -309,6 +381,8 @@ SCENARIOS: dict[int, Scenario] = {
         lines=[_line("4249751", "SKU-DELL-P7680-I9")],
         fail_at="create",
         reaches_creation=False,     # creation itself fails — still eventId-only
+        #                             (the chain now includes Inbound's whole
+        #                             Settings/JAM/SOLR leg before dying here)
         terminal=(ORDER_ENGINE, BLOCKS.CREATE),
     ),
     6: Scenario(
@@ -357,6 +431,8 @@ SCENARIOS: dict[int, Scenario] = {
         lines=[_line("4788230", "SKU-APC-UPS-3000VA")],
         bridge_ids="order",
         fail_at="jam",
+        reaches_creation=False,     # JAM is on Inbound's PRE-creation leg now —
+        #                             the journey dies eventId-only, no order ids
         terminal=(JAM, BLOCKS.SERVE),
     ),
     10: Scenario(
@@ -436,7 +512,8 @@ SCENARIOS: dict[int, Scenario] = {
     # =====================================================================
     # 15 is the NOVEL failure — the ONLY scenario here that needs EMBEDDINGS.
     #
-    # It fails at the SETTINGS enrichment satellite with a message the backend's
+    # It fails at the SETTINGS satellite — on INBOUND'S pre-creation leg now,
+    # so the journey dies eventId-only — with a message the backend's
     # _FAILURE_RULES does NOT recognize, so the journey never resolves to a
     # known NAMED subtype. Since it logs a real ERROR before going silent, the
     # journey correctly resolves as FAILED/UNRECOGNIZED_FAILURE (not TIMED_OUT
@@ -444,29 +521,23 @@ SCENARIOS: dict[int, Scenario] = {
     # the stall clock confirms nothing more is coming, and clusters via the
     # embedding/novel path instead of a (subtype, service) signature.
     #
-    # !!! REQUIRES a small service-code change — scenarios.py alone is NOT enough:
-    #   1) pipeline/services/settings.py must emit an ERROR failure variant for
-    #      its `serve` block when ctx.fail_at == "settings", with a NOVEL,
-    #      unfamiliar but INFRA-SHAPED message (matching flow 15 in
-    #      pipeline/data/mock-order-flows-v3.json exactly):
-    #        "[SettingsClient#getAccountSettingByOrganizationHierarchy] <--- ERROR:
-    #         settings service unavailable — connection reset while fetching
-    #         account settings (8000ms)"
-    #      Two properties MUST both hold:
-    #        (a) it must NOT match any backend _FAILURE_RULES pattern — that
-    #            unfamiliarity is what keeps it novel -> UNRECOGNIZED_FAILURE ->
-    #            embeddings; and
-    #        (b) it must read as INFRA (words like "unavailable"/"connection"),
-    #            because only INFRA-class failures search for a match. A novel
-    #            failure classified order-specific would just open its own
-    #            per-order incident and NEVER exercise the embedding cosine
-    #            match — so an infra shape is required to actually test embeddings.
-    #   2) The chain truncates after (SETTINGS, SERVE) below, so the order engine
-    #      never emits its recognized "Order processing aborted" wrapper — which
-    #      is what stops it being (mis)classified as ENRICHMENT_FAILED.
-    #   Verify: the flow should end FAILED/UNRECOGNIZED_FAILURE (not a recognized
-    #   NAMED subtype, and not TIMED_OUT — it has a real ERROR) and, because it
-    #   carries that real ERROR, still form/join an incident via embeddings.
+    # The failure variant lives in pipeline/services/settings.py
+    # (``_settings_down``): an INBOUND-identity client ERROR (the caller is
+    # Inbound now), whose message must keep both properties:
+    #   (a) it must NOT match any backend _FAILURE_RULES pattern — that
+    #       unfamiliarity is what keeps it novel -> UNRECOGNIZED_FAILURE ->
+    #       embeddings; and
+    #   (b) it must read as INFRA (words like "unavailable"/"connection"),
+    #       because only INFRA-class failures search for a match. A novel
+    #       failure classified order-specific would just open its own
+    #       per-order incident and NEVER exercise the embedding cosine match.
+    #   The chain truncates at (SETTINGS, SERVE) below, so no caller ever
+    #   emits a recognized abort wrapper — which is what stops it being
+    #   (mis)classified as a named subtype.
+    #   Verify: the flow should end FAILED/UNRECOGNIZED_FAILURE (not a
+    #   recognized NAMED subtype, and not TIMED_OUT — it has a real ERROR)
+    #   and, because it carries that real ERROR, still form/join an incident
+    #   via embeddings.
     # =====================================================================
     15: Scenario(
         id=15,
@@ -478,6 +549,8 @@ SCENARIOS: dict[int, Scenario] = {
         lines=[_line("4249751", "SKU-DELL-P7680-I9")],
         bridge_ids="both",
         fail_at="settings",
+        reaches_creation=False,     # Settings is on Inbound's PRE-creation leg —
+        #                             the journey dies eventId-only, no order ids
         terminal=(SETTINGS, BLOCKS.SERVE),
     ),
     # =====================================================================
@@ -488,8 +561,8 @@ SCENARIOS: dict[int, Scenario] = {
     #               SETTINGS satellite with an unrecognized, INFRA-shaped
     #               message, but 16 is WORDED DIFFERENTLY. Exact-text matching
     #               would keep them apart; the embedding recognizes they MEAN
-    #               the same thing (same failing_service=SETTINGS, high cosine,
-    #               veto passes) and MERGES them. This is the case the novel
+    #               the same thing (same failing_service, high cosine, veto
+    #               passes) and MERGES them. This is the case the novel
     #               path exists for.
     #   17        -> its OWN novel incident, on the SAME SETTINGS satellite as
     #               15/16 (so failing_service is identical — this deliberately
@@ -504,23 +577,10 @@ SCENARIOS: dict[int, Scenario] = {
     #               match on the salient-token mismatch — proving the guard
     #               itself does real work, not just the failing_service check.
     #
-    # !!! Scenario 16 still needs a service-code change — scenarios.py alone is
-    #     NOT enough for it: pipeline/services/settings.py must emit a NOVEL,
-    #     INFRA-shaped ERROR for its serve block when ctx.fail_at == "settings"
-    #     that is WORDED DIFFERENTLY from flow 15's message but means the same
-    #     thing (e.g. "could not reach settings satellite — read timed out
-    #     awaiting account settings response (8000ms)") — today ``fail_at ==
-    #     "settings"`` always emits flow 15's exact message via
-    #     ``_settings_down``, so 15 and 16 are currently byte-identical rather
-    #     than "differently worded, same meaning."
-    #   Scenario 17 needs NO further changes: ``fail_at="settings_rejected"``
-    #   is already wired to ``_settings_rejected`` in
-    #   pipeline/services/settings.py, and no backend change is needed since
-    #   it shares SETTINGS's existing (fallback) failing_service with 15/16.
-    #   Verify: 15+16 -> one UNRECOGNIZED_FAILURE incident (journey_count=2,
-    #   once 16's service-code TODO above is done); 17 -> a SEPARATE
-    #   UNRECOGNIZED_FAILURE incident (journey_count=1), never merging into
-    #   15/16's even though it shares their failing_service.
+    # Both settings failure variants are INBOUND-identity lines now (Inbound is
+    # the caller); their failing_service fallback is therefore
+    # cc-inbound-service for all of 15/16/17, which preserves the merge/veto
+    # semantics above (identical failing_service across the three).
     # =====================================================================
     16: Scenario(
         id=16,
@@ -532,6 +592,7 @@ SCENARIOS: dict[int, Scenario] = {
         lines=[_line("4249751", "SKU-DELL-P7680-I9")],
         bridge_ids="both",
         fail_at="settings",
+        reaches_creation=False,     # pre-creation — see scenario 15
         terminal=(SETTINGS, BLOCKS.SERVE),
     ),
     17: Scenario(
@@ -544,11 +605,48 @@ SCENARIOS: dict[int, Scenario] = {
         lines=[_line("4249751", "SKU-DELL-P7680-I9")],
         bridge_ids="both",
         fail_at="settings_rejected",
+        reaches_creation=False,     # pre-creation — see scenario 15
         terminal=(SETTINGS, BLOCKS.SERVE),
+    ),
+    # =====================================================================
+    # 18 — the TRANSIENT failure: the only scenario that fails and RECOVERS.
+    #
+    # Scenarios 1-17 either succeed cleanly or fail terminally; every retry
+    # loop in pipeline/services/ exhausts. That models only the terminal tail
+    # of the real system's behaviour — inbound-order.md §7.2 documents Feign
+    # clients retrying 4x with backoff on 5xx, so a downstream blip recovering
+    # on retry is the NORMAL case.
+    #
+    # SPT times out once, the retry succeeds, and the flow continues through
+    # RSM → Validator → Checker → dispatch → SAP → Inbound's close. So:
+    #   * ``flaky_at`` (NOT ``fail_at``) — the chain is NOT truncated;
+    #     ``terminal`` is Inbound's close, exactly like scenarios 1-3.
+    #   * the outcome is SUCCESS: the recovery variant emits the timeout ERROR
+    #     and the retry WARN, but never SPT-down's fatal "Order processing
+    #     aborted" line — the only line in that path _FAILURE_RULES matches.
+    #   * the journey still carries a real ERROR. That is the point: it proves
+    #     an ERROR alone does not make a journey FAILED (backend/journeys.py's
+    #     _state consults unrecovered_errors, not any-ERROR).
+    #
+    # Known and deliberate (see CLAUDE.md): this produces WARN/ERROR alerts on
+    # a SUCCESS journey, and those alerts are never clustered — incident
+    # eligibility is FAILED/TIMED_OUT only.
+    # =====================================================================
+    18: Scenario(
+        id=18,
+        name="Transient enrichment failure (SPT times out once, recovers on retry)",
+        outcome="SUCCESS",
+        country="UK",
+        user="RFLORIA",
+        accountNumber="81036533",
+        lines=[_line("3652269", "SKU-GPU-A100-80GB")],
+        bridge_ids="both",
+        flaky_at="spt",             # recovers — does NOT truncate the chain
+        terminal=(INBOUND, BLOCKS.CLOSE),
     ),
 }
 
 
 def all_scenarios() -> list[Scenario]:
-    """The 10 scenarios in id order (1..10)."""
+    """Every scenario in id order."""
     return [SCENARIOS[i] for i in sorted(SCENARIOS)]

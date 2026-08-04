@@ -12,7 +12,12 @@ python-dotenv>=1.0               # load a gitignored .env into the environment
 # zoneinfo needs a zone database. Linux images have one; WINDOWS DOES NOT, so
 # without this ZoneInfo("Europe/Bucharest") raises and /chat silently falls back
 # to UTC in local dev while working in the container. Pure-Python, ~half a MB.
-tzdata>=2024.1                   # IANA zones for zoneinfo (required on Windows)
+tzdata>=2024.1                   # IANA zones for zoneinfo. Required on Windows, and the
+                                 # safety net for the report scheduler's REPORT_TIMEZONE
+                                 # (backend/report.py) on any base image without system
+                                 # tzdata — python:3.11-slim happens to ship it, but a
+                                 # missing zone would raise at the first slot check, not
+                                 # at startup, so it must not depend on the base image.
 
 # --- AI service (LangGraph pipeline) ---
 langgraph>=0.2

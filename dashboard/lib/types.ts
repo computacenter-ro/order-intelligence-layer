@@ -16,7 +16,12 @@ export interface LogLine {
   message: string;
 }
 
-export type Department = "networking" | "devops" | "backend" | "database" | "general";
+// Mirrors shared/models.py's Department enum. `business` was `general` until the
+// department was renamed to match the Teams channel it routes to; it means "not an
+// engineering fault — the pipeline worked as designed and correctly rejected the
+// order". Not to be confused with the `general` Teams CHANNEL, which was not
+// renamed and never appears in this API.
+export type Department = "networking" | "devops" | "backend" | "database" | "business";
 
 export type Severity = "critical" | "high" | "medium" | "low";
 

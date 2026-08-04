@@ -65,10 +65,19 @@ _EXPLAIN_SYSTEM = (
 # updates the list automatically and silently leaves this block stale. Keep the two
 # in sync by hand.
 #
-# The load-bearing distinction is backend vs general: "the code misbehaved" vs "the
+# The load-bearing distinction is backend vs business: "the code misbehaved" vs "the
 # code behaved correctly and rejected the order". Without it the model routes on
 # surface association (log came from a service -> services are code -> backend), which
 # put every business-rule rejection on the backend team's queue as phantom work.
+#
+# 'business' was called 'general' until the department was renamed. The meaning is
+# unchanged and the wording below is deliberately the same wording — but a prompt
+# change is never behaviour-preserving, so the label itself may shift routing at the
+# margins. The new name should help rather than hurt: 'general' was semantically
+# empty and the prose had to fight it ("the answer is general, whatever the log
+# level"), whereas 'business' says what the verdict IS. Verify after deploying with
+# GET /alerts?department=business — if that list is thin while 'backend' grew, this
+# wording regressed.
 _DEPARTMENT_GUIDE = (
     "- networking: connectivity between services — timeouts, unreachable hosts, "
     "HTTP transport failures, a downstream service not answering.\n"
@@ -77,7 +86,7 @@ _DEPARTMENT_GUIDE = (
     "- database: persistence failures — DB timeouts, connection pools, SQL errors.\n"
     "- backend: an application code or integration DEFECT — the service itself "
     "behaved wrongly (unexpected exception, bad payload it produced, broken logic).\n"
-    "- general: NOT an engineering fault. The pipeline worked exactly as designed "
+    "- business: NOT an engineering fault. The pipeline worked exactly as designed "
     "and correctly REJECTED an order because of a business rule, user-supplied "
     "data, reference data, or account configuration. Nobody needs to change any "
     "code. Route here even though the log came from a service, is level=ERROR, "
@@ -191,7 +200,7 @@ _ROUTE_SYSTEM = (
     "   Before choosing, ask: is anything actually BROKEN? If the service executed "
     "its logic correctly and the order was rejected on business grounds — margin "
     "thresholds, missing or invalid user input, disabled accounts, unmapped "
-    "products — the answer is general, whatever the log level and whichever "
+    "products — the answer is business, whatever the log level and whichever "
     "service emitted it. ERROR means the order stopped, not that code is at fault. "
     "Reserve backend for an actual defect.\n"
     f"2. Rate its technical severity as one of: {_SEVERITIES}. Judge how urgent "

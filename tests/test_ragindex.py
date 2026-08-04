@@ -38,7 +38,7 @@ JOURNEY = "Journey SAP_SUBMISSION_FAILED: the order reached outbound and failed 
 def index() -> RagIndex:
     """A populated, enabled index (fake encoder, permissive floor)."""
     idx = RagIndex(FakeEncoder(), min_score=0.30, max_entries=100)
-    idx.index("a1", "alert", MARGIN, {"department": "general", "level": "ERROR"})
+    idx.index("a1", "alert", MARGIN, {"department": "business", "level": "ERROR"})
     idx.index("a2", "alert", SAP, {"department": "networking", "level": "ERROR"})
     idx.index("j1", "journey", JOURNEY, {"outcome": "SAP_SUBMISSION_FAILED"})
     return idx
@@ -215,7 +215,7 @@ def test_filter_narrows_results(index):
     assert {r["id"] for r in index.retrieve(query, k=5)} == {"a2"}
     # Matching filter → kept; non-matching filter on the same query → dropped.
     assert {r["id"] for r in index.retrieve(query, k=5, filters={"department": "networking"})} == {"a2"}
-    assert index.retrieve(query, k=5, filters={"department": "general"}) == []
+    assert index.retrieve(query, k=5, filters={"department": "business"}) == []
 
 
 def test_filter_on_kind_style_metadata(index):
@@ -226,15 +226,15 @@ def test_filter_on_kind_style_metadata(index):
 def test_filter_on_absent_key_excludes_the_record(index):
     # The journey record has no "department", so a department filter must exclude
     # it rather than treating the missing key as a match.
-    results = index.retrieve("journey sap submission", k=5, filters={"department": "general"})
+    results = index.retrieve("journey sap submission", k=5, filters={"department": "business"})
     assert all(r["id"] != "j1" for r in results)
 
 
 def test_multiple_filters_are_conjunctive(index):
-    # a1 matches department=general but its level is ERROR, not WARN → excluded.
+    # a1 matches department=business but its level is ERROR, not WARN → excluded.
     query = "margin check failed below threshold"
-    assert index.retrieve(query, k=5, filters={"department": "general", "level": "ERROR"})
-    assert index.retrieve(query, k=5, filters={"department": "general", "level": "WARN"}) == []
+    assert index.retrieve(query, k=5, filters={"department": "business", "level": "ERROR"})
+    assert index.retrieve(query, k=5, filters={"department": "business", "level": "WARN"}) == []
 
 
 def test_filter_compares_as_strings(index):
@@ -250,7 +250,7 @@ def test_filter_compares_as_strings(index):
 # =============================================================================
 def test_index_upserts_by_id_so_backfill_is_idempotent(index):
     before = len(index)
-    index.index("a1", "alert", MARGIN + " (re-indexed)", {"department": "general"})
+    index.index("a1", "alert", MARGIN + " (re-indexed)", {"department": "business"})
     assert len(index) == before  # replaced, not duplicated
     hit = [r for r in index.retrieve("margin check failed", k=5) if r["id"] == "a1"][0]
     assert "re-indexed" in hit["text"]

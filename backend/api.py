@@ -678,11 +678,18 @@ async def resolve_incident(
 def _dashboard_link(metadata: dict, *, kind: str = "", record_id: str = "") -> str | None:
     """Dashboard journey link for a cited record, or None.
 
-    Same rule as ``backend/teams.py::_dashboard_link``: DASHBOARD_URL + the
-    **journey_id**. For a ``journey`` record the record id IS the journey id, so it
-    is used as a last resort — otherwise a journey citation, the most link-worthy
-    kind, would render without a link. None when DASHBOARD_URL is unset or nothing
-    identifies a journey; the UI then shows the citation as plain text.
+    DASHBOARD_URL + the **journey_id**. For a ``journey`` record the record id IS
+    the journey id, so it is used as a last resort — otherwise a journey citation,
+    the most link-worthy kind, would render without a link. None when DASHBOARD_URL
+    is unset or nothing identifies a journey; the UI then shows the citation as
+    plain text.
+
+    ⚠ This deliberately still targets ``/journeys/<id>`` while
+    ``backend/teams.py::_alert_link`` now targets ``/?alert=<alert_id>``. They are
+    no longer "change them together" — a chat citation is *about* the record it
+    cites (a journey citation should open that journey), whereas a Teams card is
+    about one alert and must land on it. What the two DO still share is the rule
+    below: ``order_id`` is never a fallback.
 
     ``order_id`` is deliberately NOT a fallback. It used to be, and it produced a
     link that always 404s: ``/journeys/{journey_id}`` resolves a journey id, so

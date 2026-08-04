@@ -225,11 +225,31 @@ services:
       uvicorn backend.main:app --host 0.0.0.0 --port 8000
       --proxy-headers --forwarded-allow-ips=*
     env_file:
-      - path: .env          # TEAMS_WEBHOOK_*, DASHBOARD_URL, JWT/admin secrets, ENTRA_*
+      # TEAMS_WEBHOOK_*, DASHBOARD_URL, JWT/admin secrets, ENTRA_*. The glob is
+      # what carries the webhooks, so a NEW channel needs nothing here — only a
+      # line in the VM's .env. Six live channels, all fed by `alert.new` and
+      # nothing else: _NETWORKING, _DEVOPS, _BACKEND, _DATABASE, _BUSINESS
+      # (source="ai" + department="business" — the pipeline correctly rejected an
+      # order) and _FALLBACK (source="fallback" — LLM down). _REPORTS carries the
+      # 09:00 + 17:00 reports and no alert traffic — renamed from _GENERAL, whose
+      # meaning had moved three times (per-journey cards posted there until they
+      # were dropped at thousands a day). See
+      # backend/teams.py::channel_for. Do NOT list them under `environment:`:
+      # an unset ${VAR:-} default there would shadow .env.
+      - path: .env
         required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oil}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-oil}
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # The twice-daily report's watermark (`teams:digest:last_sent`) lives in
+      # Redis — see backend/report.py. This is the ONLY thing in the backend that
+      # needs Redis, which is why it was missing here: until the report existed,
+      # Redis belonged to the AI service alone. Without it the code falls back to
+      # `redis://localhost:6379/0`, and inside a container `localhost` is the
+      # container itself — every cycle logs "Error 111 connecting to
+      # localhost:6379" and no report is ever sent. The failure is loud in the log
+      # but silent in Teams, which is the combination worth guarding against.
+      REDIS_URL: redis://redis:6379/0
       AI_SERVICE_URL: http://ai-service:8100
       # Single origin behind Caddy, so this is same-origin and CORS is not really
       # in play — set correctly anyway (backend/main.py currently HARDCODES
@@ -256,6 +276,11 @@ services:
       migrate:
         condition: service_completed_successfully
       rabbitmq:
+        condition: service_healthy
+      # Required, not best-effort: the report loop reads its watermark from Redis
+      # on its very first cycle, and a Redis that is not up yet turns that into a
+      # logged error rather than a report.
+      redis:
         condition: service_healthy
       # The backend calls the AI service on journey completion (summaries) and
       # pushes to its retrieval index (backend/consumers.py). Both are

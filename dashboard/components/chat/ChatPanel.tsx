@@ -11,7 +11,13 @@ import {
 import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
 import { AlertDetailBody } from "@/components/alerts/AlertDetailBody";
-import { fetchAlert, sendChat, sendChatFeedback, UnauthorizedError } from "@/lib/api";
+import {
+  alertLoadErrorMessage,
+  fetchAlert,
+  sendChat,
+  sendChatFeedback,
+  UnauthorizedError,
+} from "@/lib/api";
 import { localizeUtcStamps } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ChatContext, ChatMode, ChatSource, ProcessedAlert } from "@/lib/types";
@@ -503,12 +509,11 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
         setDetail((prev) => (prev && prev.id === source.id ? { ...prev, alert } : prev))
       )
       .catch((err) => {
-        // Same two shapes the composer distinguishes: an expired session is
-        // actionable, anything else is not.
-        const message =
-          err instanceof UnauthorizedError
-            ? "Your session has expired. Please sign in again to view this alert."
-            : "That alert could not be loaded. It may have been removed since the answer cited it.";
+        // Wording shared with the Alert Feed's `/?alert=` deep link, which loads an
+        // alert by id the same way and can only fail the same two ways. It draws
+        // the distinction the composer draws: an expired session is actionable,
+        // anything else is not.
+        const message = alertLoadErrorMessage(err);
         setDetail((prev) => (prev && prev.id === source.id ? { ...prev, error: message } : prev));
       });
   };

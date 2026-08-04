@@ -114,6 +114,87 @@ def incident_total() -> Select:
     return select(func.count()).select_from(Incident)
 
 
+# --- report queries (backend/report.py; NOT part of /stats/insights) ---------
+#
+# Three builders for the twice-daily Teams report, kept here beside the other
+# aggregates rather than in report.py so all SQL lives in one place.
+#
+# Deliberately NOT a `since`/`until` retrofit of the eight builders above: the
+# report needs current-state backlog (no window at all) plus exactly two windowed
+# counts, and nothing else in the system asks for a windowed breakdown. Adding
+# optional bounds to every builder would be eight signatures changed, eight tests
+# widened, and an optional parameter that only one caller ever passes.
+
+
+def unresolved_alerts_by_department() -> Select:
+    """``(department, unresolved, urgent)`` — the report's backlog table.
+
+    One pass for both numbers: the total open alerts per department, plus the
+    ``critical`` subset as an aggregate ``FILTER`` (same pattern as
+    :func:`journey_totals`' scoped average). Two separate queries would have to be
+    reconciled by the caller and could disagree under concurrent writes.
+
+    ``urgent`` counts ``severity == "critical"`` ONLY — a deliberate narrowing.
+    Critical is rare in this corpus so the column often reads 0; widening it to
+    include ``high`` would make it a second "everything" column and cost the word
+    "urgent" its meaning.
+
+    ``department`` is nullable, and a NULL group is exactly what must not be
+    dropped: a ``source="fallback"`` alert has neither department nor severity, so
+    the alerts nobody triaged — because the LLM was down — are precisely the ones
+    a silent NULL group would hide. :func:`~backend.report.fold_departments`
+    gives it an explicit bucket, as ``_grouped(..., null_key=...)`` does above.
+    """
+    return (
+        select(
+            Alert.department,
+            func.count(),
+            func.count().filter(Alert.severity == "critical"),
+        )
+        .where(Alert.is_resolved.is_(False))
+        .group_by(Alert.department)
+    )
+
+
+def alerts_created_in_window(since, until) -> Select:
+    """Single row: ``(alerts_emitted_in [since, until),)``.
+
+    Half-open like the AI-service poller's window, so consecutive report windows
+    tile the timeline exactly once — an alert on a boundary is counted by the later
+    report, never both or neither.
+    """
+    return (
+        select(func.count())
+        .select_from(Alert)
+        .where(Alert.emitted_at >= since, Alert.emitted_at < until)
+    )
+
+
+def alerts_resolved_in_window(since, until) -> Select:
+    """Single row: ``(alerts_resolved_in [since, until),)``.
+
+    ⚠ **Every alert whose ``resolved_at`` falls in the window, regardless of when
+    it was created.** The tempting misreading — "resolved among those created in
+    the window" — would silently drop the most common case (yesterday's alert
+    triaged this morning) and break the arithmetic the card is built on::
+
+        open_at_end == open_at_start + created_in_window - resolved_in_window
+
+    A card whose numbers visibly do not add up stops being read, so this filters
+    on ``resolved_at`` and NOTHING else. A test pins that ``emitted_at`` never
+    appears in this statement.
+    """
+    return (
+        select(func.count())
+        .select_from(Alert)
+        .where(
+            Alert.resolved_at.isnot(None),
+            Alert.resolved_at >= since,
+            Alert.resolved_at < until,
+        )
+    )
+
+
 def alerts_clustered_count() -> Select:
     """Single row: ``(alerts_assigned_to_an_incident,)``.
 

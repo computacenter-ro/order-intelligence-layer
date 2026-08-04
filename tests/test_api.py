@@ -1120,7 +1120,7 @@ def test_get_alerts_passes_query_params_into_the_filter():
     assert "emitted_at >=" in sql and "department IN (" in sql and "source =" in sql
 
 
-@pytest.mark.parametrize("department", ["networking", "devops", "backend", "database", "general"])
+@pytest.mark.parametrize("department", ["networking", "devops", "backend", "database", "business"])
 def test_get_alerts_valid_department_filters(department):
     session = _use([_FakeResult(items=[])])
     r = TestClient(app).get("/alerts", params={"department": department})

@@ -914,8 +914,8 @@ anything indexed. Without it, "retrieval found nothing" and "there is nothing to
 answer from" are the same fact, which was true only while the index was the sole
 channel. The failure it fixes: click a NOVEL failure (nothing similar is indexed —
 exactly when you need help), ask "what does this mean?", and get *"No related
-incidents found — run the backfill"* while the alert's full text sits in that very
-request. The original guard still holds for the case it was written for: a bare
+incidents found ... no sources found in official documentation either"* while the
+alert's full text sits in that very request. The original guard still holds for the case it was written for: a bare
 question that matched nothing composes nothing.
 
 **Record ids never appear in the answer prose.** They identify rows the reader

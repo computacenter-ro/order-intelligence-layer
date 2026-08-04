@@ -37,7 +37,15 @@ name: Deploy to Azure Container Apps
 
 on:
   workflow_dispatch:            # run manually from the GitHub "Actions" tab
-  # Uncomment to auto-deploy after the images finish building:
+    inputs:
+      image_tag:
+        description: "Tag to deploy (blank = 'latest', which build-images.yml pushes for main)"
+        required: false
+        default: ""
+  # Uncomment to auto-deploy after the images finish building. Left OFF on
+  # purpose: a deploy rolls all five apps at once, and the AI service takes a
+  # couple of minutes to reload its embedding model — not something to trigger
+  # unattended mid-demo.
   # workflow_run:
   #   workflows: ["Build & push images"]
   #   types: [completed]
@@ -51,16 +59,21 @@ env:
   # they can authenticate against. Pulling from GHCR would additionally require
   # giving every app a GitHub token with read:packages as its registry password.
   #
-  # Images reach ACR via `az acr import` from GHCR (build-images.yml builds and
-  # pushes there), or `az acr build` — see DEPLOY_STEP_BY_STEP.md.
+  # Images reach ACR directly: build-images.yml pushes to BOTH GHCR and ACR on a
+  # push to `main`, using this same AZURE_CREDENTIALS service principal. (It used
+  # to be a manual `az acr import` hop with a personal access token.)
   #
-  # The DASHBOARD tag is pinned, not ":latest", on purpose: its bundle has the
-  # backend URL baked in at BUILD time (NEXT_PUBLIC_*, see dashboard/Dockerfile),
-  # so "the newest dashboard image" is not interchangeable the way the app image
-  # is — deploying the wrong one silently points the browser at the wrong API.
-  # Bump this when you build a new dashboard.
-  IMAGE_APP:       croildevweu01.azurecr.io/oil-app:latest
-  IMAGE_DASHBOARD: croildevweu01.azurecr.io/oil-dashboard:v4
+  # Both tags default to ":latest", which build-images.yml pushes to ACR on every
+  # push to `main`. The dashboard image used to need a hand-bumped tag because an
+  # automatic build produced a WRONG bundle (relative /api and /ws) that must not
+  # be deployed — that is fixed at the source now: build-images.yml defaults the
+  # NEXT_PUBLIC_* build args to the deployed Azure hostnames, so ":latest" is
+  # always a correct dashboard image.
+  #
+  # Override `image_tag` on a manual run to deploy a specific build (e.g. a
+  # `sha-<commit>` tag) or to roll back.
+  ACR: croildevweu01.azurecr.io
+  TAG: ${{ inputs.image_tag || 'latest' }}
 
   # Container app names (must match what you created)
   APP_COLLECTOR:  ca-oil-collector-dev-weu
@@ -83,19 +96,19 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}     # TODO: add this secret (see header) 🤝
 
       - name: Deploy collector
-        run: az containerapp update -n "$APP_COLLECTOR" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+        run: az containerapp update -n "$APP_COLLECTOR" -g "$RESOURCE_GROUP" --image "$ACR/oil-app:$TAG"
 
       - name: Deploy mock-services
-        run: az containerapp update -n "$APP_MOCK" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+        run: az containerapp update -n "$APP_MOCK" -g "$RESOURCE_GROUP" --image "$ACR/oil-app:$TAG"
 
       - name: Deploy ai-service
-        run: az containerapp update -n "$APP_AI" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+        run: az containerapp update -n "$APP_AI" -g "$RESOURCE_GROUP" --image "$ACR/oil-app:$TAG"
 
       - name: Deploy backend
-        run: az containerapp update -n "$APP_BACKEND" -g "$RESOURCE_GROUP" --image "$IMAGE_APP"
+        run: az containerapp update -n "$APP_BACKEND" -g "$RESOURCE_GROUP" --image "$ACR/oil-app:$TAG"
 
       - name: Deploy dashboard
-        run: az containerapp update -n "$APP_DASHBOARD" -g "$RESOURCE_GROUP" --image "$IMAGE_DASHBOARD"
+        run: az containerapp update -n "$APP_DASHBOARD" -g "$RESOURCE_GROUP" --image "$ACR/oil-dashboard:$TAG"
 
       # A green deploy step only means the ARM update was accepted — it says
       # nothing about whether the new revision actually STARTED. Report each

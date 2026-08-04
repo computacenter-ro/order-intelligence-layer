@@ -10,6 +10,11 @@ name: Build & push images
 #
 # Trigger: pushes to prep-for-prod / dev / main that touch something an image
 # contains, plus manual dispatch. Docs-only pushes don't rebuild.
+#
+# Images are pushed to GHCR **and**, for pushes to `main`, to ACR — because the
+# Azure Container Apps authenticate against ACR only (they were created with ACR
+# pull credentials and hold no GitHub token). Pushing directly removes the manual
+# `az acr import` hop that otherwise sat between a merge and a deployable image.
 on:
   push:
     branches: [prep-for-prod, dev, main]
@@ -26,16 +31,37 @@ on:
   workflow_dispatch:
     inputs:
       public_url:
-        description: "Base URL the dashboard bundle is built for (blank = relative /api and /ws, correct behind the reverse proxy)"
+        description: "Backend base URL the dashboard bundle calls (blank = the DEFAULT_* below)"
         required: false
         default: ""
       ws_url:
-        description: "Absolute wss:// URL for the WebSocket (split-origin only)"
+        description: "Absolute wss:// URL for the WebSocket (blank = the DEFAULT_* below)"
         required: false
         default: ""
 
 env:
   REGISTRY: ghcr.io
+  ACR_LOGIN_SERVER: croildevweu01.azurecr.io
+
+  # --- Dashboard URL defaults -------------------------------------------------
+  # NEXT_PUBLIC_* are inlined into the browser bundle at BUILD time (every page is
+  # a client component), so the dashboard image is environment-specific and these
+  # cannot be supplied at deploy time — see dashboard/Dockerfile.
+  #
+  # These default to the DEPLOYED Azure hostnames rather than to the Dockerfile's
+  # relative "/api" and "/ws". Those relative paths are correct only behind a
+  # single-origin reverse proxy (docker-compose.prod.yml + Caddy); this deployment
+  # runs dashboard and backend as SEPARATE Container Apps on DIFFERENT hostnames,
+  # where a relative "/api" makes the browser call the dashboard itself and 404.
+  # An automatic build with blank inputs used to produce exactly that image.
+  #
+  # Note the API URL carries NO "/api" suffix: backend/main.py mounts its routers
+  # at the root (/auth/login, /alerts, ...), and lib/api.ts appends the path
+  # itself. The WS URL must use the wss:// scheme — lib/useWebSocket.ts only
+  # treats a value as absolute when it starts ws:// or wss://, and resolves
+  # anything else against the DASHBOARD's own origin.
+  DEFAULT_PUBLIC_URL: https://ca-oil-backend-dev-weu.wittyisland-62bad157.westeurope.azurecontainerapps.io
+  DEFAULT_WS_URL: wss://ca-oil-backend-dev-weu.wittyisland-62bad157.westeurope.azurecontainerapps.io/ws
 
 jobs:
   app:
@@ -57,8 +83,40 @@ jobs:
           # GITHUB_TOKEN is injected by Actions — no secret to manage.
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
-        id: meta
+      # ACR is the registry the Container Apps actually pull from. Logging in via
+      # the SAME service principal deploy.yml uses (AZURE_CREDENTIALS) means no
+      # extra secret and no ACR admin password stored in GitHub.
+      #
+      # Only on `main`: feature branches have nothing to deploy to, and pushing
+      # every branch would fill ACR (Basic SKU, 10 GB) with images nothing pulls.
+      - name: Log in to Azure
+        if: github.ref == 'refs/heads/main'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to ACR
+        if: github.ref == 'refs/heads/main'
+        run: az acr login --name croildevweu01
+
+      # One `images:` list per case, because docker/metadata-action has no way to
+      # drop a registry conditionally — an empty line would emit a bare tag.
+      - name: Image metadata (main → GHCR + ACR)
+        id: meta_main
+        if: github.ref == 'refs/heads/main'
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/oil-app
+            ${{ env.ACR_LOGIN_SERVER }}/oil-app
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Image metadata (other branches → GHCR only)
+        id: meta_branch
+        if: github.ref != 'refs/heads/main'
         uses: docker/metadata-action@v5
         with:
           # Lowercased by the action: GHCR rejects uppercase in a repository name
@@ -67,7 +125,25 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Select metadata
+        id: meta
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "tags<<EOF"   >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_main.outputs.tags }}"   >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+            echo "labels<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_main.outputs.labels }}" >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+          else
+            echo "tags<<EOF"   >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_branch.outputs.tags }}"   >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+            echo "labels<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_branch.outputs.labels }}" >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -99,15 +175,57 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
-        id: meta
+      - name: Log in to Azure
+        if: github.ref == 'refs/heads/main'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to ACR
+        if: github.ref == 'refs/heads/main'
+        run: az acr login --name croildevweu01
+
+      - name: Image metadata (main → GHCR + ACR)
+        id: meta_main
+        if: github.ref == 'refs/heads/main'
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/oil-dashboard
+            ${{ env.ACR_LOGIN_SERVER }}/oil-dashboard
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Image metadata (other branches → GHCR only)
+        id: meta_branch
+        if: github.ref != 'refs/heads/main'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/oil-dashboard
           tags: |
             type=ref,event=branch
             type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Select metadata
+        id: meta
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "tags<<EOF"   >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_main.outputs.tags }}"   >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+            echo "labels<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_main.outputs.labels }}" >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+          else
+            echo "tags<<EOF"   >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_branch.outputs.tags }}"   >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+            echo "labels<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.meta_branch.outputs.labels }}" >> "$GITHUB_OUTPUT"
+            echo "EOF"         >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -117,14 +235,17 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # NEXT_PUBLIC_* are BUILD args: Next inlines them into the browser
-          # bundle, so they cannot be set at deploy time. Empty defaults mean the
-          # Dockerfile's own relative /api and /ws, which is what the
-          # reverse-proxied deployment wants — the image then carries no hostname
-          # and works for any PUBLIC_HOST. Pass public_url on a manual run only
-          # for a split-origin deployment.
+          # bundle, so they cannot be set at deploy time.
+          #
+          # A manual run's inputs win; otherwise these fall back to DEFAULT_*
+          # (the deployed Azure hostnames — see the env block at the top). They
+          # deliberately do NOT fall back to the Dockerfile's relative /api and
+          # /ws: those are correct only behind a single-origin reverse proxy, and
+          # this deployment splits dashboard and backend across two hostnames, so
+          # a relative /api makes the browser call the dashboard and 404.
           build-args: |
-            ${{ inputs.public_url && format('NEXT_PUBLIC_API_URL={0}', inputs.public_url) || '' }}
-            ${{ inputs.ws_url && format('NEXT_PUBLIC_WS_URL={0}', inputs.ws_url) || '' }}
+            NEXT_PUBLIC_API_URL=${{ inputs.public_url || env.DEFAULT_PUBLIC_URL }}
+            NEXT_PUBLIC_WS_URL=${{ inputs.ws_url || env.DEFAULT_WS_URL }}
           # The private @computacenter-ro/style-guide package needs a registry
           # token. Passed as a build SECRET (not an arg) so it never appears in
           # the build log or `docker history` — matches dashboard/Dockerfile's

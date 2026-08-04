@@ -16,11 +16,23 @@ name: Deploy to Azure Container Apps
 #        GitHub repo → Settings → Secrets and variables → Actions → New secret
 #        Name: AZURE_CREDENTIALS
 #   2. Confirm the app names + resource group below match what you created.
-#   3. Confirm the image source (GHCR by default; switch to ACR if you prefer).
+#   3. Confirm the image TAGS below are the ones you actually want deployed.
 #
-# The container apps themselves must already have registry pull credentials
-# (set when you created them). If pulling from GHCR, each app needs a GitHub
-# token with read:packages as its registry password.
+# The container apps already have ACR pull credentials (set at creation), which
+# is why the images below are ACR references rather than GHCR ones.
+#
+# ⚠ WHAT THIS DOES AND DOES NOT TOUCH. `az containerapp update --image` replaces
+# only the image; environment variables, secrets and the command/args override
+# are left as they are. That matters here because a large part of this
+# deployment's configuration lives in env vars set through the PORTAL (the
+# `az containerapp update --set-env-vars` path silently dropped values on the
+# CLI version in Cloud Shell). So a deploy will NOT restore a variable someone
+# has since cleared, and it will NOT introduce one a new revision needs — those
+# remain manual. After any deploy that ships new configuration, re-check:
+#   az containerapp show -n <app> -g rg-internship-2026 \
+#     --query "properties.template.containers[0].env" -o json
+# every entry must have a `value` or a `secretRef`; a bare {"name": ...} is a
+# variable that lost its value.
 # ---------------------------------------------------------------------------
 
 on:
@@ -33,13 +45,22 @@ on:
 env:
   RESOURCE_GROUP: rg-internship-2026
 
-  # --- Image source: GHCR (already built by build-images.yml) -----------------
-  # github.repository_owner is filled automatically. ":latest" or a specific tag.
-  IMAGE_APP:       ghcr.io/computacenter-ro/oil-app:prep-for-prod
-  IMAGE_DASHBOARD: ghcr.io/computacenter-ro/oil-dashboard:prep-for-prod
-  # --- OR switch to ACR (uncomment + set your ACR login server) ---------------
-  # IMAGE_APP:       croildevweu01.azurecr.io/oil-app:latest
-  # IMAGE_DASHBOARD: croildevweu01.azurecr.io/oil-dashboard:latest
+  # --- Image source: ACR ------------------------------------------------------
+  # ACR, not GHCR: the container apps were created with ACR pull credentials
+  # (`--registry-server croildevweu01.azurecr.io`), so that is the only registry
+  # they can authenticate against. Pulling from GHCR would additionally require
+  # giving every app a GitHub token with read:packages as its registry password.
+  #
+  # Images reach ACR via `az acr import` from GHCR (build-images.yml builds and
+  # pushes there), or `az acr build` — see DEPLOY_STEP_BY_STEP.md.
+  #
+  # The DASHBOARD tag is pinned, not ":latest", on purpose: its bundle has the
+  # backend URL baked in at BUILD time (NEXT_PUBLIC_*, see dashboard/Dockerfile),
+  # so "the newest dashboard image" is not interchangeable the way the app image
+  # is — deploying the wrong one silently points the browser at the wrong API.
+  # Bump this when you build a new dashboard.
+  IMAGE_APP:       croildevweu01.azurecr.io/oil-app:latest
+  IMAGE_DASHBOARD: croildevweu01.azurecr.io/oil-dashboard:v4
 
   # Container app names (must match what you created)
   APP_COLLECTOR:  ca-oil-collector-dev-weu
@@ -47,6 +68,10 @@ env:
   APP_AI:         ca-oil-ai-dev-weu
   APP_BACKEND:    ca-oil-backend-dev-weu
   APP_DASHBOARD:  ca-oil-dashboard-dev-weu
+  # NOTE: ca-oil-injector-dev-weu is deliberately NOT deployed here. It runs the
+  # same oil-app image but is a demo driver, not part of the system under test —
+  # and it is routinely deactivated (to stop burning LLM tokens), which a deploy
+  # step would silently reactivate.
 
 jobs:
   deploy:
@@ -72,6 +97,33 @@ jobs:
       - name: Deploy dashboard
         run: az containerapp update -n "$APP_DASHBOARD" -g "$RESOURCE_GROUP" --image "$IMAGE_DASHBOARD"
 
-      # Optional: also re-run the DB migration job on each deploy (safe/idempotent)
+      # A green deploy step only means the ARM update was accepted — it says
+      # nothing about whether the new revision actually STARTED. Report each
+      # app's running state so a crash-looping revision is visible here rather
+      # than discovered in the browser.
+      - name: Report revision health
+        run: |
+          for app in "$APP_COLLECTOR" "$APP_MOCK" "$APP_AI" "$APP_BACKEND" "$APP_DASHBOARD"; do
+            printf '%-32s ' "$app"
+            az containerapp show -n "$app" -g "$RESOURCE_GROUP" \
+              --query "properties.runningStatus" -o tsv
+          done
+
+      # Re-run the DB migration job on each deploy. `alembic upgrade head` is
+      # idempotent (an already-applied revision is a no-op), and a deploy that
+      # ships a migration WITHOUT running it leaves the backend erroring on
+      # columns that do not exist yet.
+      #
+      # ⚠ STILL COMMENTED OUT because the migrate job does not currently work:
+      # its DATABASE_URL comes from Key Vault WITHOUT a TLS parameter, and
+      # backend/migrations/env.py imports the RAW `DATABASE_URL` from backend/db.py
+      # rather than the translated `_url` — so it never gets the `sslmode -> ssl`
+      # fix and cannot connect to a managed Postgres. The schema was applied by
+      # hand from Cloud Shell instead.
+      #
+      # To enable: store the URL with an explicit `?ssl=require` (asyncpg's own
+      # parameter name — `db.py` leaves an existing `ssl=` alone, so it is correct
+      # for the backend too), confirm the job succeeds once manually, then
+      # uncomment.
       # - name: Run migrations
       #   run: az containerapp job start -n ca-oil-migrate-dev-weu -g "$RESOURCE_GROUP"

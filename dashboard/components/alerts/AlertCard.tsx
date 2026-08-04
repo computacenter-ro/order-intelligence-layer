@@ -91,10 +91,12 @@ export function AlertCard({ alert, onOpen, onResolve, isSelected = false, search
               {alert.department && <Badge status="info">{capitalize(alert.department)}</Badge>}
             </>
           ) : (
-            <>
-              <Badge status="inactive">Fallback</Badge>
-              <Badge status="inactive">General</Badge>
-            </>
+            // One badge, not two. The second read "General" — the department a
+            // fallback alert was once notified under — but a fallback alert HAS no
+            // department (null by contract), that department no longer exists under
+            // that name, and these alerts now go to the `fallback` channel anyway.
+            // It said where the alert went, wrongly; "Fallback" says what it is.
+            <Badge status="inactive">Fallback</Badge>
           )}
           <span
             style={{

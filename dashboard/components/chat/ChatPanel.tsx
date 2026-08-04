@@ -11,7 +11,13 @@ import {
 import { Button } from "@computacenter-ro/style-guide/components";
 import { Badge } from "@/components/ui/Badge";
 import { AlertDetailBody } from "@/components/alerts/AlertDetailBody";
-import { fetchAlert, sendChat, sendChatFeedback, UnauthorizedError } from "@/lib/api";
+import {
+  alertLoadErrorMessage,
+  fetchAlert,
+  sendChat,
+  sendChatFeedback,
+  UnauthorizedError,
+} from "@/lib/api";
 import { localizeUtcStamps } from "@/lib/format";
 import { renderInlineMarkdown } from "@/lib/richText";
 import type { ChatContext, ChatMode, ChatSource, ProcessedAlert } from "@/lib/types";
@@ -503,12 +509,11 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
         setDetail((prev) => (prev && prev.id === source.id ? { ...prev, alert } : prev))
       )
       .catch((err) => {
-        // Same two shapes the composer distinguishes: an expired session is
-        // actionable, anything else is not.
-        const message =
-          err instanceof UnauthorizedError
-            ? "Your session has expired. Please sign in again to view this alert."
-            : "That alert could not be loaded. It may have been removed since the answer cited it.";
+        // Wording shared with the Alert Feed's `/?alert=` deep link, which loads an
+        // alert by id the same way and can only fail the same two ways. It draws
+        // the distinction the composer draws: an expired session is actionable,
+        // anything else is not.
+        const message = alertLoadErrorMessage(err);
         setDetail((prev) => (prev && prev.id === source.id ? { ...prev, error: message } : prev));
       });
   };
@@ -568,7 +573,7 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
       <aside
         role="dialog"
         aria-modal="true"
-        aria-label="Incident assistant"
+        aria-label="AI Assistant"
         style={{
           position: "fixed",
           top: 0,
@@ -622,11 +627,18 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           ) : (
             <div>
               <div style={{ fontSize: "20px", fontWeight: 600, color: "var(--cc-foundation-blue)" }}>
-                Incident Assistant
+                AI Assistant
               </div>
-              <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginTop: "4px" }}>
-                {contextLabel ? `Scoped to ${contextLabel}` : "Answers grounded in indexed incidents"}
-              </div>
+              {/* Only ever announces a SCOPE. Unscoped, the row is omitted entirely
+                  rather than filled with a description of how the assistant works:
+                  the subtitle's job is to tell you the answers are narrowed to one
+                  record, so text here when nothing is narrowed reads as a caveat and
+                  competes with the empty state, which already explains the grounding. */}
+              {contextLabel ? (
+                <div style={{ fontSize: "14px", color: "var(--cc-grey-three)", marginTop: "4px" }}>
+                  Scoped to {contextLabel}
+                </div>
+              ) : null}
             </div>
           )}
           <button
@@ -671,7 +683,8 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
           {turns.length === 0 && !busy && (
             <div style={{ color: "var(--cc-grey-three)", fontSize: "16px", lineHeight: "22px" }}>
               <p style={{ margin: "0 0 16px" }}>
-                Ask about past alerts and order journeys. Every answer cites the records it used.
+                Ask about past alerts and order journeys, or how a service works. Every
+                answer cites the sources it used.
               </p>
               <SectionLabel>Try</SectionLabel>
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -735,7 +748,10 @@ export function ChatPanel({ open, onClose, context = null, contextLabel }: ChatP
             ref={inputRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder="Ask about an incident…"
+            // Deliberately open-ended: /chat grounds in BOTH incident history and
+            // the per-service documentation index, so naming either one narrows what
+            // people think to ask. The empty state spells out both.
+            placeholder="Ask something…"
             aria-label="Your question"
             disabled={busy}
             style={{

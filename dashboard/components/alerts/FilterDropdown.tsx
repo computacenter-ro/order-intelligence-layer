@@ -22,6 +22,17 @@ interface FilterDropdownProps {
   onChange: (value: string) => void;
   /** The "no filter" value (e.g. "all"). Anything else marks the control active. */
   defaultValue?: string;
+  /**
+   * Offer a "Clear <label>" row once a value is picked, so `defaultValue` can be
+   * a state the user returns to rather than a row they select. Lets a filter start
+   * with NOTHING selected and still get back there — the same contract
+   * `MultiFilterDropdown` has, where clearing the ticks *is* selecting all.
+   *
+   * Opt-in, and deliberately so: the Alert Feed's filters carry an explicit
+   * "All Levels"/"All Sources" row, which is a pickable option rather than an
+   * empty state, and must keep behaving that way.
+   */
+  clearable?: boolean;
 }
 
 /**
@@ -48,12 +59,17 @@ export function FilterDropdown({
   options,
   onChange,
   defaultValue = "all",
+  clearable = false,
 }: FilterDropdownProps) {
   const { open, toggle, close, containerRef, triggerRef, panelId, renderPanel } =
     useFilterPopover(label);
 
   const isActive = value !== defaultValue;
-  const selectedLabel = options.find((opt) => opt.value === value)?.label ?? value;
+  // Under `clearable` the default is an EMPTY selection, which matches no option —
+  // so fall back to "any" rather than letting the trigger announce "Status: " and
+  // tell a screen-reader user nothing. Mirrors MultiFilterDropdown's `summary`.
+  const selectedLabel =
+    options.find((opt) => opt.value === value)?.label ?? (value || "any");
 
   return (
     <div ref={containerRef} style={{ position: "relative" }}>
@@ -94,7 +110,8 @@ export function FilterDropdown({
       </button>
 
       {renderPanel(
-        options.map((opt) => {
+        <>
+        {options.map((opt) => {
           const selected = opt.value === value;
           return (
             <button
@@ -142,7 +159,42 @@ export function FilterDropdown({
               {opt.label}
             </button>
           );
-        }),
+        })}
+
+        {clearable && isActive && (
+          <>
+            <span
+              aria-hidden="true"
+              style={{
+                display: "block",
+                height: "1px",
+                margin: "4px 0",
+                background: "var(--cc-grey-six)",
+              }}
+            />
+            {/* Returning to "no filter" needs its own control once the default is
+                an empty selection — there is no row to re-pick. Still role=option
+                (selecting "none" IS one of the choices), which keeps the panel a
+                valid listbox rather than a listbox with a stray button in it. */}
+            <button
+              type="button"
+              role="option"
+              aria-selected={false}
+              onClick={() => {
+                onChange(defaultValue);
+                close();
+              }}
+              style={{
+                ...popoverRowStyle(false),
+                color: "var(--cc-heritage-blue)",
+                fontWeight: 600,
+              }}
+            >
+              Clear {label}
+            </button>
+          </>
+        )}
+        </>,
         "listbox"
       )}
     </div>

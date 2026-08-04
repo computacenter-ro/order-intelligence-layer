@@ -45,7 +45,7 @@ def _alert(**over) -> ProcessedAlert:
     base = dict(
         alert_id="alert-1", emitted_at=BASE, log=_log(),
         explanation="The order was blocked because its margin fell below the threshold.",
-        department=Department.general, severity=Severity.medium, source="ai",
+        department=Department.business, severity=Severity.medium, source="ai",
     )
     base.update(over)
     return ProcessedAlert(**base)
@@ -298,7 +298,7 @@ async def test_index_alert_builds_text_and_metadata():
     assert body["kind"] == "alert"
     assert "Margin check FAILED" in body["text"]
     assert "margin fell below the threshold" in body["text"]
-    assert body["metadata"]["department"] == "general"
+    assert body["metadata"]["department"] == "business"
     assert body["metadata"]["severity"] == "medium"
     assert body["metadata"]["app_name"] == "cc-checker-service"
     assert body["metadata"]["order_id"] == "ORD-6042"

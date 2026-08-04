@@ -195,11 +195,30 @@ export function fetchFacets(filter: AlertsFilter = {}): Promise<AlertFacets> {
 /**
  * One alert by id (backend GET /alerts/{alert_id}).
  *
- * For callers holding an id and nothing else — the assistant's citation chips.
- * The list endpoint cannot serve that: it has no alert_id filter.
+ * For callers holding an id and nothing else — the assistant's citation chips and
+ * the `/?alert=<id>` deep link a Teams card lands on. The list endpoint cannot
+ * serve either: it has no alert_id filter.
  */
 export function fetchAlert(alertId: string): Promise<ProcessedAlert> {
   return getJson<ProcessedAlert>(`/alerts/${encodeURIComponent(alertId)}`);
+}
+
+/**
+ * What to show the user when `fetchAlert` fails.
+ *
+ * Two surfaces load an alert by id — the assistant's citation detail and the
+ * Alert Feed's deep link — and both can only fail in the same two ways, so the
+ * wording lives here once. Duplicating it would let the two describe the same
+ * failure differently, which reads as two different bugs.
+ *
+ * The distinction that matters is actionable vs not: an expired session is
+ * something the reader can fix, anything else (a 404 because the alert was removed
+ * since the link was sent, a network blip) is not.
+ */
+export function alertLoadErrorMessage(err: unknown): string {
+  return err instanceof UnauthorizedError
+    ? "Your session has expired. Please sign in again to view this alert."
+    : "That alert could not be loaded. It may have been removed since the link was created.";
 }
 
 export interface JourneysFilter {

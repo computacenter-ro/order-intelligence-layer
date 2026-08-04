@@ -13,37 +13,46 @@ import { FilterDropdown } from "@/components/alerts/FilterDropdown";
 import { MultiFilterDropdown } from "@/components/alerts/MultiFilterDropdown";
 import type { FilterOption } from "@/components/alerts/FilterDropdown";
 import { capitalize } from "@/lib/format";
+import { DEPARTMENTS } from "@/lib/alertFilters";
 import type { Department, Incident, IncidentStatus, WsEvent } from "@/lib/types";
 
-type StatusFilter = IncidentStatus | "all";
+// "" is NO FILTER — the same contract the department filter has, where an empty
+// selection means "show everything". There is deliberately no "All Statuses" row:
+// with only two statuses it said exactly what selecting neither already says, and
+// it forced the page to open on a filtered view. Clearing the selection is how you
+// get back to all (FilterDropdown's `clearable`).
+type StatusFilter = IncidentStatus | "";
+// Typed as the literal "", NOT as StatusFilter: comparing against a
+// union-typed constant tells TS nothing, so `status === NO_STATUS` would fail to
+// narrow "" out of the union and the fetch below could not take an IncidentStatus.
+const NO_STATUS = "" as const;
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: "open", label: "Open" },
   { value: "resolved", label: "Resolved" },
-  { value: "all", label: "All Statuses" },
 ];
 
-// Same 5 values as the Alert Feed's department filter (AlertFilterBar.tsx) —
-// kept as its own local list rather than importing from there, since that
-// constant isn't exported and duplicating five literals is cheaper than
-// exporting it purely to share.
-const DEPARTMENTS: Department[] = ["networking", "devops", "backend", "database", "general"];
+// The same 5 values as the Alert Feed's department filter, now IMPORTED rather
+// than duplicated. It used to be a local copy ("five literals are cheaper than
+// exporting it"), which the general -> business rename showed the cost of: the
+// copy has to be found and changed by hand, and missing it means this page offers
+// a filter value the enum-typed API rejects with a 422.
 const DEPARTMENT_OPTIONS: FilterOption[] = DEPARTMENTS.map((d) => ({
   value: d,
   label: capitalize(d),
 }));
 
 export default function IncidentsPage() {
-  const [status, setStatus] = useState<StatusFilter>("open");
+  const [status, setStatus] = useState<StatusFilter>(NO_STATUS);
   const [department, setDepartment] = useState<Department[]>([]);
   const [pending, setPending] = useState<Incident[]>([]);
 
-  // The server sorts last_ts DESC and applies both filters; "all" status and
+  // The server sorts last_ts DESC and applies both filters; an empty status and
   // an empty department list both mean "no filter" for their dimension.
   const fetchPage = useCallback(
     (cursor: string | null) =>
       fetchIncidents({
-        status: status === "all" ? undefined : status,
+        status: status === NO_STATUS ? undefined : status,
         department,
         cursor: cursor ?? undefined,
       }),
@@ -89,8 +98,8 @@ export default function IncidentsPage() {
         return;
       }
       if (event.type !== "incident.new") return;
-      // A freshly created incident is always "open" — it only belongs in the
-      // live feed under the "open"/"all" filters, never under "resolved".
+      // A freshly created incident is always "open" — it belongs in the live feed
+      // under the "open" filter and under no filter at all, never under "resolved".
       if (status === "resolved") return;
       // Same IN(...) convention as the backend: a non-empty department
       // selection excludes an incident with no department (or a department
@@ -122,9 +131,9 @@ export default function IncidentsPage() {
           // matches ("open" -> gone; "resolved" can't happen here since a
           // resolve action is never shown on an already-resolved card) — drop
           // it from view immediately, same as a resolved alert leaving the Feed.
-          // Under "all", the row should stay but its badge must flip, and the
-          // hook has no "patch one item" operation, so re-fetch the page.
-          if (status !== "all") {
+          // With NO status filter the row should stay but its badge must flip, and
+          // the hook has no "patch one item" operation, so re-fetch the page.
+          if (status !== NO_STATUS) {
             remove(incident.incident_id);
           } else {
             reload();
@@ -154,7 +163,8 @@ export default function IncidentsPage() {
           label="Status"
           value={status}
           options={STATUS_OPTIONS}
-          defaultValue="all"
+          defaultValue={NO_STATUS}
+          clearable
           onChange={(v) => handleStatusChange(v as StatusFilter)}
         />
         <MultiFilterDropdown
@@ -166,7 +176,10 @@ export default function IncidentsPage() {
       </div>
       <NewIncidentsBanner count={pending.length} onReveal={handleReveal} />
       {items.length === 0 && !loading &&
-        (status === "open" ? (
+        // The unfiltered view is now the default one, so an empty page there means
+        // "nothing has happened yet", not "your filter matched nothing" — it gets
+        // the same welcoming copy as the explicit "open" filter.
+        (status === NO_STATUS || status === "open" ? (
           <EmptyState
             title="No open incidents"
             hint="Correlated alert bursts group here as they happen."

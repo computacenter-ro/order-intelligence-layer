@@ -11,10 +11,10 @@ the failure this fixes is:
 
     click a NOVEL failure (nothing similar is indexed, which is precisely why you
     are asking) -> "what does this mean?" -> "No related incidents found in the
-    indexed history... run the backfill"
+    indexed history for that question. No sources found in official documentation
+    either."
 
-...while the alert's full text sits in the very same request. The advice is also
-wrong: the backfill cannot help, because the answer was never in the index.
+...while the alert's full text sits in the very same request.
 
 The guard itself is unchanged — compose only when grounded. "Grounded" is simply
 no longer a synonym for "retrieval returned rows".

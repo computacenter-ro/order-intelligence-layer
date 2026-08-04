@@ -67,6 +67,7 @@ Nothing here touches production — all services, hosts, and data are simulated.
 ├── Caddyfile                     # prod reverse proxy + automatic TLS (one origin)
 ├── Dockerfile                    # one image for every Python service (differ only by command)
 ├── .github/workflows/            # ci.yml (dashboard build) + build-images.yml (GHCR push)
+│                                 #   + deploy.yml (manual Azure Container Apps redeploy — a SCAFFOLD)
 ├── alembic.ini                   # DB migrations config (backend/migrations)
 ├── pytest.ini                    # asyncio_mode=auto, testpaths=tests
 ├── requirements.txt              # includes pyyaml (doc frontmatter + service-map.yaml) — NOT optional
@@ -717,9 +718,9 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
   updates the list automatically and silently leaves it undefined**. A test
   (`test_route_prompt_defines_every_department`) fails if the two drift.
 
-  The load-bearing distinction is **`backend` vs `general`**:
+  The load-bearing distinction is **`backend` vs `business`**:
   - `backend` = an application/integration **defect** — the service behaved wrongly.
-  - `general` = **not an engineering fault**: the pipeline worked as designed and
+  - `business` = **not an engineering fault**: the pipeline worked as designed and
     correctly *rejected* an order (margin below threshold, missing `costCenter`
     UDF, disabled JAM account, unmapped product). Nobody changes code. This holds
     even though the log is `ERROR`, came from a service, and says FAILED/aborted.
@@ -727,13 +728,24 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
   Roughly half the alertable corpus is this business-rule class. Without the
   distinction the model routes on surface association (log came from a service →
   services are code → `backend`) and dumps them all on the backend team as phantom
-  work — the misroute this guide exists to prevent. Note `general` is also where
-  `source="fallback"` alerts land, so `#general-logs` mixes business rejections
-  with unprocessed pass-throughs (distinguishable by the `AI`/`fallback` badge).
+  work — the misroute this guide exists to prevent. `Department.business` is
+  therefore a **verdict, not a dumping ground**, and the name says so: it was
+  called `general` until the Teams split gave those alerts a `business` channel, at
+  which point the old label was both misleading (the dashboard rendered "General"
+  for an alert whose card went to `#business-logs`) and semantically empty — the
+  prompt had to fight it with "the answer is general, whatever the log level".
+  `source="fallback"` alerts go to the separate `fallback` channel (see [5] Teams);
+  the two used to be mixed in `#general-logs`, told apart only by the
+  `AI`/`fallback` badge.
+
+  > ⚠ The `general` Teams **channel** was NOT renamed and is unrelated — see [5]
+  > Teams. There is no `general` department any more; a `general` string in the
+  > codebase is a channel (or ordinary English), never a department.
 - **Fallback is a pass-through, NOT rule-based**: when the LLM is down, the
   log is sent down the pipe unexplained and unrouted (`source: "fallback"`).
-  The backend routes those to the **general** Teams channel. There is no
-  keyword/rule classification anywhere.
+  The backend routes those to the **fallback** Teams channel (its own channel
+  since the split — it was `general`). There is no keyword/rule classification
+  anywhere.
 - **Circuit breaker** (`breaker.py`): 3 consecutive LLM failures → open 60s →
   half-open probe. State in Redis (`ai:breaker:state`) so it survives restarts.
   While open, skip LLM calls entirely.
@@ -742,7 +754,7 @@ input_queue → [semantic cache lookup] ──hit──► reuse cached answer (
 ```python
 class Department(str, Enum):
     networking = "networking"; devops = "devops"; backend = "backend"
-    database = "database"; general = "general"
+    database = "database"; business = "business"   # was "general" (see [3] above)
 
 class Severity(str, Enum):
     critical = "critical"; high = "high"; medium = "medium"; low = "low"
@@ -914,8 +926,8 @@ anything indexed. Without it, "retrieval found nothing" and "there is nothing to
 answer from" are the same fact, which was true only while the index was the sole
 channel. The failure it fixes: click a NOVEL failure (nothing similar is indexed —
 exactly when you need help), ask "what does this mean?", and get *"No related
-incidents found — run the backfill"* while the alert's full text sits in that very
-request. The original guard still holds for the case it was written for: a bare
+incidents found ... no sources found in official documentation either"* while the
+alert's full text sits in that very request. The original guard still holds for the case it was written for: a bare
 question that matched nothing composes nothing.
 
 **Record ids never appear in the answer prose.** They identify rows the reader
@@ -1029,7 +1041,7 @@ Delivery is **at-least-once** → backend consumers must be idempotent
 - **`processed.alerts`** → dedup on `alert_id` → persist → link to its journey
   (`linking.py`, which also backfills the alert's `incident_id` if that journey is
   already clustered) → WebSocket push (`alert.new`) → Teams: department channel
-  when `source="ai"` and department set, **general channel** when
+  when `source="ai"` and department set, **fallback channel** when
   `source="fallback"` → push to the retrieval index (fire-and-forget).
 - **`raw.events`** → dedup on `log_id` → feed the Journey Assembler.
 - Everything after "persist" is gated on the **same insert rowcount**, so a
@@ -1082,10 +1094,16 @@ Settings failures (15/16/17) resolve to.
 On journey completion: persist outcome → request LLM summary from AI service
 (`POST /summarize-journey`, whose `suggested_label` is stored on
 `journeys.suggested_failure_label` for use as a novel incident's title) → cluster
-into an incident → WebSocket push (`journey.completed`, includes summary) → Teams
-notification → push to the retrieval index. While in progress, each appended chunk
-pushes `journey.updated` — the dashboard's journey view fills in progressively,
-possibly later than the alert that referenced it.
+into an incident → WebSocket push (`journey.completed`, includes summary) → push to
+the retrieval index. While in progress, each appended chunk pushes
+`journey.updated` — the dashboard's journey view fills in progressively, possibly
+later than the alert that referenced it.
+
+**No Teams notification** — there used to be one here. A completed journey per flow
+at ~2 flows/30s is thousands of cards a day, so it was dropped outright rather than
+deferred; the stage-3 daily report covers completions in aggregate. The
+`journey.completed` event itself is unchanged and still goes to the WebSocket: only
+the Teams sink ignores it (see [5] Teams).
 
 ### Incident Clustering (`incidents.py`)
 An order that fails produces many alerts, and one outage produces many failing
@@ -1442,21 +1460,176 @@ backend CORS sets `allow_credentials=True` and allows `POST`/`OPTIONS`.
 > exactly as the Slack spec described — only the transport (Teams webhooks /
 > Power Automate) and the env-var names changed.
 
-Webhook per department channel + general, Teams channels like `#devops-logs`,
-... , `#general-logs`:
-`TEAMS_WEBHOOK_NETWORKING`, `_DEVOPS`, `_BACKEND`, `_DATABASE`, `_GENERAL`.
-Card (simple title + fields, easy to adapt between an Incoming Webhook and a
-Power Automate flow): level/outcome, severity, department, service, explanation
-(or "unprocessed — LLM unavailable" for `source="fallback"`), ids, `AI` vs
-`fallback` badge, and a link to the dashboard journey view built from **`DASHBOARD_URL`** +
-`journey_id`/`order_id`. **If a channel's webhook env var is unset, print the
-card to stdout** — never crash on missing config.
+**Exactly two event types are notified: `alert.new` and `report.daily`.**
+Everything else — `journey.completed`, `journey.updated`, every `incident.*`,
+anything added later — returns `None` from `channel_for()` and posts nothing. That
+restraint is what keeps these channels readable.
 
-Fed from the same `{"type","data"}` event stream as the WebSocket hub: routing
-is a pure `channel_for(event)` — `alert.new` → its department (AI + department
-set) else `general`; `journey.completed` → `general`; `journey.updated` **and
-every incident event** → `None` (ignored: per-chunk updates would be spam, and
-incidents are a dashboard view, not a notification channel). `backend/main.py`
+Seven channels, one webhook each — `TEAMS_WEBHOOK_NETWORKING`, `_DEVOPS`,
+`_BACKEND`, `_DATABASE`, `_BUSINESS`, `_FALLBACK`, `_REPORTS` — resolved by
+`_webhook_url(channel)` from the channel name, so a new channel needs no code
+change there. `_REPORTS` carries the twice-daily report and nothing else; it was
+called `_GENERAL` until the report shipped, and was renamed because that name had
+meant three different things in turn (see the warning below).
+
+**A channel is NOT a department**, even where the strings match. `channel_for()`
+used to return `data["department"]` verbatim; it is now an explicit
+department → channel table (`_DEPARTMENT_CHANNELS`), because two unrelated things
+shared the `general` channel: business rejections (`source="ai"` +
+`department="business"` — back then the department was itself called `general`; the
+pipeline worked as designed and correctly rejected an order) and unprocessed
+pass-throughs (`source="fallback"` — the LLM was down). They are fully
+distinguishable in the data (an AI alert always has a department, a fallback alert
+never does), so they now get a channel each:
+
+| condition | channel |
+|---|---|
+| `alert.new`, `source="ai"`, one of the 4 engineering departments | that department |
+| `alert.new`, `source="ai"`, `department="business"` | **`business`** |
+| `alert.new`, `source="fallback"` (or no department — defensive, never raises) | **`fallback`** |
+| `report.daily` (either slot) | **`general`** |
+| `journey.completed` | **`None`** (dropped — see below) |
+| `journey.updated`, every `incident.*`, anything else | `None` (ignored) |
+
+`report.daily` is ONE event type for both slots — the slot travels in `data`, since
+routing is per channel and two types would be two identical rows. It is **not** a
+WebSocket event (deliberately absent from `backend/ws.py`'s constants) and does not
+go through `main.py`'s `_fan_out`: the dashboard has no use for a report, so
+`backend/report.py`'s scheduler calls `teams.notify()` directly.
+
+**`journey.completed` notifies nothing.** It posted to `general` as a deliberate
+interim in stage 1, on the reasoning that the daily report did not exist yet; it is
+now dropped outright. At the deployed rate (~2 flows/30s) one card per completed
+journey is **thousands a day** — more traffic than the alerts themselves, and the
+same volume that made the `general` channel unusable to begin with. The stage-3
+daily report covers completions as aggregate numbers instead. **This is not a gap
+waiting to be filled**: do not re-add a per-journey card. The event is untouched on
+the WebSocket — the dashboard still needs it — only the Teams sink declines it.
+
+> ⚠ **`TEAMS_WEBHOOK_REPORTS` carries the twice-daily report — and ONLY that.** It
+> was `TEAMS_WEBHOOK_GENERAL`, and the rename is the point: that name meant three
+> different things in turn while never changing — *was* "every alert without an
+> engineering department" (business rejections and fallback pass-throughs, mixed,
+> which is what made it unreadable) → *then* "journey completions only" → *then*
+> nothing at all → *now* two report cards per weekday. A name whose meaning keeps
+> moving is a name nobody can trust, so it now says what arrives: a scheduled digest
+> channel, never a catch-all. Alerts belong in the six channels above.
+>
+> The channel constant was *removed* in stage 1 (when `journey.completed` stopped
+> notifying) with a test asserting its absence, precisely so that re-adding it had
+> to be a conscious act rather than a reflex. Adding the report was that act: the
+> constant is back — as `REPORTS` — and the test was **updated, not worked around**:
+> it now pins the narrower invariant that no alert and no journey/incident event can
+> reach it. The Teams channel behind it is `oil-general-reports`; the webhook URL is
+> the only binding, so the channel can be renamed in Teams without a code change.
+>
+> Separately: the `Department` enum was renamed the other way round (`general` →
+> `business`), so every department now maps to a like-named channel. That identity
+> is **not** a reason to collapse `_DEPARTMENT_CHANNELS` back into
+> `return data["department"]` — `fallback` is a channel with no department, and the
+> table is what keeps the two namespaces separable.
+
+Card (simple title + fields, easy to adapt between an Incoming Webhook and a
+Power Automate flow): level, severity, department, service, explanation, ids, `AI`
+vs `fallback` badge. It builds an **alert** card only: the journey-shaped handling
+(`outcome` as the level, `summary` as the body) was removed along with the journey
+routing rather than left as annotated dead code — no planned notification reuses
+those fields, since stage 2's interrupts are incident-shaped and stage 3's report
+is an aggregate digest.
+**If a channel's webhook env var is unset, print the card to stdout** — never crash
+on missing config.
+
+**One action, "View alert" → `{DASHBOARD_URL}/?alert=<alert_id>`**
+(`_alert_link`), which opens the Alert Feed with that alert's drawer already open.
+It used to link to the *journey* view, which meant the alert a card was about had no
+URL at all — and since `journey_id` is **nullable** (an alert is stitched to its
+journey by a later `raw.events` message), those cards shipped with **no button**.
+`alert_id` is non-nullable, so a card now always carries an action whenever
+`DASHBOARD_URL` is set; a test pins that for the `journey_id is None` case
+specifically. Deliberately the only button: the drawer already offers
+"→ View Full Order Journey" under RELATED, so a second one would duplicate existing
+navigation in the card's most expensive space. `order_id` is still never used in a
+link — the rule that outlived the retargeting, since `/journeys/ORD-8944` is a
+guaranteed 404. Note `backend/api.py::_dashboard_link` **still** builds
+`/journeys/<id>` links, correctly: it links chat citations, where a `journey`
+citation is *about* a journey. The two no longer share a target, only that rule.
+
+**No explanation ⇒ the raw log line**, as a monospace block, in addition to the
+"unprocessed — LLM unavailable" note (the two say different things: why there is no
+explanation, versus what was logged). Without it a `source="fallback"` card carried
+the service, the level and nothing about what broke — least informative in exactly
+the case where the AI explained nothing. Only when there is no explanation:
+appending it to an AI card would roughly double its length to restate the prose.
+
+### The twice-daily report (`report.py`)
+
+Two cards per **weekday** to `general`, and the two windows are deliberately
+different periods: **09:00** local reports the night nobody watched
+(17:00→09:00, state-heavy — "what's waiting for you"), **17:00** reports the worked
+day (09:00→17:00, delta-heavy — "what we're leaving behind"). A single 24h report
+would average them into neither, which is the whole reason there are two slots —
+**do not merge them.**
+
+Split like `journeys.py` / `incidents.py`: pure functions (slot maths, window
+derivation, the fold into a payload) with `now` **passed in**, then a thin
+DB/Redis layer and the loop over them. The card is a separate builder
+(`teams.build_report_card`), not a branch inside `build_card` — same precedent as
+dropping journey support from that one rather than keeping it as a branch. One
+builder serves both slots, parameterised by the payload.
+
+- **Config:** `REPORT_TIMEZONE` (default `Europe/Bucharest`), `REPORT_SLOTS`
+  (default `09:00,17:00`). The timezone decides **only when a slot fires**; every
+  stored/compared timestamp stays UTC and aware, per the project rule. Boundaries
+  are built from local wall time, so they are DST-correct — 09:00 Bucharest is
+  07:00Z in winter and 06:00Z in summer, and a fixed-UTC schedule would be an hour
+  off for half the year.
+- **Loop:** its own lifespan task checking every 60s, **not** inside
+  `run_consumers`' gather — that coroutine owns the RabbitMQ connection and is
+  restarted on every broker blip, which would take the reporter down exactly when a
+  report still matters. It reads Postgres and Redis, never the broker.
+- **Watermark** `teams:digest:last_sent` (ISO UTC in Redis). Find the most recent
+  passed slot boundary; if `last_sent` is before it, report `[last_sent, boundary]`.
+  Three load-bearing properties:
+  1. **The window ends at the BOUNDARY, not at `now`** — a run starting at 09:00:07
+     still reports up to 09:00:00, so consecutive windows are exactly contiguous and
+     a report is reproducible from its own bounds (the poller-watermark discipline).
+  2. **A long outage yields ONE report, not a catch-up burst** — the window ends at
+     the *most recent* boundary, so two days down is one report covering the gap. The
+     card states its real window, so that is visible rather than hidden.
+  3. **The watermark advances only AFTER a successful send** — a failed POST leaves
+     it alone and the next check retries the same window. A duplicate report is
+     cheap; a lost window is irreversible.
+  Cold start (no watermark) uses the previous boundary, so the first report covers
+  one slot period rather than all history.
+- **Queries:** three new builders in `stats.py` — `unresolved_alerts_by_department()`
+  (backlog, with `critical` as a FILTERed aggregate in the same pass) plus
+  `alerts_created_in_window()` / `alerts_resolved_in_window()`. Deliberately **not**
+  a `since`/`until` retrofit of the eight existing builders: nothing else needs a
+  windowed breakdown.
+  **"Resolved in window" means every alert whose `resolved_at` falls in the window,
+  regardless of when it was created** — only that definition makes
+  `open_at_end == open_at_start + created − resolved` true, and a card whose numbers
+  visibly don't add up stops being read.
+- **`urgent` = `severity == "critical"` only**, deliberately. Critical is rare here
+  so the column often reads 0; that is the accepted trade-off, not an invitation to
+  widen it to `high`.
+- **Alerts with no department** (every `source="fallback"` one) get an explicit
+  `unassigned` bucket, so the table sums back to the printed total. Without it the
+  alerts nobody triaged — because the LLM was down — would be the ones missing.
+- **The window is stated in absolute local dates** ("Fri 31 Jul 17:00 → Mon 3 Aug
+  09:00 (64h)"), never a bare relative phrase. Every relative phrase is **derived
+  from the window**: Friday's 17:00 card is a weekend handover, Monday's 09:00 window
+  is ~64h, and an outage window is neither. On an append-only surface a wrong
+  relative phrase can never be corrected.
+- **Always sent, even when every number is zero.** "0 new, 0 unresolved" proves the
+  pipeline and the reporter are both alive; silence is ambiguous — quiet night, or
+  dead scheduler? Same reasoning as the staleness signal on `/ai-performance`.
+- One action, "Open Alert Feed" → `DASHBOARD_URL`. No LLM narration: the numbers are
+  already readable, and a generated summary would add a failure mode (breaker open)
+  on the one surface that cannot be corrected after posting.
+
+Fed from the same `{"type","data"}` event stream as the WebSocket hub: routing is
+a pure `channel_for(event)` (the table above). `backend/main.py`
 wires a fan-out `on_event` in its
 lifespan that delivers each event to **both** the WS hub and Teams, isolating a
 failing sink so one never stops the other or the consumers.
@@ -1496,6 +1669,12 @@ Connects to backend WS + REST. Feature contract:
   live on `incident.new` / `incident.updated`; the detail page lists member alerts
   grouped per order (`OrderGroupRow.tsx`) and offers Resolve
   (`IncidentActionsMenu.tsx`), which cascades to every member alert.
+  The **Status filter opens with nothing selected** (`""` = no filter, same contract
+  as the department multi-select) and is single-select: there is deliberately no
+  "All Statuses" row, because with two statuses it said what selecting neither
+  already says. `FilterDropdown`'s opt-in `clearable` prop supplies the
+  "Clear Status" row that gets you back to unfiltered; the Alert Feed's five
+  single-selects keep their explicit "All …" rows and are unaffected.
 - **Assistant panel** (`components/chat/ChatPanel.tsx` + `lib/chat.tsx`) — one
   drawer, mounted once in `AppShell`, opened from the side-nav, the alert drawer's
   "Ask about this", or a journey view. Opening it from a record passes a **scope**
@@ -1515,7 +1694,23 @@ Connects to backend WS + REST. Feature contract:
   and breakdown bars (`components/insights/`).
 - **Alert detail drawer** (`AlertDetailDrawer.tsx`), **search**
   (`SearchInput.tsx`), and **"load more" pagination** (`lib/usePagination.ts`)
-  over the cursor-based endpoints.
+  over the cursor-based endpoints. The drawer is chrome only — content comes from
+  `AlertDetailBody`, shared with the assistant panel — but it DOES own the
+  `AlertActionsMenu` (Resolve). That action deliberately lives in the chrome and not
+  the body: the body is also rendered by `ChatPanel` over a conversation, which has
+  no resolve concept, and a deep-linked alert may have no feed card behind it, so
+  without a menu in the drawer the Teams link would be read-only.
+- **`/?alert=<alert_id>` deep link** (`lib/alertDeepLink.ts` + `app/page.tsx`) —
+  where a Teams alert card lands: the Alert Feed opens with that alert's drawer.
+  Fetched **by id** (`GET /alerts/{id}`, the client `ChatPanel` already uses for
+  cited alerts), never looked up in the loaded list — the alert may be filtered out,
+  past the first page, or resolved (resolved alerts are in `/history`, not this
+  feed; landing on `/` is still right because the drawer content comes from the
+  fetch). Closing clears the param with `router.replace` so a refresh or Back does
+  not reopen it, and the param is **validated** before use (it reaches an API path
+  from a URL anyone can edit) — junk simply opens no drawer. A 404 renders a short
+  message rather than an empty drawer, wording shared with `ChatPanel` via
+  `alertLoadErrorMessage` so the two surfaces cannot drift.
 
 ---
 
@@ -1530,6 +1725,8 @@ Connects to backend WS + REST. Feature contract:
 | `ai:semcache:hits` / `:misses` | string | — | semantic-cache hit/miss counters (the demo number; `GET /semcache/stats`) |
 | `ai:ragindex` | string | — | retrieval-index dump (incident records + vectors). Rebuildable — drop it and run `python -m backend.scripts.backfill_rag`. |
 | `ai:llmstats:snapshot` | string | — | LangSmith per-model stats snapshot + its `fetched_at` (all 3 windows x 4 tags), refreshed on a timer and read by `GET /llm-stats`. Rebuildable — safe to drop; it exists so a restart doesn't blank `/ai-performance` until the first cycle lands. |
+
+| `teams:digest:last_sent` | string | — | Twice-daily Teams report watermark: ISO **UTC** end of the last successfully sent window ([5] `report.py`). **Load-bearing, not a cache** — dropping it makes the next report cover one slot period (cold start) instead of the true gap. Advanced only AFTER a successful send, so a failed POST retries the same window. |
 
 The **documentation index has no Redis key on purpose** — it is rebuilt from
 `ai_service/knowledge/*.md` at every startup in seconds, so a persisted copy could
@@ -1603,6 +1800,17 @@ Differences that matter:
   → `oil-app` for all Python services, `oil-dashboard` for Next.js); the VM only
   pulls. Building on the VM would need ~4 vCPUs for torch + the Next bundle and
   would put the private-registry npm token on the box.
+- **A second, separate target: `deploy.yml` (Azure Container Apps).** Unrelated to
+  the VM path above — it runs `az containerapp update` against five already-existing
+  container apps in `rg-internship-2026`, pinned to the `:prep-for-prod` image tag.
+  It is a **scaffold and does not run today**: trigger is `workflow_dispatch` only,
+  it creates no infrastructure (the first deploy is manual), and it needs an
+  `AZURE_CREDENTIALS` service-principal secret that is not yet set. Its header points
+  at `DEPLOY_STEP_BY_STEP.md`, which **does not exist anywhere in the repo** — so that
+  reference is dangling, not a file you have missed. Container Apps give the dashboard
+  and backend different hostnames, which is exactly the case `[5] Cross-site
+  deployment` covers: `CORS_ALLOW_ORIGINS`, `AUTH_COOKIE_SAMESITE=none` and
+  `AUTH_COOKIE_SECURE=true` must all change together.
 
 > ⚠ **Do not copy a development `.env` onto the VM.** Two services load it
 > wholesale via `env_file`, and `env_file` values **win** over the `environment:`
@@ -1657,8 +1865,16 @@ any deployment),
 `AUTH_COOKIE_SAMESITE=lax` (`none` for a cross-site deploy — needs
 `AUTH_COOKIE_SECURE=true`), `DB_SSL=` (unset = no TLS; `require` for a managed
 Postgres) — see "Cross-site deployment" under [5] for how these three go
-together — plus Azure AI Foundry vars and the `TEAMS_WEBHOOK_*` webhooks
-above.
+together — plus Azure AI Foundry vars and the Teams webhooks, one per **channel**
+(not per department): `TEAMS_WEBHOOK_NETWORKING`, `_DEVOPS`, `_BACKEND`,
+`_DATABASE`, `_BUSINESS` (`source="ai"` + `department="business"` — business
+rejections), `_FALLBACK` (`source="fallback"` — the LLM was down), and
+`_REPORTS`, which carries **the twice-daily report only** and no `alert.new`
+event at all (renamed from `_GENERAL`, whose meaning changed three times — see the warning in [5] Teams
+before reusing it). All unset ⇒ cards print to stdout.
+Report scheduling: `REPORT_TIMEZONE=Europe/Bucharest` (decides only WHEN a slot
+fires; all stored timestamps stay UTC), `REPORT_SLOTS=09:00,17:00` (weekdays only),
+`REPORT_CHECK_INTERVAL=60`.
 
 `LLM_STATS_CACHE_TTL_SECONDS` was **removed** with the TTL cache it belonged to —
 reads no longer fetch, so there is nothing to expire.
@@ -1682,7 +1898,7 @@ reads no longer fetch, so there is nothing to expire.
   change nothing.
 - **AI service**: WARN/ERROR filtering + suppression; breaker opens after 3
   failures; fallback alerts have null explanation/department,
-  `source="fallback"`, and land in the general Teams channel; router output is
+  `source="fallback"`, and land in the fallback Teams channel; router output is
   always one of the 5 departments.
 - **Semantic cache**: a hit reuses the cached answer WITHOUT calling the LLM
   (assert the model isn't invoked); two same-type logs with different ids hit
@@ -1776,7 +1992,7 @@ reads no longer fetch, so there is nothing to expire.
 - The collector is intentionally dumb; journey intelligence lives ONLY in the
   backend, alert intelligence ONLY in the AI service.
 - There is **no rule-based classification** — the LLM-down path is a raw
-  pass-through to the general channel. Don't reintroduce keyword routing.
+  pass-through to the fallback channel. Don't reintroduce keyword routing.
 - Both output queues are at-least-once: consumers must be idempotent.
 - Schema changes go through Alembic (`backend/migrations/versions/`) — never
   hand-edit the tables in `backend/db.py` without a matching migration.

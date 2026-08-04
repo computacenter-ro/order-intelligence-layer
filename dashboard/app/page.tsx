@@ -1,8 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@computacenter-ro/style-guide/components";
-import { fetchAlerts, fetchFacets, resolveAlert, type AlertFacets, type Page } from "@/lib/api";
+import {
+  alertLoadErrorMessage,
+  fetchAlert,
+  fetchAlerts,
+  fetchFacets,
+  resolveAlert,
+  type AlertFacets,
+  type Page,
+} from "@/lib/api";
+import { ALERT_PARAM, alertIdFromParam } from "@/lib/alertDeepLink";
 import { usePagination } from "@/lib/usePagination";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { AlertCard } from "@/components/alerts/AlertCard";
@@ -29,6 +39,9 @@ const EMPTY_PAGE: Page<ProcessedAlert> = { items: [], next_cursor: null };
 export default function AlertFeedPage() {
   const [pending, setPending] = useState<ProcessedAlert[]>([]);
   const [selected, setSelected] = useState<ProcessedAlert | null>(null);
+  // Deep-link failure (404 / expired session), shown in place of drawer content.
+  // Null in the normal case, including while the fetch is in flight.
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
   const [filters, setFilters] = useState<AlertFilters>(DEFAULT_ALERT_FILTERS);
   // Gates fetching until localStorage has been read, so the list loads once with
   // the rehydrated selection instead of flashing the default filter first.
@@ -52,6 +65,59 @@ export default function AlertFeedPage() {
     }
     setFiltersReady(true);
   }, []);
+
+  // --- `/?alert=<alert_id>` deep link (where a Teams card lands) --------------
+  //
+  // Fetched BY ID, never looked up in `items`: the alert may be filtered out by the
+  // active filters, older than the first page, or resolved (resolved alerts are not
+  // in this feed at all — they live in /history). Landing on / is still right, since
+  // the drawer's content comes from the fetch; the list behind it simply omits the
+  // row. Deliberately independent of `filtersReady` for the same reason — the alert
+  // is addressed by id, not matched by query, so it opens whatever the filters say.
+  //
+  // `useSearchParams` in a prerendered route client-renders the component tree up
+  // to the nearest Suspense boundary, and Next's docs suggest adding one. Checked
+  // rather than assumed: the built HTML for `/` contains none of this page and none
+  // of the side-nav even WITHOUT this hook (compare `/history`) — the whole
+  // dashboard is client-rendered already, since filters come from localStorage and
+  // every list from the API. So there is nothing left to prerender and no Suspense
+  // wrapper to justify; the hook is used directly for the value it adds, which is
+  // reacting to the param rather than reading `window.location` once on mount.
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const deepLinkId = alertIdFromParam(searchParams.get(ALERT_PARAM));
+
+  useEffect(() => {
+    if (!deepLinkId) return;
+    let cancelled = false;
+    fetchAlert(deepLinkId)
+      .then((alert) => {
+        if (cancelled) return;
+        setSelected(alert);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // A card can outlive its alert, so a 404 is expected rather than
+        // exceptional: show why the drawer is empty instead of an empty drawer.
+        setDeepLinkError(alertLoadErrorMessage(err));
+      });
+    // Guards against a second `?alert=` arriving before the first resolves, so a
+    // slow earlier response cannot overwrite the newer selection.
+    return () => {
+      cancelled = true;
+    };
+  }, [deepLinkId]);
+
+  // Closing the drawer drops the param, so a refresh or a Back press does not
+  // reopen it. `replace`, not `push`: the deep-linked URL should not become a
+  // history entry the user has to step back through. Replacing with a bare "/" is
+  // safe because `alert` is the only param this route reads — the filters live in
+  // localStorage, not the URL.
+  const closeDetail = useCallback(() => {
+    setSelected(null);
+    setDeepLinkError(null);
+    if (deepLinkId) router.replace("/", { scroll: false });
+  }, [deepLinkId, router]);
 
   // Persist the selection whenever it changes (but not the pre-rehydration default).
   useEffect(() => {
@@ -160,12 +226,19 @@ export default function AlertFeedPage() {
     (alert: ProcessedAlert) => {
       resolveAlert(alert.alert_id)
         .then((updated) => {
-          // Resolved alerts move to History — drop it from the live feed.
+          // Resolved alerts move to History — drop it from the live feed. A no-op
+          // when the alert was never in the loaded list, which is the normal case
+          // for one opened by deep link (filtered out, or past the first page).
           remove(updated.alert_id);
+          // Close if the drawer was showing this alert. Resolving from the drawer
+          // must behave exactly like resolving from the card, and the row it
+          // described is gone — so leaving it open would show a stale record.
+          setSelected((prev) => (prev?.alert_id === updated.alert_id ? null : prev));
+          if (deepLinkId === updated.alert_id) router.replace("/", { scroll: false });
         })
         .catch((err) => console.error("Failed to resolve alert:", err));
     },
-    [remove]
+    [remove, deepLinkId, router]
   );
 
   return (
@@ -214,8 +287,10 @@ export default function AlertFeedPage() {
       )}
       <AlertDetailDrawer
         alert={selected}
-        onClose={() => setSelected(null)}
+        onClose={closeDetail}
         search={filters.search.trim()}
+        onResolve={handleResolve}
+        error={deepLinkError}
       />
     </div>
   );
